@@ -98,7 +98,8 @@ class TrainingConfig:
     seed_repulsion_sigma: float = 0.08
     boundary_margin: float = 0.05
 
-    curve_length_worst_weight: float = 0.1,
+    curve_length_worst_weight: float = 1.0
+    curve_length_outlier_weight: float = 5.0
 
     freeze_w: bool = False
     w_const: float = 0.25
@@ -109,6 +110,10 @@ class TrainingConfig:
     w_max_ratio: float = 0.5
     min_feature_size_3d: float | None = None
     auto_update_wmin: bool = False
+
+    cell_edge_uniform_eps: float = 1e-8
+    cell_angle_eps: float = 1e-8
+    cell_vertex_merge_tolerance: float = 1e-5
 
     beta: float = 0.05
     centerline_beta: float = 0.02
@@ -159,7 +164,6 @@ class TrainingConfig:
     curve_length_loss_type: str = "pairwise"
     curve_length_eps: float = 1e-8
     curve_length_tolerance: float = 0.15
-    curve_length_outlier_weight: float = 1.0
     curve_length_exclude_shell_edges: bool = True
     curve_length_ratio_target: float = 1.25
     curve_length_ratio_weight: float = 50.0
@@ -257,6 +261,21 @@ class TrainingConfig:
     timelapse_tube_n_sides: int = 12
 
     def __post_init__(self):
+        for name in (
+            "curve_length_worst_weight",
+            "curve_length_outlier_weight",
+            "cell_edge_uniform_eps",
+            "cell_angle_eps",
+            "cell_angle_uniform_eps",
+            "cell_vertex_merge_tolerance",
+        ):
+            value = getattr(self, name, None)
+            if isinstance(value, tuple) and len(value) == 1:
+                setattr(self, name, value[0])
+
+        if self.cell_angle_uniform_eps != 1e-8 and self.cell_angle_eps == 1e-8:
+            self.cell_angle_eps = self.cell_angle_uniform_eps
+
         self.training_face_index = int(self.training_face_index)
         if self.training_face_index < 0:
             raise ValueError(
@@ -1485,40 +1504,74 @@ class NN_Trainer:
 
     def curve_length_similarity_loss(self, decoder_out):
         """
-        Encourage selected 3D edge curves to have equal lengths while
-        giving additional attention to the worst edge-length outlier.
+        Encourage selected 3D Voronoi edges to have similar lengths.
+
+        Uses a tolerance region, an average penalty, and a smooth worst-edge
+        penalty. The objective is scale-invariant.
         """
         cfg = self.cfg
 
-        edge_types = getattr(
-            cfg,
-            "curve_length_equal_edge_types",
-            (0,),
-        )
-
         edge_lengths = self.curve_3d_edge_lengths(
             decoder_out,
-            edge_types=edge_types,
+            edge_types=getattr(
+                cfg,
+                "curve_length_equal_edge_types",
+                (0,),
+            ),
         )
 
         if edge_lengths.numel() <= 1:
             return edge_lengths.new_zeros(())
 
         eps = float(getattr(cfg, "curve_length_eps", 1e-8))
-        mean_length = edge_lengths.mean().clamp_min(eps)
+        tolerance = max(
+            float(getattr(cfg, "curve_length_tolerance", 0.10)),
+            0.0,
+        )
+        worst_weight = max(
+            float(getattr(cfg, "curve_length_worst_weight", 1.0)),
+            0.0,
+        )
+        outlier_weight = max(
+            float(getattr(cfg, "curve_length_outlier_weight", 1.0)),
+            0.0,
+        )
 
-        log_relative_lengths = torch.log(
+        mean_length = edge_lengths.mean().clamp_min(eps)
+        log_ratio = torch.log(
             edge_lengths.clamp_min(eps) / mean_length
         )
 
-        mean_loss = log_relative_lengths.square().mean()
-        worst_loss = log_relative_lengths.abs().max().square()
+        # No penalty for edges inside the requested relative tolerance.
+        excess = torch.relu(log_ratio.abs() - tolerance)
 
-        worst_weight = float(
-            getattr(cfg, "curve_length_worst_weight", 0.1)
+        mean_loss = excess.square().mean()
+
+        # Smooth worst-edge approximation, instead of hard max.
+        temperature = 12.0
+        squared_excess = excess.square()
+        smooth_worst = (
+            torch.logsumexp(
+                temperature * squared_excess,
+                dim=0,
+            )
+            - math.log(max(int(squared_excess.numel()), 1))
+        ) / temperature
+
+        # Additional emphasis on outliers, weighted smoothly by severity.
+        severity_weights = torch.softmax(
+            outlier_weight * excess.detach(),
+            dim=0,
         )
+        outlier_loss = (
+            severity_weights * squared_excess
+        ).sum()
 
-        return mean_loss + worst_weight * worst_loss
+        return (
+            mean_loss
+            + worst_weight * smooth_worst
+            + outlier_loss
+        )
 
 
 
@@ -1609,170 +1662,318 @@ class NN_Trainer:
         return edge_len.var(unbiased=False) / mean_len.pow(2) + equality_shape_penalty()
     
 
-    
-    
-
     def cell_edge_uniformity_loss(self, decoder_out):
-        """
-        Penalize per-cell irregularity without forcing all cells to one size.
+            cfg = self.cfg
 
-        Uses decoder_out["edge_curves_xyz"] with shape [E, K, 3] and
-        decoder_out["graph"]["edge_seed_pair"] with shape [E, 2]. Each graph
-        edge contributes to both cells in its seed pair.
-        """
-        cfg = self.cfg
-        curves = decoder_out.get("edge_curves_xyz", None)
-        graph = decoder_out.get("graph", None)
-        if curves is None or not isinstance(graph, dict):
-            for value in decoder_out.values():
-                if torch.is_tensor(value):
-                    return value.new_zeros(())
-            try:
-                device = next(self.ppnet_cls.parameters()).device
-            except Exception:
-                device = getattr(self, "device", torch.device("cpu"))
-            return torch.zeros((), device=device)
+            curves = decoder_out.get("edge_curves_xyz")
+            graph = decoder_out.get("graph")
 
-        pairs = graph.get("edge_seed_pair", None)
-        if pairs is None:
-            return curves.new_zeros(())
-        if curves.ndim != 3 or curves.shape[0] == 0 or curves.shape[1] < 2:
-            return curves.new_zeros(())
-        if pairs.ndim != 2 or pairs.shape != (curves.shape[0], 2):
-            return curves.new_zeros(())
+            if curves is None or not isinstance(graph, dict):
+                for value in decoder_out.values():
+                    if torch.is_tensor(value):
+                        return value.new_zeros(())
+                return torch.zeros((), device=self.device)
 
-        seg = curves[:, 1:, :] - curves[:, :-1, :]
-        edge_len = torch.linalg.norm(seg, dim=-1).sum(dim=-1)
-        pairs = pairs.to(device=edge_len.device)
-        finite_edges = torch.isfinite(edge_len)
-        valid_pairs = pairs >= 0
-        valid_edge = finite_edges & valid_pairs.any(dim=1)
-        if not bool(valid_edge.any().detach().cpu().item()):
-            return curves.new_zeros(())
+            pairs = graph.get("edge_seed_pair")
+            edge_type = graph.get("edge_type")
 
-        eps = float(getattr(cfg, "cell_edge_uniform_eps", 1e-8))
-        angle_eps = float(getattr(cfg, "cell_angle_uniform_eps", 1e-8))
-        lam_angle = float(getattr(cfg, "lam_cell_angle_uniform", 1.0))
-        lam_radial = float(getattr(cfg, "lam_cell_radial_uniform", 0.5))
-        edge_start = curves[:, 0, :]
-        edge_end = curves[:, -1, :]
-        cell_ids = torch.unique(pairs[valid_edge & valid_pairs.any(dim=1)])
-        cell_ids = cell_ids[cell_ids >= 0]
-        losses = []
+            if (
+                pairs is None
+                or curves.ndim != 3
+                or curves.shape[0] == 0
+                or pairs.ndim != 2
+                or pairs.shape != (curves.shape[0], 2)
+            ):
+                return curves.new_zeros(())
 
-        def unique_endpoint_indices(points: torch.Tensor) -> torch.Tensor:
-            rounded = torch.round(points.detach().cpu() / max(eps, 1e-12)).to(torch.long)
-            seen = {}
-            keep = []
-            for idx, key_t in enumerate(rounded):
-                key = tuple(int(v) for v in key_t.tolist())
-                if key not in seen:
-                    seen[key] = idx
-                    keep.append(idx)
-            return torch.as_tensor(keep, dtype=torch.long, device=points.device)
+            pairs = pairs.to(device=curves.device)
 
-        def polygon_vertices_for_cell(edge_ids: torch.Tensor) -> torch.Tensor | None:
-            endpoints = torch.cat((edge_start[edge_ids], edge_end[edge_ids]), dim=0)
-            finite_points = torch.isfinite(endpoints).all(dim=1)
-            endpoints = endpoints[finite_points]
-            if endpoints.shape[0] < 3:
-                return None
+            if edge_type is not None:
+                edge_type = edge_type.to(device=curves.device).reshape(-1)
+                if edge_type.shape[0] != curves.shape[0]:
+                    edge_type = None
 
-            keep = unique_endpoint_indices(endpoints)
-            vertices = endpoints.index_select(0, keep)
-            if vertices.shape[0] < 3:
-                return None
-            return vertices
+            eps = float(getattr(cfg, "cell_edge_uniform_eps", 1e-8))
+            angle_eps = float(getattr(cfg, "cell_angle_eps", 1e-8))
+            merge_tol = float(
+                getattr(cfg, "cell_vertex_merge_tolerance", 1e-5)
+            )
 
-        def ordered_vertices_for_cell(vertices: torch.Tensor) -> torch.Tensor | None:
-            if vertices is None or vertices.shape[0] < 3:
-                return None
+            lam_angle = float(
+                getattr(cfg, "lam_cell_angle_uniform", 0.0)
+            )
+            lam_radial = float(
+                getattr(cfg, "lam_cell_radial_uniform", 0.0)
+            )
 
-            center_det = vertices.detach().mean(dim=0)
-            rel_det = vertices.detach() - center_det
-            if not bool((torch.linalg.vector_norm(rel_det, dim=1) > eps).all().detach().cpu().item()):
-                return None
+            # Full sampled 3D curve length.
+            segments = curves[:, 1:, :] - curves[:, :-1, :]
+            edge_len = torch.linalg.vector_norm(
+                segments,
+                dim=-1,
+            ).sum(dim=-1)
 
-            try:
-                _u, _s, vh = torch.linalg.svd(rel_det, full_matrices=False)
-                basis_x = vh[0]
-                basis_y = vh[1] if vh.shape[0] > 1 else rel_det.new_tensor([0.0, 1.0, 0.0])
-            except Exception:
-                basis_x = rel_det[0] / torch.linalg.vector_norm(rel_det[0]).clamp_min(eps)
-                trial = rel_det[1]
-                basis_y = trial - (trial * basis_x).sum() * basis_x
-                basis_y = basis_y / torch.linalg.vector_norm(basis_y).clamp_min(eps)
+            finite_curves = torch.isfinite(curves).all(dim=(1, 2))
+            finite_lengths = torch.isfinite(edge_len)
 
-            x = rel_det @ basis_x
-            y = rel_det @ basis_y
-            if not bool((torch.isfinite(x).all() & torch.isfinite(y).all()).detach().cpu().item()):
-                return None
-            order = torch.argsort(torch.atan2(y, x))
-            return vertices.index_select(0, order.to(device=vertices.device))
+            # Edges associated with at least one valid seed cell.
+            geometry_mask = (
+                finite_curves
+                & finite_lengths
+                & (pairs >= 0).any(dim=1)
+            )
 
-        def polygon_angle_loss(vertices: torch.Tensor) -> torch.Tensor | None:
-            if vertices is None or vertices.shape[0] < 3:
-                return None
-            prev_v = torch.roll(vertices, shifts=1, dims=0)
-            next_v = torch.roll(vertices, shifts=-1, dims=0)
-            a = prev_v - vertices
-            b = next_v - vertices
-            a_norm = torch.linalg.vector_norm(a, dim=1)
-            b_norm = torch.linalg.vector_norm(b, dim=1)
-            valid = (a_norm > angle_eps) & (b_norm > angle_eps)
-            if int(valid.detach().sum().cpu().item()) < 3:
-                return None
-            cos_angle = (a[valid] * b[valid]).sum(dim=1) / (
-                a_norm[valid] * b_norm[valid]
-            ).clamp_min(angle_eps)
-            angles = torch.acos(cos_angle.clamp(-1.0 + 1e-6, 1.0 - 1e-6))
-            mean_angle = angles.mean().clamp_min(angle_eps)
-            return angles.var(unbiased=False) / mean_angle.pow(2)
+            # Edge types used for within-cell length uniformity.
+            uniform_mask = geometry_mask.clone()
 
-        def polygon_radial_loss(vertices: torch.Tensor) -> torch.Tensor | None:
-            if vertices is None or vertices.shape[0] < 3:
-                return None
-            center = vertices.mean(dim=0)
-            radial = torch.linalg.vector_norm(vertices - center, dim=1)
-            finite_radial = torch.isfinite(radial) & (radial > eps)
-            if int(finite_radial.detach().sum().cpu().item()) < 3:
-                return None
-            radial = radial[finite_radial]
-            mean_radial = radial.mean().clamp_min(eps)
-            return radial.var(unbiased=False) / mean_radial.pow(2)
+            allowed_types = getattr(
+                cfg,
+                "curve_length_equal_edge_types",
+                (0,),
+            )
 
-        for cell_id in cell_ids.detach().cpu().tolist():
-            belongs = valid_edge & (pairs == int(cell_id)).any(dim=1)
-            if int(belongs.sum().detach().cpu().item()) <= 1:
-                continue
-            edge_ids = torch.nonzero(belongs, as_tuple=False).flatten()
+            if edge_type is not None and allowed_types is not None:
+                type_mask = torch.zeros_like(uniform_mask)
 
-            lengths = edge_len[belongs]
-            finite = torch.isfinite(lengths)
-            if int(finite.sum().detach().cpu().item()) <= 1:
-                continue
+                for allowed_type in allowed_types:
+                    type_mask |= edge_type == int(allowed_type)
 
-            lengths = lengths[finite]
-            mean_len = lengths.mean()
-            mean_len = mean_len.clamp_min(eps)
-            var_len = (lengths - mean_len).pow(2).mean()
-            cell_loss = var_len / mean_len.pow(2)
+                uniform_mask &= type_mask
 
-            cell_vertices = polygon_vertices_for_cell(edge_ids)
-            ordered_vertices = ordered_vertices_for_cell(cell_vertices)
-            angle_loss = polygon_angle_loss(ordered_vertices)
-            if angle_loss is not None:
-                cell_loss = cell_loss + lam_angle * angle_loss
-            elif lam_radial != 0.0:
-                radial_loss = polygon_radial_loss(cell_vertices)
-                if radial_loss is not None:
-                    cell_loss = cell_loss + lam_radial * radial_loss
+            if not bool(geometry_mask.any().detach().item()):
+                return curves.new_zeros(())
 
-            losses.append(cell_loss)
+            def unique_vertices(points):
+                """
+                Deduplicate points for polygon reconstruction.
 
-        if not losses:
-            return curves.new_zeros(())
-        return torch.stack(losses).mean()
+                Index selection is discrete, but selected coordinates retain their
+                gradient connection to `curves`.
+                """
+                if points.ndim != 2 or points.shape[0] == 0:
+                    return None
+
+                finite = torch.isfinite(points).all(dim=1)
+                points = points[finite]
+
+                if points.shape[0] < 3:
+                    return None
+
+                keys = torch.round(
+                    points.detach() / merge_tol
+                ).to(torch.int64)
+
+                # Preserve the first occurrence of each rounded coordinate.
+                seen = set()
+                keep_indices = []
+
+                for index, key in enumerate(keys.cpu().tolist()):
+                    key_tuple = tuple(key)
+                    if key_tuple not in seen:
+                        seen.add(key_tuple)
+                        keep_indices.append(index)
+
+                if len(keep_indices) < 3:
+                    return None
+
+                keep = torch.as_tensor(
+                    keep_indices,
+                    dtype=torch.long,
+                    device=points.device,
+                )
+
+                return points.index_select(0, keep)
+
+            def order_vertices(vertices):
+                """
+                Order 3D polygon vertices around their best-fit local plane.
+                """
+                if vertices is None or vertices.shape[0] < 3:
+                    return None
+
+                center = vertices.mean(dim=0)
+                centered = vertices - center
+
+                # Detached basis selection avoids differentiating through discrete/
+                # unstable plane orientation while preserving gradients through the
+                # projected coordinates.
+                try:
+                    _, _, vh = torch.linalg.svd(
+                        centered.detach(),
+                        full_matrices=False,
+                    )
+                except RuntimeError:
+                    return None
+
+                if vh.shape[0] < 2:
+                    return None
+
+                basis_u = vh[0].to(
+                    device=vertices.device,
+                    dtype=vertices.dtype,
+                )
+                basis_v = vh[1].to(
+                    device=vertices.device,
+                    dtype=vertices.dtype,
+                )
+
+                coord_u = centered @ basis_u
+                coord_v = centered @ basis_v
+
+                angles = torch.atan2(coord_v, coord_u)
+
+                # Ordering is discrete; the reordered vertices remain differentiable.
+                order = torch.argsort(angles.detach())
+
+                return vertices.index_select(0, order)
+
+            def polygon_angle_loss(vertices):
+                if vertices is None or vertices.shape[0] < 3:
+                    return None
+
+                previous = torch.roll(vertices, shifts=1, dims=0)
+                following = torch.roll(vertices, shifts=-1, dims=0)
+
+                vector_a = previous - vertices
+                vector_b = following - vertices
+
+                norm_a = torch.linalg.vector_norm(vector_a, dim=1)
+                norm_b = torch.linalg.vector_norm(vector_b, dim=1)
+
+                valid = (
+                    torch.isfinite(norm_a)
+                    & torch.isfinite(norm_b)
+                    & (norm_a > angle_eps)
+                    & (norm_b > angle_eps)
+                )
+
+                if int(valid.detach().sum().item()) < 3:
+                    return None
+
+                cosine = (
+                    vector_a[valid] * vector_b[valid]
+                ).sum(dim=1) / (
+                    norm_a[valid] * norm_b[valid]
+                ).clamp_min(angle_eps)
+
+                angles = torch.acos(
+                    cosine.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+                )
+
+                mean_angle = angles.mean().clamp_min(angle_eps)
+
+                return (
+                    angles.var(unbiased=False)
+                    / mean_angle.square()
+                )
+
+            def polygon_radial_loss(vertices):
+                if vertices is None or vertices.shape[0] < 3:
+                    return None
+
+                center = vertices.mean(dim=0)
+
+                radial = torch.linalg.vector_norm(
+                    vertices - center,
+                    dim=1,
+                )
+
+                valid = (
+                    torch.isfinite(radial)
+                    & (radial > eps)
+                )
+
+                if int(valid.detach().sum().item()) < 3:
+                    return None
+
+                radial = radial[valid]
+                mean_radial = radial.mean().clamp_min(eps)
+
+                return (
+                    radial.var(unbiased=False)
+                    / mean_radial.square()
+                )
+
+            cell_ids = torch.unique(pairs[geometry_mask])
+            cell_ids = cell_ids[cell_ids >= 0]
+
+            cell_losses = []
+
+            for cell_id_tensor in cell_ids:
+                cell_id = int(cell_id_tensor.detach().item())
+
+                belongs_geometry = (
+                    geometry_mask
+                    & (pairs == cell_id).any(dim=1)
+                )
+
+                belongs_uniform = (
+                    uniform_mask
+                    & (pairs == cell_id).any(dim=1)
+                )
+
+                cell_loss = curves.new_zeros(())
+                has_component = False
+
+                # Within-cell equality of selected edge lengths.
+                lengths = edge_len[belongs_uniform]
+
+                if lengths.numel() > 1:
+                    mean_length = lengths.mean().clamp_min(eps)
+
+                    edge_loss = (
+                        (lengths - mean_length).square().mean()
+                        / mean_length.square()
+                    )
+
+                    cell_loss = cell_loss + edge_loss
+                    has_component = True
+
+                # Reconstruct the complete cell polygon using all valid cell edges,
+                # not only the selected equal-length edge types.
+                cell_curves = curves[belongs_geometry]
+
+                if cell_curves.shape[0] > 0:
+                    endpoints = torch.cat(
+                        (
+                            cell_curves[:, 0, :],
+                            cell_curves[:, -1, :],
+                        ),
+                        dim=0,
+                    )
+
+                    vertices = unique_vertices(endpoints)
+                    ordered_vertices = order_vertices(vertices)
+
+                    if lam_angle != 0.0:
+                        angle_loss = polygon_angle_loss(
+                            ordered_vertices
+                        )
+
+                        if angle_loss is not None:
+                            cell_loss = (
+                                cell_loss
+                                + lam_angle * angle_loss
+                            )
+                            has_component = True
+
+                    if lam_radial != 0.0:
+                        radial_loss = polygon_radial_loss(vertices)
+
+                        if radial_loss is not None:
+                            cell_loss = (
+                                cell_loss
+                                + lam_radial * radial_loss
+                            )
+                            has_component = True
+
+                if has_component and torch.isfinite(cell_loss):
+                    cell_losses.append(cell_loss)
+
+            if not cell_losses:
+                return curves.new_zeros(())
+
+            return torch.stack(cell_losses).mean()
 
     def neutral_density_fiber_fields(self, uv: torch.Tensor, Xu: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
         rho = torch.zeros((uv.shape[0],), dtype=uv.dtype, device=uv.device)
@@ -2392,13 +2593,23 @@ class NN_Trainer:
         return "Optimized: " + ", ".join(params)
 
     @staticmethod
+    def _clone_detached_tree(value):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return value.detach().clone()
+        if isinstance(value, dict):
+            return {k: NN_Trainer._clone_detached_tree(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [NN_Trainer._clone_detached_tree(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(NN_Trainer._clone_detached_tree(v) for v in value)
+        return value
+
+    @staticmethod
     def _clone_pred_list(pred_list: list[dict]) -> list[dict]:
         def _clone_value(value):
-            if value is None:
-                return None
-            if isinstance(value, torch.Tensor):
-                return value.detach().clone()
-            return value
+            return NN_Trainer._clone_detached_tree(value)
 
         return [
             {
@@ -2411,17 +2622,36 @@ class NN_Trainer:
                 "h": _clone_value(p.get("h")),
                 "centerline_radius": _clone_value(p.get("centerline_radius")),
                 "seeds_uv": _clone_value(p.get("seeds_uv")),
+                "seed_active_mask": _clone_value(p.get("seed_active_mask")),
+                "active_seed_ids": _clone_value(p.get("active_seed_ids")),
+                "seed_activity_weight": _clone_value(p.get("seed_activity_weight")),
+                "topology_seeds_uv": _clone_value(p.get("topology_seeds_uv")),
                 "seeds_xyz": _clone_value(p.get("seeds_xyz")),
                 "edge_curves_uv": _clone_value(p.get("edge_curves_uv")),
                 "edge_curves_xyz": _clone_value(p.get("edge_curves_xyz")),
                 "edge_index": _clone_value(p.get("edge_index")),
                 "edge_seed_pair": _clone_value(p.get("edge_seed_pair")),
                 "edge_type": _clone_value(p.get("edge_type")),
+                "graph": _clone_value(p.get("graph")),
                 "number_of_edges": p.get("number_of_edges"),
                 "topology_identifier": p.get("topology_identifier"),
             }
             for p in pred_list
         ]
+
+    @staticmethod
+    def _copy_activation_metadata_to_pred(pred: dict, decoder_out: dict) -> None:
+        for key in (
+            "seeds_uv",
+            "seed_active_mask",
+            "active_seed_ids",
+            "seed_activity_weight",
+            "topology_seeds_uv",
+        ):
+            value = decoder_out.get(key, None)
+            if isinstance(value, torch.Tensor):
+                pred[key] = value.detach().clone()
+
     @staticmethod
     def _scalar_tensor_is_finite(x: torch.Tensor | float | int) -> bool:
         if isinstance(x, torch.Tensor):
@@ -2726,6 +2956,66 @@ class NN_Trainer:
         decoder.n_seeds = None if old_n_seeds is None else int(old_n_seeds)
         if old_seed_face_id is not None:
             decoder.seed_face_id = old_seed_face_id
+
+    @staticmethod
+    def _decoder_seed_activation_counts(decoder_out: dict) -> dict[str, int | float]:
+        raw_seeds_i = decoder_out.get("seeds_uv", None)
+        if not isinstance(raw_seeds_i, torch.Tensor):
+            raise RuntimeError(
+                "Decoder output is missing raw seed positions under 'seeds_uv'; "
+                "cannot calculate active units reliably."
+            )
+
+        active_mask_i = decoder_out.get("seed_active_mask", None)
+        active_ids_i = decoder_out.get("active_seed_ids", None)
+        topology_seeds_i = decoder_out.get("topology_seeds_uv", None)
+        seed_activity_weight_i = decoder_out.get("seed_activity_weight", None)
+
+        total_seed_i = int(raw_seeds_i.shape[0])
+
+        active_count_i: int | None = None
+        if active_mask_i is not None:
+            active_count_i = int(active_mask_i.to(dtype=torch.bool).sum().item())
+        elif active_ids_i is not None:
+            active_count_i = int(active_ids_i.numel())
+        elif topology_seeds_i is not None:
+            active_count_i = int(topology_seeds_i.shape[0])
+        else:
+            raise RuntimeError(
+                "Decoder output is missing seed activation information; "
+                "cannot calculate active units reliably."
+            )
+
+        if active_mask_i is not None and active_ids_i is not None:
+            assert int(active_mask_i.to(dtype=torch.bool).sum().item()) == int(active_ids_i.numel())
+
+        if active_mask_i is not None and topology_seeds_i is not None:
+            assert int(active_mask_i.to(dtype=torch.bool).sum().item()) == int(topology_seeds_i.shape[0])
+
+        inactive_count_i = total_seed_i - active_count_i
+        if inactive_count_i < 0:
+            raise RuntimeError(
+                f"Decoder reported more active seeds ({active_count_i}) than raw seeds ({total_seed_i})."
+            )
+
+        topology_count_i = (
+            int(topology_seeds_i.shape[0])
+            if isinstance(topology_seeds_i, torch.Tensor)
+            else active_count_i
+        )
+        soft_active_i = (
+            float(seed_activity_weight_i.detach().sum().item())
+            if isinstance(seed_activity_weight_i, torch.Tensor)
+            else float("nan")
+        )
+
+        return {
+            "raw": total_seed_i,
+            "active": active_count_i,
+            "inactive": inactive_count_i,
+            "topology": topology_count_i,
+            "soft_active": soft_active_i,
+        }
 
     @staticmethod
     def _pair_upper_values(t: torch.Tensor) -> torch.Tensor:
@@ -3228,6 +3518,7 @@ class NN_Trainer:
             w_raw=pred["w_raw"],
             generate_density_fiber=getattr(self.cfg, "generate_decoder_density_fiber", True),
         )
+        self._copy_activation_metadata_to_pred(pred, decoder_out)
 
         if getattr(self.cfg, "generate_decoder_density_fiber", True):
             decoder_out = apply_density_postprocess_to_output(
@@ -3256,6 +3547,9 @@ class NN_Trainer:
             "fiber3d_dense": fiber3d_dense,
             "seeds_uv": decoder_out.get("seeds_uv", decoder_out.get("seeds", None)),
             "topology_seeds_uv": decoder_out.get("topology_seeds_uv", decoder_out.get("seeds_uv", decoder_out.get("seeds", None))),
+            "seed_active_mask": decoder_out.get("seed_active_mask", None),
+            "active_seed_ids": decoder_out.get("active_seed_ids", None),
+            "seed_activity_weight": decoder_out.get("seed_activity_weight", None),
             "seeds_xyz": decoder_out.get("seeds_xyz", None),
             "edge_curves_uv": decoder_out.get("edge_curves_uv", None),
             "edge_curves_xyz": decoder_out.get("edge_curves_xyz", None),
@@ -4401,7 +4695,8 @@ class NN_Trainer:
         width, height = int(window_size[0]), int(window_size[1])
         uv = cache_i["uv_dense"].detach().cpu().numpy().astype(np.float64)
         faces = cache_i["faces_ijk"].detach().cpu().numpy().astype(np.int64)
-        seeds = seeds_i.detach().cpu().numpy().astype(np.float64)
+        raw_seeds_t = pred_i.get("seeds_uv", seeds_i)
+        seeds = raw_seeds_t.detach().cpu().numpy().astype(np.float64)
         topology_seeds_t = out_i.get("topology_seeds_uv", None)
         topology_seeds = None
         if isinstance(topology_seeds_t, torch.Tensor):
@@ -4480,10 +4775,24 @@ class NN_Trainer:
                     pass
 
         active_values = pred_i.get("seed_active_mask", None)
-        if active_values is not None:
-            active = active_values.detach().cpu().numpy().reshape(-1).astype(bool)
-        else:
+        if active_values is None:
+            if not getattr(self, "_warned_missing_seed_active_mask_for_timelapse", False):
+                tqdm.write(
+                    "Timelapse seed overlay is using all seeds as active because "
+                    "this cached prediction has no seed_active_mask."
+                )
+                self._warned_missing_seed_active_mask_for_timelapse = True
             active = np.ones((seeds.shape[0],), dtype=bool)
+        else:
+            active = active_values.detach().cpu().numpy().reshape(-1).astype(bool)
+            if active.shape[0] != seeds.shape[0]:
+                if not getattr(self, "_warned_missing_seed_active_mask_for_timelapse", False):
+                    tqdm.write(
+                        "Timelapse seed overlay is using all seeds as active because "
+                        "seed_active_mask length does not match raw seed positions."
+                    )
+                    self._warned_missing_seed_active_mask_for_timelapse = True
+                active = np.ones((seeds.shape[0],), dtype=bool)
         weight_values = pred_i.get("seed_active_weights", None)
         if weight_values is not None:
             weights = weight_values.detach().cpu().numpy().reshape(-1)
@@ -4495,8 +4804,8 @@ class NN_Trainer:
                     seeds[~active, 0],
                     seeds[~active, 1],
                     s=72,
-                    c="#6b7280",
-                    edgecolors="white",
+                    facecolors="none",
+                    edgecolors="#6b7280",
                     linewidths=1.4,
                     alpha=0.55,
                     zorder=5,
@@ -5895,6 +6204,9 @@ class NN_Trainer:
         best_step = -1
         best_active_count = None
         best_inactive_count = None
+        best_raw_seed_count = None
+        best_seed_active_mask = None
+        best_active_seed_ids = None
         best_rho = None
         best_fiber_surface = None
         best_seeds = None
@@ -5994,10 +6306,13 @@ class NN_Trainer:
                 w_geo_terms = []
                 h_terms = []
                 centerline_radius_terms = []
-                participating_count_total = 0.0
+                participating_count_total = 0
                 participating_frac_sum = 0.0
-                inactive_count_total = 0.0
+                inactive_count_total = 0
                 inactive_frac_sum = 0.0
+                raw_seed_count_total = 0
+                topology_seed_count_total = 0
+                soft_active_total = 0.0
 
                 # Activate losses based on their lambda values in the configuration (cfg). If a lambda value is set to 0.0, the corresponding loss will not be computed during training
                 compute_rep_loss = cfg.lam_rep != 0.0
@@ -6131,13 +6446,21 @@ class NN_Trainer:
                         "centerline_radius",
                         _centerline_radius_raw_from_w(cfg, w_raw_i),
                     )
-                    active_count_i = float(seeds_i.shape[0])
-                    inactive_count_i = 0.0
-                    total_seed_i = max(int(seeds_i.shape[0]), 1)
+                    activation_counts_i = self._decoder_seed_activation_counts(decoder_out)
+                    active_count_i = int(activation_counts_i["active"])
+                    inactive_count_i = int(activation_counts_i["inactive"])
+                    total_seed_i = int(activation_counts_i["raw"])
+                    topology_seed_count_i = int(activation_counts_i["topology"])
+                    soft_active_i = float(activation_counts_i["soft_active"])
+                    raw_seed_count_total += total_seed_i
+                    topology_seed_count_total += topology_seed_count_i
+                    if math.isfinite(soft_active_i):
+                        soft_active_total += soft_active_i
+                    total_seed_i_for_frac = max(total_seed_i, 1)
                     participating_count_total += active_count_i
-                    participating_frac_sum += active_count_i / float(total_seed_i)
+                    participating_frac_sum += active_count_i / float(total_seed_i_for_frac)
                     inactive_count_total += inactive_count_i
-                    inactive_frac_sum += inactive_count_i / float(total_seed_i)
+                    inactive_frac_sum += inactive_count_i / float(total_seed_i_for_frac)
 
                     for name, t in {
                         "seeds_i": seeds_i,
@@ -6187,13 +6510,18 @@ class NN_Trainer:
                         "w_geo": w_geo_i.detach().clone(),
                         "h": h_i.detach().clone() if isinstance(h_i, torch.Tensor) else h_i,
                         "centerline_radius": centerline_radius_i.detach().clone() if isinstance(centerline_radius_i, torch.Tensor) else centerline_radius_i,
-                        "seeds_uv": decoder_out.get("seeds_uv", seeds_i).detach().clone(),
+                        "seeds_uv": decoder_out["seeds_uv"].detach().clone(),
+                        "seed_active_mask": decoder_out["seed_active_mask"].detach().clone(),
+                        "active_seed_ids": decoder_out["active_seed_ids"].detach().clone(),
+                        "seed_activity_weight": decoder_out["seed_activity_weight"].detach().clone(),
+                        "topology_seeds_uv": decoder_out["topology_seeds_uv"].detach().clone(),
                         "seeds_xyz": decoder_out["seeds_xyz"].detach().clone() if isinstance(decoder_out.get("seeds_xyz"), torch.Tensor) else None,
                         "edge_curves_uv": decoder_out["edge_curves_uv"].detach().clone() if isinstance(decoder_out.get("edge_curves_uv"), torch.Tensor) else None,
                         "edge_curves_xyz": decoder_out["edge_curves_xyz"].detach().clone() if isinstance(decoder_out.get("edge_curves_xyz"), torch.Tensor) else None,
                         "edge_index": decoder_out["graph"]["edge_index"].detach().clone() if isinstance(decoder_out.get("graph"), dict) and isinstance(decoder_out["graph"].get("edge_index"), torch.Tensor) else None,
                         "edge_seed_pair": decoder_out["graph"]["edge_seed_pair"].detach().clone() if isinstance(decoder_out.get("graph"), dict) and isinstance(decoder_out["graph"].get("edge_seed_pair"), torch.Tensor) else None,
                         "edge_type": decoder_out["graph"]["edge_type"].detach().clone() if isinstance(decoder_out.get("graph"), dict) and isinstance(decoder_out["graph"].get("edge_type"), torch.Tensor) else None,
+                        "graph": self._clone_detached_tree(decoder_out.get("graph")),
                         "number_of_edges": int(topology_metrics_i["number_of_edges"]),
                         "topology_identifier": topology_metrics_i["topology_identifier"],
                     })
@@ -6546,7 +6874,7 @@ class NN_Trainer:
                     best_candidate_is_valid = (
                         ((cfg.lam_fem == 0.0) or fem_is_valid)
                         and total_is_finite
-                        and participating_count_total >= float(cfg.min_active_seeds or 1)
+                        and raw_seed_count_total >= int(cfg.min_active_seeds or 1)
                     )
 
                     prev_best_step = best_step
@@ -6592,6 +6920,11 @@ class NN_Trainer:
                         best_w_geo = float(w_geo_mean.detach().item())
                         best_active_count = float(participating_count_total)
                         best_inactive_count = float(inactive_count_total)
+                        best_raw_seed_count = int(raw_seed_count_total)
+                        if pred_list and isinstance(pred_list[0].get("seed_active_mask"), torch.Tensor):
+                            best_seed_active_mask = pred_list[0]["seed_active_mask"].detach().clone()
+                        if pred_list and isinstance(pred_list[0].get("active_seed_ids"), torch.Tensor):
+                            best_active_seed_ids = pred_list[0]["active_seed_ids"].detach().clone()
                         best_rho = rho.detach().clone()
                         best_fiber_surface = fiber_surface.detach().clone()
                         best_seeds = [s.detach().clone() for s in seeds_list]
@@ -6818,6 +7151,9 @@ class NN_Trainer:
                         "inactive_units_total": inactive_count_total,
                         "inactive_units_mean": inactive_count_mean,
                         "inactive_units_frac_mean": inactive_frac_mean,
+                        "raw_seed_units_total": raw_seed_count_total,
+                        "topology_seed_units_total": topology_seed_count_total,
+                        "soft_active_units_total": soft_active_total,
                         "anchor_update_allowed": 1.0 if anchor_update_allowed else 0.0,
                         "collapse_active": (
                             1.0
@@ -6909,6 +7245,8 @@ class NN_Trainer:
                         tqdm.write(
                             f"[{step:05d}] | "
                             f"Active Units/Total={participating_count_total:.0f}/{participating_count_total+inactive_count_total:.0f} | "
+                            f"Raw/Active/Inactive/Topology={raw_seed_count_total:.0f}/{participating_count_total:.0f}/{inactive_count_total:.0f}/{topology_seed_count_total:.0f} | "
+                            f"SoftActive={soft_active_total:.2f} | "
 
                             f"L_total={row['L_total']:.4e} | "
                             f"L_vol={row['loss_vol']:.3e} "
@@ -7093,6 +7431,12 @@ class NN_Trainer:
                     best_active_count = float(participating_count_total)
                 if best_inactive_count is None:
                     best_inactive_count = float(inactive_count_total)
+                if best_raw_seed_count is None:
+                    best_raw_seed_count = int(raw_seed_count_total)
+                if best_seed_active_mask is None and pred_list and isinstance(pred_list[0].get("seed_active_mask"), torch.Tensor):
+                    best_seed_active_mask = pred_list[0]["seed_active_mask"].detach().clone()
+                if best_active_seed_ids is None and pred_list and isinstance(pred_list[0].get("active_seed_ids"), torch.Tensor):
+                    best_active_seed_ids = pred_list[0]["active_seed_ids"].detach().clone()
 
         use_hard_result = False
         returned_best_source = "global"
@@ -7141,6 +7485,40 @@ class NN_Trainer:
                     )
                 finally:
                     self._restore_decoder_seed_state(decoder, decoder_seed_state)
+                restored_active_count = int(hard_out_i["seed_active_mask"].to(dtype=torch.bool).sum().item())
+                restored_topology_count = int(hard_out_i["topology_seeds_uv"].shape[0])
+                assert restored_active_count == restored_topology_count
+
+                saved_best_active_count = (
+                    int(best_seed_active_mask.to(dtype=torch.bool).sum().item())
+                    if isinstance(best_seed_active_mask, torch.Tensor)
+                    else int(round(float(best_active_count or 0.0)))
+                )
+                saved_seed_uv = pred_i.get("seeds_uv", None)
+                restored_seed_uv = hard_out_i.get("seeds_uv", None)
+                if isinstance(saved_seed_uv, torch.Tensor) and isinstance(restored_seed_uv, torch.Tensor):
+                    seed_difference_norm = float(
+                        torch.linalg.vector_norm(
+                            saved_seed_uv.detach().to(device=restored_seed_uv.device, dtype=restored_seed_uv.dtype)
+                            - restored_seed_uv.detach()
+                        ).item()
+                    )
+                else:
+                    seed_difference_norm = float("nan")
+                if restored_active_count != saved_best_active_count:
+                    source = (
+                        "topology threshold crossing"
+                        if math.isfinite(seed_difference_norm) and seed_difference_norm <= 1e-8
+                        else "checkpoint restoration or seed reconstruction"
+                    )
+                    tqdm.write(
+                        "Best-state active count mismatch: "
+                        f"saved_active={saved_best_active_count}, "
+                        f"restored_active={restored_active_count}, "
+                        f"seed_difference_norm={seed_difference_norm:.3e}, "
+                        f"likely_source={source}."
+                    )
+                self._copy_activation_metadata_to_pred(pred_i, hard_out_i)
 
                 if getattr(cfg, "generate_decoder_density_fiber", True):
                     hard_out_i = apply_density_postprocess_to_output(
@@ -7387,8 +7765,11 @@ class NN_Trainer:
             "best_score": best_score,
             "best_step": best_step,
             "best_solution_metrics": best_solution_metrics,
+            "best_raw_seed_count": int(best_raw_seed_count or 0),
             "best_active_units": float(best_active_count or 0.0),
             "best_inactive_units": float(best_inactive_count or 0.0),
+            "best_seed_active_mask": best_seed_active_mask,
+            "best_active_seed_ids": best_active_seed_ids,
             "best_hard_score": best_hard_score,
             "best_hard_step": best_hard_step,
             "best_hard_active_units": float(best_hard_active_count or 0.0),
@@ -7411,6 +7792,10 @@ class NN_Trainer:
             "best_seed_points_xyz": seed_points_final,
             "best_edge_curves_uv": best_pred[0].get("edge_curves_uv") if best_pred else None,
             "best_edge_curves_xyz": best_pred[0].get("edge_curves_xyz") if best_pred else None,
+            "best_graph": best_pred[0].get("graph") if best_pred else None,
+            "best_edge_index": best_pred[0].get("edge_index") if best_pred else None,
+            "best_edge_seed_pair": best_pred[0].get("edge_seed_pair") if best_pred else None,
+            "best_edge_type": best_pred[0].get("edge_type") if best_pred else None,
             "A_v": A_v,
             "uv_init_list": uv_init_list,
             "uv_anchor_list": [uv_anchor],

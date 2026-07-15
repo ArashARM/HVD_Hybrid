@@ -1917,6 +1917,13 @@ class ContinuousVoronoiDecoder(nn.Module):
                 'edge_curves_uv': curves_uv,
                 'edge_curves_xyz': curves_xyz,
             })
+            raw_count = int(out['seeds_uv'].shape[0])
+            active_count = int(out['seed_active_mask'].sum().item())
+            topology_count = int(out['topology_seeds_uv'].shape[0])
+
+            assert out['seed_active_mask'].numel() == raw_count
+            assert out['active_seed_ids'].numel() == active_count
+            assert topology_count == active_count
             return out
 
 

@@ -17,6 +17,22 @@ def make_decoder(**kwargs):
     return ContinuousVoronoiDecoder(None, face_mesh, **kwargs)
 
 
+def test_training_config_numeric_defaults_are_scalars() -> None:
+    cfg = TrainingConfig()
+
+    assert isinstance(cfg.curve_length_worst_weight, float)
+    assert isinstance(cfg.curve_length_outlier_weight, float)
+    assert isinstance(cfg.cell_edge_uniform_eps, float)
+    assert isinstance(cfg.cell_angle_eps, float)
+    assert isinstance(cfg.cell_vertex_merge_tolerance, float)
+
+
+def test_training_config_normalizes_single_item_numeric_tuples() -> None:
+    cfg = TrainingConfig(cell_angle_eps=(1e-7,))
+
+    assert cfg.cell_angle_eps == 1e-7
+
+
 def test_curve_length_loss_filters_to_configured_edge_types() -> None:
     trainer = NN_Trainer.__new__(NN_Trainer)
     trainer.cfg = TrainingConfig(
@@ -50,6 +66,91 @@ def test_curve_length_loss_filters_to_configured_edge_types() -> None:
     loss.backward()
     assert edge_curves_xyz.grad is not None
     assert torch.isfinite(edge_curves_xyz.grad[:2]).all()
+
+
+class DummyUnitSquareCadDomain:
+    def eval_uv_norm_batch(self, uv, return_inside_mask=False):
+        xyz = torch.cat(
+            (
+                uv,
+                torch.zeros((*uv.shape[:-1], 1), dtype=uv.dtype, device=uv.device),
+            ),
+            dim=-1,
+        )
+        out = {"xyz": xyz}
+        if return_inside_mask:
+            out["inside_mask"] = torch.ones(uv.shape[:-1], dtype=torch.bool, device=uv.device)
+        return out
+
+
+def test_duplicate_suppression_active_seed_accounting_matches_training_helper() -> None:
+    dtype = torch.float64
+    face_mesh = {
+        "uv": torch.tensor(
+            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+            dtype=dtype,
+        ),
+        "Xu": torch.tensor([[1.0, 0.0, 0.0]] * 4, dtype=dtype),
+        "Xv": torch.tensor([[0.0, 1.0, 0.0]] * 4, dtype=dtype),
+        "points_xyz": torch.tensor(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
+            dtype=dtype,
+        ),
+    }
+    decoder = ContinuousVoronoiDecoder(
+        DummyUnitSquareCadDomain(),
+        face_mesh,
+        use_seed_activation=True,
+        use_trim_activity=False,
+        duplicate_merge_sigma=0.08,
+    )
+    seeds = torch.tensor(
+        [
+            [0.10, 0.10],
+            [0.12, 0.10],
+            [0.80, 0.10],
+            [0.82, 0.10],
+            [0.50, 0.80],
+        ],
+        dtype=dtype,
+    )
+    w_raw = torch.ones((seeds.shape[0], seeds.shape[0]), dtype=dtype) * 0.02
+
+    out = decoder(seeds_uv=seeds, w_raw=w_raw, generate_density_fiber=False)
+
+    raw_count = int(out["seeds_uv"].shape[0])
+    active_count = int(out["seed_active_mask"].sum().item())
+
+    assert raw_count == 5
+    assert active_count < raw_count
+    assert int(out["active_seed_ids"].numel()) == active_count
+    assert int(out["topology_seeds_uv"].shape[0]) == active_count
+
+    counts = NN_Trainer._decoder_seed_activation_counts(out)
+    assert counts["raw"] == raw_count
+    assert counts["active"] == active_count
+    assert counts["topology"] == active_count
+    assert counts["inactive"] == raw_count - active_count
+
+
+def test_prediction_clone_preserves_activation_metadata_for_timelapse() -> None:
+    pred = {
+        "face_id": 0,
+        "seeds_raw": torch.zeros((5, 2), dtype=torch.float64),
+        "w_raw": torch.zeros((5, 5), dtype=torch.float64),
+        "seeds_uv": torch.zeros((5, 2), dtype=torch.float64),
+        "seed_active_mask": torch.tensor([True, False, True, False, True]),
+        "active_seed_ids": torch.tensor([0, 2, 4], dtype=torch.long),
+        "seed_activity_weight": torch.tensor([1.0, 0.2, 1.0, 0.2, 1.0]),
+        "topology_seeds_uv": torch.zeros((3, 2), dtype=torch.float64),
+    }
+
+    cached_pred = NN_Trainer._clone_pred_list([pred])[0]
+
+    assert "seed_active_mask" in cached_pred
+    assert "active_seed_ids" in cached_pred
+    assert "topology_seeds_uv" in cached_pred
+    assert int(cached_pred["seed_active_mask"].sum().item()) == int(cached_pred["topology_seeds_uv"].shape[0])
 
 
 class DummyVoronoiSeedTrainer(nn.Module):
