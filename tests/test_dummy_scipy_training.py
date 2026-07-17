@@ -4,7 +4,16 @@ import torch
 import torch.nn as nn
 
 from Decoder_CLasses.ContinuousVoronoiDecoder import ContinuousVoronoiDecoder
-from Training.MainTrain import NN_Trainer, TrainingConfig
+import Training.MainTrain as main_train
+from Training.MainTrain import (
+    NN_Trainer,
+    TrainingConfig,
+    build_edge_type_mask,
+    build_shared_curve_geometry,
+    compute_all_edge_curve_lengths,
+    needs_shared_curve_geometry,
+    resolve_edge_types_in_losses,
+)
 
 
 def make_decoder(**kwargs):
@@ -33,12 +42,92 @@ def test_training_config_normalizes_single_item_numeric_tuples() -> None:
     assert cfg.cell_angle_eps == 1e-7
 
 
-def test_curve_length_loss_filters_to_configured_edge_types() -> None:
-    trainer = NN_Trainer.__new__(NN_Trainer)
-    trainer.cfg = TrainingConfig(
-        curve_length_equal_edge_types=(0,),
-        curve_length_report_edge_types=(0,),
+def test_resolve_edge_types_in_losses_modes() -> None:
+    assert resolve_edge_types_in_losses("Interior") == (0,)
+    assert resolve_edge_types_in_losses("interior") == (0,)
+    assert resolve_edge_types_in_losses(" VDonly ") == (0, 1, 3)
+    assert resolve_edge_types_in_losses("all") == (0, 1, 3, 4)
+
+    for invalid in ("shell", "none", "0,1,3", "everything", None):
+        try:
+            resolve_edge_types_in_losses(invalid)  # type: ignore[arg-type]
+        except (TypeError, ValueError) as exc:
+            assert "Edge_in_losses" in str(exc)
+        else:
+            raise AssertionError(f"Expected {invalid!r} to fail")
+
+
+def test_edge_type_masks_exclude_reserved_type() -> None:
+    edge_type = torch.tensor([0, 1, 2, 3, 4])
+
+    assert torch.equal(
+        build_edge_type_mask(edge_type, resolve_edge_types_in_losses("Interior")),
+        torch.tensor([True, False, False, False, False]),
     )
+    assert torch.equal(
+        build_edge_type_mask(edge_type, resolve_edge_types_in_losses("VDonly")),
+        torch.tensor([True, True, False, True, False]),
+    )
+    assert torch.equal(
+        build_edge_type_mask(edge_type, resolve_edge_types_in_losses("all")),
+        torch.tensor([True, True, False, True, True]),
+    )
+
+
+def test_edge_in_losses_modes_select_expected_lengths_and_skip_reserved() -> None:
+    trainer = NN_Trainer.__new__(NN_Trainer)
+    edge_curves_xyz = torch.tensor(
+        [
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [99.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]],
+        ],
+        dtype=torch.float64,
+    )
+    geometry = build_shared_curve_geometry(
+        {
+            "edge_curves_xyz": edge_curves_xyz,
+            "graph": {
+                "edge_type": torch.tensor([0, 1, 2, 3, 4], dtype=torch.long),
+            },
+        }
+    )
+
+    trainer.cfg = TrainingConfig(Edge_in_losses="Interior")
+    assert torch.allclose(trainer.curve_3d_edge_lengths(geometry), edge_curves_xyz.new_tensor([1.0]))
+
+    trainer.cfg = TrainingConfig(Edge_in_losses="VDonly")
+    assert torch.allclose(trainer.curve_3d_edge_lengths(geometry), edge_curves_xyz.new_tensor([1.0, 2.0, 3.0]))
+
+    trainer.cfg = TrainingConfig(Edge_in_losses="all")
+    assert torch.allclose(trainer.curve_3d_edge_lengths(geometry), edge_curves_xyz.new_tensor([1.0, 2.0, 3.0, 4.0]))
+
+
+def test_compute_all_edge_curve_lengths_known_cases() -> None:
+    curves = torch.tensor(
+        [
+            [[0.0, 0.0, 0.0], [3.0, 4.0, 0.0], [3.0, 4.0, 0.0]],
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 2.0, 0.0]],
+        ],
+        dtype=torch.float64,
+    )
+
+    assert torch.allclose(
+        compute_all_edge_curve_lengths(curves),
+        torch.tensor([5.0, 3.0], dtype=torch.float64),
+    )
+    assert compute_all_edge_curve_lengths(curves.new_empty((0, 3, 3))).shape == (0,)
+    assert torch.equal(
+        compute_all_edge_curve_lengths(curves.new_ones((2, 1, 3))),
+        curves.new_zeros((2,)),
+    )
+
+
+def test_curve_length_loss_filters_to_edge_in_losses_mode() -> None:
+    trainer = NN_Trainer.__new__(NN_Trainer)
+    trainer.cfg = TrainingConfig(Edge_in_losses="Interior")
     edge_curves_xyz = torch.tensor(
         [
             [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
@@ -56,16 +145,223 @@ def test_curve_length_loss_filters_to_configured_edge_types() -> None:
         },
     }
 
-    filtered = trainer.curve_3d_edge_lengths(decoder_out, edge_types=(0,))
-    unfiltered = trainer.curve_3d_edge_lengths(decoder_out, include_shell_edges=True)
-    loss = trainer.curve_length_similarity_loss(decoder_out)
+    geometry = build_shared_curve_geometry(decoder_out)
+    filtered = trainer.curve_3d_edge_lengths(geometry)
+    all_lengths = trainer.curve_3d_edge_lengths(
+        geometry,
+        edge_types=resolve_edge_types_in_losses("all"),
+    )
+    loss = trainer.curve_length_similarity_loss(geometry)
 
     assert torch.allclose(filtered, edge_curves_xyz.new_tensor([1.0, 1.2]))
-    assert torch.allclose(unfiltered, edge_curves_xyz.new_tensor([1.0, 1.2, 0.02, 8.0]))
+    assert torch.allclose(all_lengths, edge_curves_xyz.new_tensor([1.0, 1.2, 0.02, 8.0]))
     assert loss < edge_curves_xyz.new_tensor(100.0)
     loss.backward()
     assert edge_curves_xyz.grad is not None
     assert torch.isfinite(edge_curves_xyz.grad[:2]).all()
+
+
+def test_shared_curve_geometry_gradients_feed_curve_losses() -> None:
+    trainer = NN_Trainer.__new__(NN_Trainer)
+    trainer.cfg = TrainingConfig(
+        Edge_in_losses="VDonly",
+        lam_cell_angle_uniform=0.0,
+        lam_cell_radial_uniform=0.0,
+    )
+    curves = torch.tensor(
+        [
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [8.0, 0.0, 0.0]],
+        ],
+        dtype=torch.double,
+        requires_grad=True,
+    )
+    decoder_out = {
+        "edge_curves_xyz": curves,
+        "graph": {
+            "edge_type": torch.tensor([0, 1, 3, 4], dtype=torch.long),
+            "edge_seed_pair": torch.tensor([[0, 1], [0, 2], [0, 3], [1, 2]], dtype=torch.long),
+        },
+    }
+
+    geometry = build_shared_curve_geometry(decoder_out)
+    total = (
+        trainer.curve_length_similarity_loss(geometry)
+        + trainer.cell_edge_uniformity_loss(geometry)
+    )
+    total.backward()
+
+    assert curves.grad is not None
+    assert torch.isfinite(curves.grad).all()
+    assert torch.count_nonzero(curves.grad).item() > 0
+
+
+def test_shared_curve_geometry_computes_lengths_once_for_losses_and_metrics(monkeypatch) -> None:
+    calls = {"count": 0}
+    original = main_train.compute_all_edge_curve_lengths
+
+    def counted(curves):
+        calls["count"] += 1
+        return original(curves)
+
+    monkeypatch.setattr(main_train, "compute_all_edge_curve_lengths", counted)
+
+    trainer = NN_Trainer.__new__(NN_Trainer)
+    trainer.cfg = TrainingConfig(
+        Edge_in_losses="VDonly",
+        lam_cell_angle_uniform=0.0,
+        lam_cell_radial_uniform=0.0,
+    )
+    curves = torch.tensor(
+        [
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
+        ],
+        dtype=torch.double,
+        requires_grad=True,
+    )
+    decoder_out = {
+        "edge_curves_xyz": curves,
+        "graph": {
+            "edge_type": torch.tensor([0, 1, 3], dtype=torch.long),
+            "edge_seed_pair": torch.tensor([[0, 1], [0, 2], [1, 2]], dtype=torch.long),
+        },
+    }
+
+    geometry = main_train.build_shared_curve_geometry(decoder_out)
+    trainer.curve_length_similarity_loss(geometry)
+    trainer.cell_edge_uniformity_loss(geometry)
+    selected_lengths = trainer.curve_3d_edge_lengths(geometry).detach()
+    trainer.solution_topology_metrics(decoder_out, curve_lengths=selected_lengths)
+
+    assert calls["count"] == 1
+
+
+def test_shared_curve_geometry_not_built_when_losses_and_reporting_are_inactive(monkeypatch) -> None:
+    calls = {"count": 0}
+
+    def counted(curves):
+        calls["count"] += 1
+        return curves.new_zeros((curves.shape[0],))
+
+    monkeypatch.setattr(main_train, "compute_all_edge_curve_lengths", counted)
+
+    need_geometry = needs_shared_curve_geometry(
+        compute_curve_length_loss=False,
+        compute_cell_edge_uniform_loss=False,
+        collect_curve_metrics=False,
+        collect_topology_metrics=False,
+    )
+    decoder_out = {
+        "edge_curves_xyz": torch.zeros((2, 2, 3)),
+        "graph": {
+            "edge_type": torch.tensor([0, 1]),
+            "edge_seed_pair": torch.tensor([[0, 1], [1, 2]]),
+        },
+    }
+    geometry = main_train.build_shared_curve_geometry(decoder_out) if need_geometry else None
+
+    assert geometry is None
+    assert calls["count"] == 0
+
+
+def test_shared_curve_geometry_requires_matching_edge_type_metadata() -> None:
+    curves = torch.zeros((2, 2, 3), dtype=torch.double)
+
+    try:
+        build_shared_curve_geometry({"edge_curves_xyz": curves, "graph": {}})
+    except ValueError as exc:
+        assert "edge_type" in str(exc)
+    else:
+        raise AssertionError("missing edge_type should fail")
+
+    try:
+        build_shared_curve_geometry(
+            {
+                "edge_curves_xyz": curves,
+                "graph": {
+                    "edge_type": torch.tensor([0]),
+                    "edge_seed_pair": torch.tensor([[0, 1], [1, 2]]),
+                },
+            }
+        )
+    except ValueError as exc:
+        assert "edge_type" in str(exc)
+    else:
+        raise AssertionError("mismatched edge_type should fail")
+
+
+def test_shared_curve_geometry_validates_edge_seed_pair_shape() -> None:
+    try:
+        build_shared_curve_geometry(
+            {
+                "edge_curves_xyz": torch.zeros((2, 2, 3), dtype=torch.double),
+                "graph": {
+                    "edge_type": torch.tensor([0, 1]),
+                    "edge_seed_pair": torch.tensor([[0, 1, 2]]),
+                },
+            }
+        )
+    except ValueError as exc:
+        assert "edge_seed_pair" in str(exc)
+    else:
+        raise AssertionError("mismatched edge_seed_pair should fail")
+
+
+def test_shared_curve_geometry_requires_edge_seed_pair_when_requested() -> None:
+    try:
+        build_shared_curve_geometry(
+            {
+                "edge_curves_xyz": torch.zeros((2, 2, 3), dtype=torch.double),
+                "graph": {
+                    "edge_type": torch.tensor([0, 1]),
+                },
+            },
+            require_edge_seed_pair=True,
+        )
+    except ValueError as exc:
+        assert "edge_seed_pair" in str(exc)
+    else:
+        raise AssertionError("missing edge_seed_pair should fail when required")
+
+
+def test_cell_edge_uniformity_excludes_shell_edges_even_in_all_mode() -> None:
+    trainer = NN_Trainer.__new__(NN_Trainer)
+    trainer.cfg = TrainingConfig(
+        Edge_in_losses="all",
+        lam_cell_angle_uniform=0.0,
+        lam_cell_radial_uniform=0.0,
+    )
+    edge_curves_xyz = torch.tensor(
+        [
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [50.0, 0.0, 0.0]],
+        ],
+        dtype=torch.double,
+        requires_grad=True,
+    )
+    decoder_out = {
+        "edge_curves_xyz": edge_curves_xyz,
+        "graph": {
+            "edge_type": torch.tensor([0, 1, 4], dtype=torch.long),
+            "edge_seed_pair": torch.tensor([[0, 1], [0, 2], [0, 3]], dtype=torch.long),
+        },
+    }
+
+    loss = trainer.cell_edge_uniformity_loss(build_shared_curve_geometry(decoder_out))
+
+    assert torch.allclose(loss, edge_curves_xyz.new_zeros(()))
+
+
+def test_compute_all_edge_curve_lengths_gradcheck() -> None:
+    curves = torch.randn(3, 4, 3, dtype=torch.double, requires_grad=True)
+    curves = curves + torch.arange(4, dtype=torch.double).view(1, 4, 1)
+
+    assert torch.autograd.gradcheck(compute_all_edge_curve_lengths, (curves,))
 
 
 class DummyUnitSquareCadDomain:
@@ -891,10 +1187,11 @@ def test_cell_edge_uniformity_loss_groups_edges_per_cell() -> None:
                 [[0, 1], [0, 2], [0, 3], [1, 2]],
                 dtype=torch.long,
             ),
+            "edge_type": torch.tensor([0, 0, 0, 0], dtype=torch.long),
         },
     }
 
-    loss = trainer.cell_edge_uniformity_loss(decoder_out)
+    loss = trainer.cell_edge_uniformity_loss(build_shared_curve_geometry(decoder_out))
 
     assert torch.allclose(loss, edge_curves_xyz.new_tensor(5.0 / 54.0))
     loss.backward()
@@ -929,10 +1226,11 @@ def test_cell_edge_uniformity_loss_penalizes_per_cell_angles() -> None:
                 [[0, 1], [0, 2], [0, 3], [0, 4], [0, 5], [0, 6]],
                 dtype=torch.long,
             ),
+            "edge_type": torch.tensor([0, 0, 0, 0, 0, 0], dtype=torch.long),
         },
     }
 
-    loss = trainer.cell_edge_uniformity_loss(decoder_out)
+    loss = trainer.cell_edge_uniformity_loss(build_shared_curve_geometry(decoder_out))
 
     assert loss > edge_curves_xyz.new_tensor(0.0)
     loss.backward()

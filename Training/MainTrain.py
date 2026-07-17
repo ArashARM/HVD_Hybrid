@@ -11,7 +11,6 @@ from datetime import datetime
 from typing import Any
 
 import cv2
-from sympy import python
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from Utils.TimelapseRecorder import TimelapseRecorder
@@ -36,11 +35,19 @@ try:
     from .Loss_FEM import Loss_FEM
     from .Loss_Volume import Loss_Volume
     from .Loss_rep import Loss_rep
+    from .Loss_DensityWeightedCVT import LossDensityWeightedCVT
+    from .Loss_ActivityWeights import prepare_seed_activity_weights
+    from .Loss_SeedDomainRecovery import LossSeedDomainRecovery
+    from .Loss_SeedActive import Loss_SeedActive
 except ImportError:
     from Loss_Boundary import Loss_Boundary
     from Loss_FEM import Loss_FEM
     from Loss_Volume import Loss_Volume
     from Loss_rep import Loss_rep
+    from Loss_DensityWeightedCVT import LossDensityWeightedCVT
+    from Loss_ActivityWeights import prepare_seed_activity_weights
+    from Loss_SeedDomainRecovery import LossSeedDomainRecovery
+    from Loss_SeedActive import Loss_SeedActive
 
 
 def compute_w_min_from_min_feature_size_3d(
@@ -86,13 +93,203 @@ def compute_w_min_from_min_feature_size_3d(
 
     return float(w_min_uv.detach().cpu())
 
+
+EDGE_INTERIOR_VORONOI = 0
+EDGE_CLIPPED_ONE_SIDE = 1
+EDGE_RESERVED = 2
+EDGE_CLIPPED_TWO_SIDE = 3
+EDGE_DOMAIN_SHELL = 4
+
+EDGE_TYPES_BY_LOSS_MODE = {
+    "Interior": (EDGE_INTERIOR_VORONOI,),
+    "VDonly": (EDGE_INTERIOR_VORONOI, EDGE_CLIPPED_ONE_SIDE, EDGE_CLIPPED_TWO_SIDE),
+    "all": (EDGE_INTERIOR_VORONOI, EDGE_CLIPPED_ONE_SIDE, EDGE_CLIPPED_TWO_SIDE, EDGE_DOMAIN_SHELL),
+}
+CELL_GEOMETRY_EDGE_TYPES = (
+    EDGE_INTERIOR_VORONOI,
+    EDGE_CLIPPED_ONE_SIDE,
+    EDGE_CLIPPED_TWO_SIDE,
+)
+
+
+def canonical_edge_in_losses_mode(mode: str) -> str:
+    if not isinstance(mode, str):
+        raise TypeError(
+            f"Edge_in_losses must be a string, got {type(mode).__name__}."
+        )
+
+    normalized = mode.strip().lower()
+    canonical_by_normalized = {
+        "interior": "Interior",
+        "vdonly": "VDonly",
+        "all": "all",
+    }
+
+    if normalized not in canonical_by_normalized:
+        raise ValueError(
+            "Invalid Edge_in_losses value "
+            f"{mode!r}. Expected one of: 'Interior', 'VDonly', 'all'."
+        )
+
+    return canonical_by_normalized[normalized]
+
+
+def resolve_edge_types_in_losses(mode: str) -> tuple[int, ...]:
+    return EDGE_TYPES_BY_LOSS_MODE[canonical_edge_in_losses_mode(mode)]
+
+
+def build_edge_type_mask(
+    edge_type: torch.Tensor,
+    allowed_types: tuple[int, ...],
+) -> torch.Tensor:
+    if edge_type.ndim != 1:
+        raise ValueError(
+            f"edge_type must be one-dimensional, got {edge_type.shape}."
+        )
+
+    mask = torch.zeros_like(edge_type, dtype=torch.bool)
+    for edge_type_value in allowed_types:
+        mask |= edge_type == int(edge_type_value)
+    return mask
+
+
+def compute_all_edge_curve_lengths(
+    edge_curves_xyz: torch.Tensor,
+) -> torch.Tensor:
+    if edge_curves_xyz.ndim != 3:
+        raise ValueError(
+            "edge_curves_xyz must have shape [E, K, 3], "
+            f"got {tuple(edge_curves_xyz.shape)}."
+        )
+
+    if edge_curves_xyz.shape[-1] != 3:
+        raise ValueError(
+            "The final edge_curves_xyz dimension must be 3."
+        )
+
+    edge_count = edge_curves_xyz.shape[0]
+    sample_count = edge_curves_xyz.shape[1]
+
+    if edge_count == 0:
+        return edge_curves_xyz.new_empty((0,))
+
+    if sample_count < 2:
+        return edge_curves_xyz.new_zeros((edge_count,))
+
+    segments = edge_curves_xyz[:, 1:, :] - edge_curves_xyz[:, :-1, :]
+
+    return torch.linalg.vector_norm(
+        segments,
+        ord=2,
+        dim=-1,
+    ).sum(dim=-1)
+
+
+@dataclass
+class SharedCurveGeometry:
+    curves_xyz: torch.Tensor
+    edge_lengths: torch.Tensor
+    finite_edge_mask: torch.Tensor
+    edge_type: torch.Tensor
+    edge_seed_pair: torch.Tensor | None
+
+
+def build_shared_curve_geometry(
+    decoder_out: dict,
+    *,
+    require_edge_type: bool = True,
+    require_edge_seed_pair: bool = False,
+) -> SharedCurveGeometry | None:
+    curves = decoder_out.get("edge_curves_xyz", None)
+    if curves is None:
+        return None
+
+    edge_lengths = compute_all_edge_curve_lengths(curves)
+    graph = decoder_out.get("graph", None)
+    edge_count = curves.shape[0]
+
+    edge_type = None
+    edge_seed_pair = None
+    if isinstance(graph, dict):
+        edge_type = graph.get("edge_type", None)
+        edge_seed_pair = graph.get(
+            "edge_seed_pair_original",
+            graph.get("edge_seed_pair", None),
+        )
+
+    if edge_type is None:
+        if require_edge_type:
+            raise ValueError(
+                "decoder_out['graph']['edge_type'] is required when "
+                "edge_curves_xyz is present."
+            )
+        edge_type = torch.full((edge_count,), EDGE_INTERIOR_VORONOI, dtype=torch.long, device=curves.device)
+    else:
+        edge_type = torch.as_tensor(
+            edge_type,
+            dtype=torch.long,
+            device=curves.device,
+        ).reshape(-1)
+        if edge_type.shape[0] != edge_count:
+            raise ValueError(
+                "decoder_out['graph']['edge_type'] must have one value per "
+                f"edge curve, got {edge_type.shape[0]} for {edge_count} curves."
+            )
+
+    if edge_seed_pair is None:
+        if require_edge_seed_pair:
+            raise ValueError(
+                "decoder_out['graph']['edge_seed_pair'] is required "
+                "when the cell edge-uniformity loss is enabled."
+            )
+    else:
+        edge_seed_pair = torch.as_tensor(
+            edge_seed_pair,
+            dtype=torch.long,
+            device=curves.device,
+        )
+        if edge_seed_pair.ndim != 2 or edge_seed_pair.shape != (edge_count, 2):
+            raise ValueError(
+                "decoder_out['graph']['edge_seed_pair'] must have shape "
+                f"[{edge_count}, 2], got {tuple(edge_seed_pair.shape)}."
+            )
+
+    finite_edge_mask = (
+        torch.isfinite(edge_lengths)
+        & torch.isfinite(curves).all(dim=-1).all(dim=-1)
+    )
+
+    return SharedCurveGeometry(
+        curves_xyz=curves,
+        edge_lengths=edge_lengths,
+        finite_edge_mask=finite_edge_mask,
+        edge_type=edge_type,
+        edge_seed_pair=edge_seed_pair,
+    )
+
+
+def needs_shared_curve_geometry(
+    *,
+    compute_curve_length_loss: bool,
+    compute_cell_edge_uniform_loss: bool,
+    collect_curve_metrics: bool,
+    collect_topology_metrics: bool,
+) -> bool:
+    return (
+        compute_curve_length_loss
+        or compute_cell_edge_uniform_loss
+        or collect_curve_metrics
+        or collect_topology_metrics
+    )
+
+
 @dataclass
 class TrainingConfig:
     seed_init_fps_seed: int | None = None
     use_balanced_seed_init: bool = True
     seed_number: int = 15
     training_face_index: int = 0
-    LoadingCasee: str = "Unspecified loading case"
+    LoadingCase: str = "Unspecified loading case"
 
     target_volfrac: float = 0.5
     seed_repulsion_sigma: float = 0.08
@@ -159,26 +356,32 @@ class TrainingConfig:
     lam_bnd: float = 0.5
     lam_vol_effective: float = 0.5
     effective_volume_power: float = 2.0
-    lam_curve_length: float = 1.0
-    curve_length_target: float | None = None
-    curve_length_loss_type: str = "pairwise"
+    lambda_cvt: float = 1.0
+    cvt_temperature: float = 0.02
+    cvt_importance_source: str = "fem_stress"
+    cvt_importance_normalize_mean: bool = True
+    cvt_importance_min: float = 0.0
+    cvt_importance_max: float | None = None
+    use_smooth_seed_activity_in_losses: bool = True
+    activity_weight_floor: float = 0.02
+    activity_weight_power: float = 1.0
+    activity_pair_weight_mode: str = "geometric_mean"
+    activity_recovery_floor: float = 0.05
+    activity_recovery_power: float = 1.0
+    cvt_activity_log_floor: float = 1e-4
+    cvt_activity_temperature: float = 1.0
+    repulsion_inactive_recovery_strength: float = 1.0
+    lam_seed_domain_recovery: float = 1.0
+    lam_seed_active: float = 1.0
+    seed_active_loss_mode: str = "minimum"
+    seed_active_loss_temperature: float = 0.25
+    lam_curve_length: float = 0.1
     curve_length_eps: float = 1e-8
     curve_length_tolerance: float = 0.15
-    curve_length_exclude_shell_edges: bool = True
-    curve_length_ratio_target: float = 1.25
-    curve_length_ratio_weight: float = 50.0
-    curve_length_range_weight: float = 10.0
-    curve_length_log_weight: float = 10.0
-    curve_length_max_log_weight: float = 50.0
-    curve_length_short_edge_weight: float = 50.0
-    curve_length_long_edge_weight: float = 10.0
-    curve_length_equal_edge_types: tuple[int, ...] | None = (0,)
-    curve_length_report_edge_types: tuple[int, ...] | None = (0,)
+    Edge_in_losses: str = "Interior"
     lam_cell_edge_uniform: float = 1.0
     lam_cell_angle_uniform: float = 1.0
     lam_cell_radial_uniform: float = 0.5
-    cell_edge_uniform_eps: float = 1e-8
-    cell_angle_uniform_eps: float = 1e-8
 
     comp_normalize_by: float | None = 1e10
     normalize_losses: bool = True
@@ -196,7 +399,7 @@ class TrainingConfig:
     seed_anchor_warmup_frac: float = 0.05
     use_rolling_seed_anchors: bool = True
     disable_rolling_seed_anchors_for_curve_only: bool = True
-    guard_seed_anchor_updates: bool = True
+    anchor_guard_updates: bool = True
     anchor_guard_rep_max: float = 0.30
     anchor_guard_bnd_max: float = 0.80
     anchor_guard_vol_eff_min: float = 0.10
@@ -266,15 +469,13 @@ class TrainingConfig:
             "curve_length_outlier_weight",
             "cell_edge_uniform_eps",
             "cell_angle_eps",
-            "cell_angle_uniform_eps",
             "cell_vertex_merge_tolerance",
         ):
             value = getattr(self, name, None)
             if isinstance(value, tuple) and len(value) == 1:
                 setattr(self, name, value[0])
 
-        if self.cell_angle_uniform_eps != 1e-8 and self.cell_angle_eps == 1e-8:
-            self.cell_angle_eps = self.cell_angle_uniform_eps
+        self.Edge_in_losses = canonical_edge_in_losses_mode(self.Edge_in_losses)
 
         self.training_face_index = int(self.training_face_index)
         if self.training_face_index < 0:
@@ -404,6 +605,60 @@ class TrainingConfig:
                 raise ValueError(
                     f"min_feature_size_3d must be > 0, got {self.min_feature_size_3d}"
                 )
+        if not (0.0 <= self.activity_weight_floor < 1.0):
+            raise ValueError(
+                "activity_weight_floor must satisfy 0 <= floor < 1, "
+                f"got {self.activity_weight_floor}"
+            )
+        if self.activity_weight_power <= 0.0:
+            raise ValueError(
+                f"activity_weight_power must be > 0, got {self.activity_weight_power}"
+            )
+        if self.activity_pair_weight_mode != "geometric_mean":
+            raise ValueError(
+                "activity_pair_weight_mode must be 'geometric_mean', "
+                f"got {self.activity_pair_weight_mode!r}"
+            )
+        if not (0.0 <= self.activity_recovery_floor < 1.0):
+            raise ValueError(
+                "activity_recovery_floor must satisfy 0 <= floor < 1, "
+                f"got {self.activity_recovery_floor}"
+            )
+        if self.activity_recovery_power <= 0.0:
+            raise ValueError(
+                f"activity_recovery_power must be > 0, got {self.activity_recovery_power}"
+            )
+        if self.cvt_activity_log_floor <= 0.0:
+            raise ValueError(
+                f"cvt_activity_log_floor must be > 0, got {self.cvt_activity_log_floor}"
+            )
+        if self.cvt_activity_temperature <= 0.0:
+            raise ValueError(
+                f"cvt_activity_temperature must be > 0, got {self.cvt_activity_temperature}"
+            )
+        if self.repulsion_inactive_recovery_strength < 0.0:
+            raise ValueError(
+                "repulsion_inactive_recovery_strength must be >= 0, "
+                f"got {self.repulsion_inactive_recovery_strength}"
+            )
+        if self.lam_seed_domain_recovery < 0.0:
+            raise ValueError(
+                f"lam_seed_domain_recovery must be >= 0, got {self.lam_seed_domain_recovery}"
+            )
+        if self.lam_seed_active < 0.0:
+            raise ValueError(
+                f"lam_seed_active must be >= 0, got {self.lam_seed_active}"
+            )
+        if self.seed_active_loss_mode not in {"minimum", "target"}:
+            raise ValueError(
+                "seed_active_loss_mode must be one of: 'minimum', 'target', "
+                f"got {self.seed_active_loss_mode!r}"
+            )
+        if self.seed_active_loss_temperature <= 0.0:
+            raise ValueError(
+                "seed_active_loss_temperature must be > 0, "
+                f"got {self.seed_active_loss_temperature}"
+            )
         self.use_balanced_seed_init = bool(self.use_balanced_seed_init)
 
 
@@ -1377,6 +1632,9 @@ class NN_Trainer:
         self.loss_fem = Loss_FEM(self)
         self.loss_boundary = Loss_Boundary()
         self.loss_rep = Loss_rep()
+        self.loss_density_weighted_cvt = LossDensityWeightedCVT()
+        self.loss_seed_domain_recovery = LossSeedDomainRecovery()
+        self.loss_seed_active = Loss_SeedActive()
         self.timelapse_loading_img = (
             None if loading_img is None else self._composite_to_white(np.asarray(loading_img))
         )
@@ -1387,44 +1645,58 @@ class NN_Trainer:
 
     def curve_3d_edge_lengths(
         self,
-        decoder_out,
-        include_shell_edges: bool | None = None,
+        curve_geometry: SharedCurveGeometry,
         edge_types: tuple[int, ...] | list[int] | None = None,
     ):
-        curves = decoder_out.get("edge_curves_xyz", None)
-        if curves is None:
-            for value in decoder_out.values():
-                if torch.is_tensor(value):
-                    return value.new_empty((0,))
-            try:
-                device = next(self.ppnet_cls.parameters()).device
-            except Exception:
-                device = getattr(self, "device", torch.device("cpu"))
-            return torch.empty((0,), device=device)
+        allowed_types = (
+            tuple(edge_types)
+            if edge_types is not None
+            else resolve_edge_types_in_losses(self.cfg.Edge_in_losses)
+        )
+        type_mask = build_edge_type_mask(curve_geometry.edge_type, allowed_types)
+        keep = curve_geometry.finite_edge_mask & type_mask
+        return curve_geometry.edge_lengths[keep]
 
-        if curves.ndim != 3 or curves.shape[0] == 0 or curves.shape[1] < 2:
-            return curves.new_empty((0,))
+    def curve_edge_activity_weights(
+        self,
+        curve_geometry: SharedCurveGeometry,
+        seed_active_weights: torch.Tensor | None,
+    ) -> torch.Tensor:
+        curves = curve_geometry.curves_xyz
+        edge_count = curves.shape[0]
+        pairs = curve_geometry.edge_seed_pair
+        if seed_active_weights is None or pairs is None:
+            return torch.ones(edge_count, dtype=curves.dtype, device=curves.device)
 
-        seg = curves[:, 1:, :] - curves[:, :-1, :]
-        edge_len = torch.linalg.norm(seg, dim=-1).sum(dim=-1)
-        graph = decoder_out.get("graph", None)
-        edge_type = graph.get("edge_type", None) if isinstance(graph, dict) else None
-        if edge_type is not None:
-            edge_type = torch.as_tensor(edge_type, dtype=torch.long, device=edge_len.device).reshape(-1)
-            if edge_type.shape[0] == edge_len.shape[0]:
-                if edge_types is not None:
-                    keep = torch.zeros_like(edge_type, dtype=torch.bool)
-                    for value in tuple(edge_types):
-                        keep = keep | (edge_type == int(value))
-                    edge_len = edge_len[keep]
-                else:
-                    if include_shell_edges is None:
-                        include_shell_edges = not bool(getattr(self.cfg, "curve_length_exclude_shell_edges", True))
-                    if not include_shell_edges:
-                        edge_len = edge_len[edge_type != 4]
-        elif include_shell_edges is None:
-            include_shell_edges = not bool(getattr(self.cfg, "curve_length_exclude_shell_edges", True))
-        return edge_len[torch.isfinite(edge_len)]
+        num_seeds = int(seed_active_weights.reshape(-1).numel())
+        g_eff = prepare_seed_activity_weights(
+            seed_active_weights,
+            num_seeds=num_seeds,
+            reference=curves,
+            floor=float(getattr(self.cfg, "activity_weight_floor", 0.02)),
+            power=float(getattr(self.cfg, "activity_weight_power", 1.0)),
+        )
+
+        pairs = pairs.to(device=curves.device, dtype=torch.long)
+        valid = (pairs >= 0) & (pairs < num_seeds)
+        safe_pairs = pairs.clamp(0, max(num_seeds - 1, 0))
+        endpoint_weights = g_eff[safe_pairs] * valid.to(dtype=curves.dtype)
+        valid_count = valid.to(dtype=curves.dtype).sum(dim=1)
+
+        two_endpoint = valid_count >= 2.0
+        one_endpoint = valid_count == 1.0
+        edge_activity = torch.ones(edge_count, dtype=curves.dtype, device=curves.device)
+        edge_activity = torch.where(
+            two_endpoint,
+            torch.sqrt(endpoint_weights.prod(dim=1).clamp_min(float(getattr(self.cfg, "eps", 1e-12)))),
+            edge_activity,
+        )
+        edge_activity = torch.where(
+            one_endpoint,
+            endpoint_weights.sum(dim=1),
+            edge_activity,
+        )
+        return edge_activity
 
     @staticmethod
     def topology_identifier_from_graph(graph: dict | None) -> str:
@@ -1452,23 +1724,22 @@ class NN_Trainer:
     def solution_topology_metrics(
         self,
         decoder_out: dict,
+        *,
         curve_lengths: torch.Tensor | None = None,
     ) -> dict[str, float | int | str]:
         if curve_lengths is None:
-            curve_lengths = self.curve_3d_edge_lengths(
-                decoder_out,
-                edge_types=getattr(self.cfg, "curve_length_report_edge_types", (0,)),
-            )
+            raise ValueError("solution_topology_metrics requires preselected curve_lengths.")
 
         graph = decoder_out.get("graph", None)
         edge_index = graph.get("edge_index", None) if isinstance(graph, dict) else None
         if isinstance(edge_index, torch.Tensor):
-            number_of_edges = int(edge_index.shape[0])
+            number_of_total_edges = int(edge_index.shape[0])
         elif edge_index is not None:
-            number_of_edges = int(np.asarray(edge_index).shape[0])
+            number_of_total_edges = int(np.asarray(edge_index).shape[0])
         else:
             curves = decoder_out.get("edge_curves_xyz", decoder_out.get("edge_curves_uv", None))
-            number_of_edges = int(curves.shape[0]) if isinstance(curves, torch.Tensor) and curves.ndim >= 1 else 0
+            number_of_total_edges = int(curves.shape[0]) if isinstance(curves, torch.Tensor) and curves.ndim >= 1 else 0
+        number_of_selected_edges = int(curve_lengths.numel()) if curve_lengths is not None else 0
 
         if curve_lengths is not None and curve_lengths.numel() > 0:
             lengths = curve_lengths.detach()
@@ -1497,12 +1768,18 @@ class NN_Trainer:
             "standard_deviation": standard_deviation,
             "coefficient_of_variation": coefficient_of_variation,
             "maximum_minimum_ratio": maximum_minimum_ratio,
-            "number_of_edges": number_of_edges,
+            "number_of_selected_edges": number_of_selected_edges,
+            "number_of_total_edges": number_of_total_edges,
+            "number_of_edges": number_of_selected_edges,
             "topology_identifier": self.topology_identifier_from_graph(graph),
         }
 
 
-    def curve_length_similarity_loss(self, decoder_out):
+    def curve_length_similarity_loss(
+        self,
+        curve_geometry: SharedCurveGeometry,
+        seed_active_weights: torch.Tensor | None = None,
+    ):
         """
         Encourage selected 3D Voronoi edges to have similar lengths.
 
@@ -1511,14 +1788,14 @@ class NN_Trainer:
         """
         cfg = self.cfg
 
-        edge_lengths = self.curve_3d_edge_lengths(
-            decoder_out,
-            edge_types=getattr(
-                cfg,
-                "curve_length_equal_edge_types",
-                (0,),
-            ),
-        )
+        allowed_types = resolve_edge_types_in_losses(cfg.Edge_in_losses)
+        type_mask = build_edge_type_mask(curve_geometry.edge_type, allowed_types)
+        keep = curve_geometry.finite_edge_mask & type_mask
+        edge_lengths = curve_geometry.edge_lengths[keep]
+        edge_weights = self.curve_edge_activity_weights(
+            curve_geometry,
+            seed_active_weights,
+        )[keep]
 
         if edge_lengths.numel() <= 1:
             return edge_lengths.new_zeros(())
@@ -1537,7 +1814,8 @@ class NN_Trainer:
             0.0,
         )
 
-        mean_length = edge_lengths.mean().clamp_min(eps)
+        weight_sum = edge_weights.sum().clamp_min(eps)
+        mean_length = (edge_weights * edge_lengths).sum().div(weight_sum).clamp_min(eps)
         log_ratio = torch.log(
             edge_lengths.clamp_min(eps) / mean_length
         )
@@ -1545,7 +1823,7 @@ class NN_Trainer:
         # No penalty for edges inside the requested relative tolerance.
         excess = torch.relu(log_ratio.abs() - tolerance)
 
-        mean_loss = excess.square().mean()
+        mean_loss = (edge_weights * excess.square()).sum() / weight_sum
 
         # Smooth worst-edge approximation, instead of hard max.
         temperature = 12.0
@@ -1559,8 +1837,11 @@ class NN_Trainer:
         ) / temperature
 
         # Additional emphasis on outliers, weighted smoothly by severity.
+        # Detaching only the adaptive weights preserves gradients through the
+        # selected shared edge lengths while avoiding gradients through the
+        # weighting decision itself.
         severity_weights = torch.softmax(
-            outlier_weight * excess.detach(),
+            torch.log(edge_weights.clamp_min(eps)) + outlier_weight * excess.detach(),
             dim=0,
         )
         outlier_loss = (
@@ -1573,407 +1854,314 @@ class NN_Trainer:
             + outlier_loss
         )
 
-
-
-    def curve_length_similarity_loss_old(self, decoder_out):
-        """
-        Differentiable loss that encourages all generated 3D edge curves
-        to have similar lengths.
-
-        Uses decoder_out["edge_curves_xyz"] with shape [E, K, 3].
-        """
+    def cell_edge_uniformity_loss(
+        self,
+        curve_geometry: SharedCurveGeometry,
+        seed_active_weights: torch.Tensor | None = None,
+    ):
         cfg = self.cfg
-        equal_edge_types = getattr(cfg, "curve_length_equal_edge_types", (0,))
-        edge_len = self.curve_3d_edge_lengths(decoder_out, edge_types=equal_edge_types)
-        if edge_len.numel() <= 1:
-            return edge_len.new_zeros(())
 
-        eps = float(getattr(cfg, "curve_length_eps", 1e-8))
-        mean_len = edge_len.mean().clamp_min(eps)
-        loss_type = str(getattr(cfg, "curve_length_loss_type", "cv")).lower()
+        curves = curve_geometry.curves_xyz
 
-        def equality_shape_penalty() -> torch.Tensor:
-            min_len = edge_len.min().clamp_min(eps)
-            max_len = edge_len.max()
-            ratio_target = max(float(getattr(cfg, "curve_length_ratio_target", 1.25)), 1.0 + eps)
-            ratio_weight = max(float(getattr(cfg, "curve_length_ratio_weight", 50.0)), 0.0)
-            range_weight = max(float(getattr(cfg, "curve_length_range_weight", 10.0)), 0.0)
-            log_weight = max(float(getattr(cfg, "curve_length_log_weight", 10.0)), 0.0)
-            max_log_weight = max(float(getattr(cfg, "curve_length_max_log_weight", 50.0)), 0.0)
-            short_edge_weight = max(float(getattr(cfg, "curve_length_short_edge_weight", 50.0)), 0.0)
-            long_edge_weight = max(float(getattr(cfg, "curve_length_long_edge_weight", 10.0)), 0.0)
-            tol = max(float(getattr(cfg, "curve_length_tolerance", 0.15)), eps)
-            ratio = max_len / min_len
-            ratio_excess = torch.relu(torch.log(ratio / ratio_target))
-            rel_range = (max_len - min_len) / mean_len
-            log_to_mean = torch.log((edge_len / mean_len).clamp_min(eps))
-            lower = torch.exp(edge_len.new_tensor(-tol))
-            upper = torch.exp(edge_len.new_tensor(tol))
-            short_excess = torch.relu(torch.log((mean_len * lower / edge_len.clamp_min(eps)).clamp_min(eps)))
-            long_excess = torch.relu(torch.log((edge_len / (mean_len * upper)).clamp_min(eps)))
+        pairs = curve_geometry.edge_seed_pair
+        edge_type = curve_geometry.edge_type
+
+        if pairs is None or curves.ndim != 3 or curves.shape[0] == 0:
+            return curves.new_zeros(())
+
+        pairs = pairs.to(device=curves.device)
+
+        eps = float(getattr(cfg, "cell_edge_uniform_eps", 1e-8))
+        angle_eps = float(getattr(cfg, "cell_angle_eps", 1e-8))
+        merge_tol = float(
+            getattr(cfg, "cell_vertex_merge_tolerance", 1e-5)
+        )
+
+        lam_angle = float(
+            getattr(cfg, "lam_cell_angle_uniform", 0.0)
+        )
+        lam_radial = float(
+            getattr(cfg, "lam_cell_radial_uniform", 0.0)
+        )
+
+        edge_len = curve_geometry.edge_lengths
+        edge_activity = self.curve_edge_activity_weights(
+            curve_geometry,
+            seed_active_weights,
+        )
+        finite_curves = torch.isfinite(curves).all(dim=(1, 2))
+        finite_lengths = curve_geometry.finite_edge_mask
+
+        selected_loss_types = resolve_edge_types_in_losses(cfg.Edge_in_losses)
+        cell_length_types = tuple(
+            edge_type_value
+            for edge_type_value in selected_loss_types
+            if edge_type_value in CELL_GEOMETRY_EDGE_TYPES
+        )
+        loss_edge_type_mask = build_edge_type_mask(
+            edge_type,
+            cell_length_types,
+        )
+        cell_geometry_type_mask = build_edge_type_mask(
+            edge_type,
+            CELL_GEOMETRY_EDGE_TYPES,
+        )
+
+        # Edges associated with at least one valid seed cell. Cell polygon
+        # reconstruction uses all valid Voronoi-derived edges (0, 1, 3),
+        # while the scalar length component uses Edge_in_losses.
+        base_cell_mask = (
+            finite_curves
+            & finite_lengths
+            & (pairs >= 0).any(dim=1)
+        )
+        geometry_mask = base_cell_mask & cell_geometry_type_mask
+        uniform_mask = base_cell_mask & loss_edge_type_mask
+
+        if not bool(base_cell_mask.any().detach().item()):
+            return curves.new_zeros(())
+
+        def unique_vertices(points):
+            """
+            Deduplicate points for polygon reconstruction.
+
+            Index selection is discrete, but selected coordinates retain their
+            gradient connection to `curves`.
+            """
+            if points.ndim != 2 or points.shape[0] == 0:
+                return None
+
+            finite = torch.isfinite(points).all(dim=1)
+            points = points[finite]
+
+            if points.shape[0] < 3:
+                return None
+
+            keys = torch.round(
+                points.detach() / merge_tol
+            ).to(torch.int64)
+
+            # Preserve the first occurrence of each rounded coordinate.
+            seen = set()
+            keep_indices = []
+
+            for index, key in enumerate(keys.cpu().tolist()):
+                key_tuple = tuple(key)
+                if key_tuple not in seen:
+                    seen.add(key_tuple)
+                    keep_indices.append(index)
+
+            if len(keep_indices) < 3:
+                return None
+
+            keep = torch.as_tensor(
+                keep_indices,
+                dtype=torch.long,
+                device=points.device,
+            )
+
+            return points.index_select(0, keep)
+
+        def order_vertices(vertices):
+            """
+            Order 3D polygon vertices around their best-fit local plane.
+            """
+            if vertices is None or vertices.shape[0] < 3:
+                return None
+
+            center = vertices.mean(dim=0)
+            centered = vertices - center
+
+            # Detached basis selection avoids differentiating through discrete/
+            # unstable plane orientation while preserving gradients through the
+            # projected coordinates.
+            try:
+                _, _, vh = torch.linalg.svd(
+                    centered.detach(),
+                    full_matrices=False,
+                )
+            except RuntimeError:
+                return None
+
+            if vh.shape[0] < 2:
+                return None
+
+            basis_u = vh[0].to(
+                device=vertices.device,
+                dtype=vertices.dtype,
+            )
+            basis_v = vh[1].to(
+                device=vertices.device,
+                dtype=vertices.dtype,
+            )
+
+            coord_u = centered @ basis_u
+            coord_v = centered @ basis_v
+
+            angles = torch.atan2(coord_v, coord_u)
+
+            # Ordering is discrete; the reordered vertices remain differentiable.
+            order = torch.argsort(angles.detach())
+
+            return vertices.index_select(0, order)
+
+        def polygon_angle_loss(vertices):
+            if vertices is None or vertices.shape[0] < 3:
+                return None
+
+            previous = torch.roll(vertices, shifts=1, dims=0)
+            following = torch.roll(vertices, shifts=-1, dims=0)
+
+            vector_a = previous - vertices
+            vector_b = following - vertices
+
+            norm_a = torch.linalg.vector_norm(vector_a, dim=1)
+            norm_b = torch.linalg.vector_norm(vector_b, dim=1)
+
+            valid = (
+                torch.isfinite(norm_a)
+                & torch.isfinite(norm_b)
+                & (norm_a > angle_eps)
+                & (norm_b > angle_eps)
+            )
+
+            if int(valid.detach().sum().item()) < 3:
+                return None
+
+            cosine = (
+                vector_a[valid] * vector_b[valid]
+            ).sum(dim=1) / (
+                norm_a[valid] * norm_b[valid]
+            ).clamp_min(angle_eps)
+
+            angles = torch.acos(
+                cosine.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+            )
+
+            mean_angle = angles.mean().clamp_min(angle_eps)
+
             return (
-                log_weight * log_to_mean.pow(2).mean()
-                + max_log_weight * log_to_mean.abs().max().pow(2)
-                + ratio_weight * ratio_excess.pow(2)
-                + range_weight * rel_range.pow(2)
-                + short_edge_weight * short_excess.pow(2).max()
-                + long_edge_weight * long_excess.pow(2).max()
+                angles.var(unbiased=False)
+                / mean_angle.square()
             )
 
-        if loss_type == "target" and getattr(cfg, "curve_length_target", None) is not None:
-            target = torch.as_tensor(
-                float(cfg.curve_length_target),
-                dtype=edge_len.dtype,
-                device=edge_len.device,
-            )
-            return ((edge_len - target) / target.clamp_min(eps)).pow(2).mean() + equality_shape_penalty()
+        def polygon_radial_loss(vertices):
+            if vertices is None or vertices.shape[0] < 3:
+                return None
 
-        if loss_type == "var":
-            return ((edge_len - mean_len) / mean_len).pow(2).mean() + equality_shape_penalty()
-        if loss_type == "pairwise":
-            diff = edge_len[:, None] - edge_len[None, :]
-            denom = mean_len.pow(2).clamp_min(eps)
-            return diff.pow(2).mean() / denom + equality_shape_penalty()
-        
-        if loss_type == "pairwise_smooth_l1":
-            diff = edge_len[:, None] - edge_len[None, :]
-            return torch.sqrt(diff.pow(2) + eps).mean() / mean_len + equality_shape_penalty()
-        
-        if loss_type == "range_cv":
-            cv = edge_len.var(unbiased=False) / mean_len.pow(2).clamp_min(eps)
-            rel_range = (edge_len.max() - edge_len.min()) / mean_len
-            return cv + 5.0 * rel_range.pow(2) + equality_shape_penalty()
-        
-        if loss_type == "log_tolerance":
-            ratio = edge_len / mean_len
-            log_ratio = torch.log(ratio.clamp_min(eps))
-            tol = float(getattr(cfg, "curve_length_tolerance", 0.15))
-            excess = torch.relu(log_ratio.abs() - tol)
-            return excess.pow(2).mean() + equality_shape_penalty()
+            center = vertices.mean(dim=0)
 
-        if loss_type == "log_tolerance_max":
-            ratio = edge_len / mean_len
-            log_ratio = torch.log(ratio.clamp_min(eps))
-            tol = float(getattr(cfg, "curve_length_tolerance", 0.15))
-            excess = torch.relu(log_ratio.abs() - tol)
-            outlier_weight = float(getattr(cfg, "curve_length_outlier_weight", 1.0))
-            return excess.pow(2).mean() + outlier_weight * excess.max().pow(2) + equality_shape_penalty()
-
-        return edge_len.var(unbiased=False) / mean_len.pow(2) + equality_shape_penalty()
-    
-
-    def cell_edge_uniformity_loss(self, decoder_out):
-            cfg = self.cfg
-
-            curves = decoder_out.get("edge_curves_xyz")
-            graph = decoder_out.get("graph")
-
-            if curves is None or not isinstance(graph, dict):
-                for value in decoder_out.values():
-                    if torch.is_tensor(value):
-                        return value.new_zeros(())
-                return torch.zeros((), device=self.device)
-
-            pairs = graph.get("edge_seed_pair")
-            edge_type = graph.get("edge_type")
-
-            if (
-                pairs is None
-                or curves.ndim != 3
-                or curves.shape[0] == 0
-                or pairs.ndim != 2
-                or pairs.shape != (curves.shape[0], 2)
-            ):
-                return curves.new_zeros(())
-
-            pairs = pairs.to(device=curves.device)
-
-            if edge_type is not None:
-                edge_type = edge_type.to(device=curves.device).reshape(-1)
-                if edge_type.shape[0] != curves.shape[0]:
-                    edge_type = None
-
-            eps = float(getattr(cfg, "cell_edge_uniform_eps", 1e-8))
-            angle_eps = float(getattr(cfg, "cell_angle_eps", 1e-8))
-            merge_tol = float(
-                getattr(cfg, "cell_vertex_merge_tolerance", 1e-5)
+            radial = torch.linalg.vector_norm(
+                vertices - center,
+                dim=1,
             )
 
-            lam_angle = float(
-                getattr(cfg, "lam_cell_angle_uniform", 0.0)
-            )
-            lam_radial = float(
-                getattr(cfg, "lam_cell_radial_uniform", 0.0)
+            valid = (
+                torch.isfinite(radial)
+                & (radial > eps)
             )
 
-            # Full sampled 3D curve length.
-            segments = curves[:, 1:, :] - curves[:, :-1, :]
-            edge_len = torch.linalg.vector_norm(
-                segments,
-                dim=-1,
-            ).sum(dim=-1)
+            if int(valid.detach().sum().item()) < 3:
+                return None
 
-            finite_curves = torch.isfinite(curves).all(dim=(1, 2))
-            finite_lengths = torch.isfinite(edge_len)
+            radial = radial[valid]
+            mean_radial = radial.mean().clamp_min(eps)
 
-            # Edges associated with at least one valid seed cell.
-            geometry_mask = (
-                finite_curves
-                & finite_lengths
-                & (pairs >= 0).any(dim=1)
+            return (
+                radial.var(unbiased=False)
+                / mean_radial.square()
             )
 
-            # Edge types used for within-cell length uniformity.
-            uniform_mask = geometry_mask.clone()
+        cell_ids = torch.unique(pairs[base_cell_mask])
+        cell_ids = cell_ids[cell_ids >= 0]
 
-            allowed_types = getattr(
-                cfg,
-                "curve_length_equal_edge_types",
-                (0,),
+        cell_losses = []
+        cell_loss_weights = []
+
+        for cell_id_tensor in cell_ids:
+            cell_id = int(cell_id_tensor.detach().item())
+
+            belongs_geometry = (
+                geometry_mask
+                & (pairs == cell_id).any(dim=1)
             )
 
-            if edge_type is not None and allowed_types is not None:
-                type_mask = torch.zeros_like(uniform_mask)
+            belongs_uniform = (
+                uniform_mask
+                & (pairs == cell_id).any(dim=1)
+            )
 
-                for allowed_type in allowed_types:
-                    type_mask |= edge_type == int(allowed_type)
+            cell_loss = curves.new_zeros(())
+            has_component = False
 
-                uniform_mask &= type_mask
+            # Within-cell equality of selected edge lengths.
+            lengths = edge_len[belongs_uniform]
+            length_weights = edge_activity[belongs_uniform]
 
-            if not bool(geometry_mask.any().detach().item()):
-                return curves.new_zeros(())
+            if lengths.numel() > 1:
+                length_weight_sum = length_weights.sum().clamp_min(eps)
+                mean_length = (
+                    length_weights * lengths
+                ).sum().div(length_weight_sum).clamp_min(eps)
 
-            def unique_vertices(points):
-                """
-                Deduplicate points for polygon reconstruction.
-
-                Index selection is discrete, but selected coordinates retain their
-                gradient connection to `curves`.
-                """
-                if points.ndim != 2 or points.shape[0] == 0:
-                    return None
-
-                finite = torch.isfinite(points).all(dim=1)
-                points = points[finite]
-
-                if points.shape[0] < 3:
-                    return None
-
-                keys = torch.round(
-                    points.detach() / merge_tol
-                ).to(torch.int64)
-
-                # Preserve the first occurrence of each rounded coordinate.
-                seen = set()
-                keep_indices = []
-
-                for index, key in enumerate(keys.cpu().tolist()):
-                    key_tuple = tuple(key)
-                    if key_tuple not in seen:
-                        seen.add(key_tuple)
-                        keep_indices.append(index)
-
-                if len(keep_indices) < 3:
-                    return None
-
-                keep = torch.as_tensor(
-                    keep_indices,
-                    dtype=torch.long,
-                    device=points.device,
+                edge_loss = (
+                    (length_weights * (lengths - mean_length).square()).sum()
+                    / length_weight_sum
+                    / mean_length.square()
                 )
 
-                return points.index_select(0, keep)
+                cell_loss = cell_loss + edge_loss
+                has_component = True
 
-            def order_vertices(vertices):
-                """
-                Order 3D polygon vertices around their best-fit local plane.
-                """
-                if vertices is None or vertices.shape[0] < 3:
-                    return None
+            # Reconstruct the complete cell polygon using all valid cell edges,
+            # not only the selected equal-length edge types.
+            cell_curves = curves[belongs_geometry]
 
-                center = vertices.mean(dim=0)
-                centered = vertices - center
-
-                # Detached basis selection avoids differentiating through discrete/
-                # unstable plane orientation while preserving gradients through the
-                # projected coordinates.
-                try:
-                    _, _, vh = torch.linalg.svd(
-                        centered.detach(),
-                        full_matrices=False,
-                    )
-                except RuntimeError:
-                    return None
-
-                if vh.shape[0] < 2:
-                    return None
-
-                basis_u = vh[0].to(
-                    device=vertices.device,
-                    dtype=vertices.dtype,
-                )
-                basis_v = vh[1].to(
-                    device=vertices.device,
-                    dtype=vertices.dtype,
+            if cell_curves.shape[0] > 0:
+                endpoints = torch.cat(
+                    (
+                        cell_curves[:, 0, :],
+                        cell_curves[:, -1, :],
+                    ),
+                    dim=0,
                 )
 
-                coord_u = centered @ basis_u
-                coord_v = centered @ basis_v
+                vertices = unique_vertices(endpoints)
+                ordered_vertices = order_vertices(vertices)
 
-                angles = torch.atan2(coord_v, coord_u)
-
-                # Ordering is discrete; the reordered vertices remain differentiable.
-                order = torch.argsort(angles.detach())
-
-                return vertices.index_select(0, order)
-
-            def polygon_angle_loss(vertices):
-                if vertices is None or vertices.shape[0] < 3:
-                    return None
-
-                previous = torch.roll(vertices, shifts=1, dims=0)
-                following = torch.roll(vertices, shifts=-1, dims=0)
-
-                vector_a = previous - vertices
-                vector_b = following - vertices
-
-                norm_a = torch.linalg.vector_norm(vector_a, dim=1)
-                norm_b = torch.linalg.vector_norm(vector_b, dim=1)
-
-                valid = (
-                    torch.isfinite(norm_a)
-                    & torch.isfinite(norm_b)
-                    & (norm_a > angle_eps)
-                    & (norm_b > angle_eps)
-                )
-
-                if int(valid.detach().sum().item()) < 3:
-                    return None
-
-                cosine = (
-                    vector_a[valid] * vector_b[valid]
-                ).sum(dim=1) / (
-                    norm_a[valid] * norm_b[valid]
-                ).clamp_min(angle_eps)
-
-                angles = torch.acos(
-                    cosine.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
-                )
-
-                mean_angle = angles.mean().clamp_min(angle_eps)
-
-                return (
-                    angles.var(unbiased=False)
-                    / mean_angle.square()
-                )
-
-            def polygon_radial_loss(vertices):
-                if vertices is None or vertices.shape[0] < 3:
-                    return None
-
-                center = vertices.mean(dim=0)
-
-                radial = torch.linalg.vector_norm(
-                    vertices - center,
-                    dim=1,
-                )
-
-                valid = (
-                    torch.isfinite(radial)
-                    & (radial > eps)
-                )
-
-                if int(valid.detach().sum().item()) < 3:
-                    return None
-
-                radial = radial[valid]
-                mean_radial = radial.mean().clamp_min(eps)
-
-                return (
-                    radial.var(unbiased=False)
-                    / mean_radial.square()
-                )
-
-            cell_ids = torch.unique(pairs[geometry_mask])
-            cell_ids = cell_ids[cell_ids >= 0]
-
-            cell_losses = []
-
-            for cell_id_tensor in cell_ids:
-                cell_id = int(cell_id_tensor.detach().item())
-
-                belongs_geometry = (
-                    geometry_mask
-                    & (pairs == cell_id).any(dim=1)
-                )
-
-                belongs_uniform = (
-                    uniform_mask
-                    & (pairs == cell_id).any(dim=1)
-                )
-
-                cell_loss = curves.new_zeros(())
-                has_component = False
-
-                # Within-cell equality of selected edge lengths.
-                lengths = edge_len[belongs_uniform]
-
-                if lengths.numel() > 1:
-                    mean_length = lengths.mean().clamp_min(eps)
-
-                    edge_loss = (
-                        (lengths - mean_length).square().mean()
-                        / mean_length.square()
+                if lam_angle != 0.0:
+                    angle_loss = polygon_angle_loss(
+                        ordered_vertices
                     )
 
-                    cell_loss = cell_loss + edge_loss
-                    has_component = True
-
-                # Reconstruct the complete cell polygon using all valid cell edges,
-                # not only the selected equal-length edge types.
-                cell_curves = curves[belongs_geometry]
-
-                if cell_curves.shape[0] > 0:
-                    endpoints = torch.cat(
-                        (
-                            cell_curves[:, 0, :],
-                            cell_curves[:, -1, :],
-                        ),
-                        dim=0,
-                    )
-
-                    vertices = unique_vertices(endpoints)
-                    ordered_vertices = order_vertices(vertices)
-
-                    if lam_angle != 0.0:
-                        angle_loss = polygon_angle_loss(
-                            ordered_vertices
+                    if angle_loss is not None:
+                        cell_loss = (
+                            cell_loss
+                            + lam_angle * angle_loss
                         )
+                        has_component = True
 
-                        if angle_loss is not None:
-                            cell_loss = (
-                                cell_loss
-                                + lam_angle * angle_loss
-                            )
-                            has_component = True
+                if lam_radial != 0.0:
+                    radial_loss = polygon_radial_loss(vertices)
 
-                    if lam_radial != 0.0:
-                        radial_loss = polygon_radial_loss(vertices)
+                    if radial_loss is not None:
+                        cell_loss = (
+                            cell_loss
+                            + lam_radial * radial_loss
+                        )
+                        has_component = True
 
-                        if radial_loss is not None:
-                            cell_loss = (
-                                cell_loss
-                                + lam_radial * radial_loss
-                            )
-                            has_component = True
+            if has_component and torch.isfinite(cell_loss):
+                cell_weight = edge_activity[
+                    geometry_mask & (pairs == cell_id).any(dim=1)
+                ].mean().clamp_min(eps)
+                cell_losses.append(cell_weight * cell_loss)
+                cell_loss_weights.append(cell_weight)
 
-                if has_component and torch.isfinite(cell_loss):
-                    cell_losses.append(cell_loss)
+        if not cell_losses:
+            return curves.new_zeros(())
 
-            if not cell_losses:
-                return curves.new_zeros(())
-
-            return torch.stack(cell_losses).mean()
+        return torch.stack(cell_losses).sum() / torch.stack(cell_loss_weights).sum().clamp_min(eps)
 
     def neutral_density_fiber_fields(self, uv: torch.Tensor, Xu: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
         rho = torch.zeros((uv.shape[0],), dtype=uv.dtype, device=uv.device)
@@ -2193,6 +2381,9 @@ class NN_Trainer:
         self._tb_add_scalar("Loss/Volume", row["loss_vol"], step)
         self._tb_add_scalar("Loss/Repulsion", row["loss_rep"], step)
         self._tb_add_scalar("Loss/Boundary", row["loss_bnd"], step)
+        self._tb_add_scalar("Loss/DensityWeightedCVT", row["loss_density_weighted_cvt"], step)
+        self._tb_add_scalar("Loss/SeedActive", row["loss_seed_active"], step)
+        self._tb_add_scalar("Loss/SeedDomainRecovery", row["loss_seed_domain_recovery"], step)
         self._tb_add_scalar("Loss/CurveLength", row["loss_curve_length"], step)
         self._tb_add_scalar("Loss/CellEdgeUniform", row["loss_cell_edge_uniform"], step)
         self._tb_add_scalar("Loss/FEM", row["loss_fem"], step)
@@ -2222,6 +2413,8 @@ class NN_Trainer:
         self._tb_add_scalar("Geometry/CenterlineRadius", row["centerline_radius_mean"], step)
         self._tb_add_scalar("Train/BestHardScore", row["best_hard_score"], step)
         self._tb_add_scalar("Train/BestHardStep", row["best_hard_step"], step)
+        self._tb_add_scalar("Activity/SoftActiveMass", row["soft_active_mass"], step)
+        self._tb_add_scalar("Activity/HardActiveCount", row["hard_active_count"], step)
 
         fiber_norm = torch.linalg.norm(fiber_surface, dim=1)
         if fiber_norm.numel() > 0:
@@ -2454,6 +2647,49 @@ class NN_Trainer:
             "VolFrac": "Material volume fraction used by the current method for optimization and reporting.",
         }
 
+    def _curve_length_summary(
+        self,
+        curve_length_values: list[torch.Tensor],
+        reference: torch.Tensor,
+    ) -> dict[str, float]:
+        nonempty_curve_lengths = [
+            v.reshape(-1) for v in curve_length_values if v.numel() > 0
+        ]
+        if nonempty_curve_lengths:
+            curve_lengths = torch.cat(nonempty_curve_lengths, dim=0)
+        else:
+            curve_lengths = reference.new_empty((0,))
+
+        if curve_lengths.numel() == 0:
+            return {
+                "min": float("nan"),
+                "max": float("nan"),
+                "mean": float("nan"),
+                "std": float("nan"),
+                "cv": float("nan"),
+                "ratio": float("nan"),
+            }
+
+        curve_length_min = float(curve_lengths.min().item())
+        curve_length_max = float(curve_lengths.max().item())
+        curve_length_mean = float(curve_lengths.mean().item())
+        curve_length_std = float(curve_lengths.std(unbiased=False).item())
+        curve_length_cv = (
+            curve_length_std / curve_length_mean
+            if math.isfinite(curve_length_mean) and abs(curve_length_mean) > float(self.cfg.eps)
+            else float("nan")
+        )
+        curve_length_ratio = curve_length_max / max(curve_length_min, float(self.cfg.eps))
+
+        return {
+            "min": curve_length_min,
+            "max": curve_length_max,
+            "mean": curve_length_mean,
+            "std": curve_length_std,
+            "cv": curve_length_cv,
+            "ratio": curve_length_ratio,
+        }
+
     @staticmethod
     def _sanitize_history_rows(history: list[dict]) -> list[dict]:
         obsolete_keys = {
@@ -2517,6 +2753,8 @@ class NN_Trainer:
             "maximum_minimum_ratio",
             "minimum_seed_distance",
             "number_of_edges",
+            "number_of_selected_edges",
+            "number_of_total_edges",
             "topology_identifier",
         ]
         best_solution_metrics = {
@@ -2625,6 +2863,9 @@ class NN_Trainer:
                 "seed_active_mask": _clone_value(p.get("seed_active_mask")),
                 "active_seed_ids": _clone_value(p.get("active_seed_ids")),
                 "seed_activity_weight": _clone_value(p.get("seed_activity_weight")),
+                "seed_box_activity_weight": _clone_value(p.get("seed_box_activity_weight")),
+                "seed_domain_activity_weight": _clone_value(p.get("seed_domain_activity_weight")),
+                "seed_duplicate_activity_weight": _clone_value(p.get("seed_duplicate_activity_weight")),
                 "topology_seeds_uv": _clone_value(p.get("topology_seeds_uv")),
                 "seeds_xyz": _clone_value(p.get("seeds_xyz")),
                 "edge_curves_uv": _clone_value(p.get("edge_curves_uv")),
@@ -2646,6 +2887,9 @@ class NN_Trainer:
             "seed_active_mask",
             "active_seed_ids",
             "seed_activity_weight",
+            "seed_box_activity_weight",
+            "seed_domain_activity_weight",
+            "seed_duplicate_activity_weight",
             "topology_seeds_uv",
         ):
             value = decoder_out.get(key, None)
@@ -3104,6 +3348,93 @@ class NN_Trainer:
             face_tensor["points_xyz"],
         )
 
+    def _lambda_cvt(self) -> float:
+        if hasattr(self.cfg, "lambda_cvt"):
+            return float(getattr(self.cfg, "lambda_cvt"))
+        return float(getattr(self.cfg, "lam_density_weighted_cvt", 0.0))
+
+    def _eval_uv_to_xyz_differentiable(self, uv: torch.Tensor) -> torch.Tensor:
+        evaluator_owner = self.Cad_domain if self.Cad_domain is not None else self.generator
+        evaluator = getattr(evaluator_owner, "eval_uv_norm_batch_torch", None)
+        if evaluator is None or not callable(evaluator):
+            raise TypeError(
+                "Density-weighted CVT requires a differentiable "
+                "eval_uv_norm_batch_torch(uv) CAD evaluator."
+            )
+        evaluated = evaluator(uv)
+        xyz = evaluated["xyz"] if isinstance(evaluated, dict) else evaluated
+        if not isinstance(xyz, torch.Tensor):
+            raise TypeError("eval_uv_norm_batch_torch must return a tensor or {'xyz': tensor}.")
+        if xyz.shape != (*uv.shape[:-1], 3):
+            raise ValueError(
+                "Differentiable CAD evaluator returned XYZ with shape "
+                f"{tuple(xyz.shape)} for UV shape {tuple(uv.shape)}."
+            )
+        return xyz
+
+    def _surface_importance_from_fem(
+        self,
+        face_tensor: dict,
+        fem_out: dict,
+        num_samples: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        source = str(getattr(self.cfg, "cvt_importance_source", "fem_stress")).lower()
+        if source in ("", "none", "uniform"):
+            return None
+
+        if source in ("stress", "fem_stress", "von_mises", "vm"):
+            field = fem_out.get("stress_field", None)
+        elif source in ("displacement", "fem_displacement", "disp"):
+            field = fem_out.get("displacement_field", None)
+        elif source in ("loaded_displacement", "loaded_boundary_displacement"):
+            field = fem_out.get("loaded_boundary_displacement_field", None)
+        elif source in ("density", "fem_density"):
+            field = fem_out.get("density_field", None)
+        else:
+            return None
+
+        if not isinstance(field, torch.Tensor) or field.numel() == 0:
+            return None
+
+        flat = field.detach().to(device=device, dtype=dtype).reshape(-1).abs()
+        if flat.numel() == num_samples:
+            importance = flat
+        else:
+            sample_elem_idx = getattr(self.shell_problem, "sample_elem_idx", None)
+            if sample_elem_idx is None:
+                return None
+            sample_elem_idx = torch.as_tensor(
+                sample_elem_idx,
+                dtype=torch.long,
+                device=device,
+            ).reshape(-1)
+            if sample_elem_idx.numel() != num_samples:
+                return None
+            valid = (sample_elem_idx >= 0) & (sample_elem_idx < flat.numel())
+            importance = torch.zeros((num_samples,), dtype=dtype, device=device)
+            if valid.any():
+                importance[valid] = flat[sample_elem_idx[valid]]
+
+        importance = torch.nan_to_num(
+            importance,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(float(getattr(self.cfg, "cvt_importance_min", 0.0)))
+
+        importance_max = getattr(self.cfg, "cvt_importance_max", None)
+        if importance_max is not None:
+            importance = importance.clamp_max(float(importance_max))
+
+        if bool(getattr(self.cfg, "cvt_importance_normalize_mean", True)):
+            positive = importance[importance > 0.0]
+            if positive.numel() > 0:
+                importance = importance / positive.mean().clamp_min(float(self.cfg.eps))
+
+        return importance
+
     def _finite_or_default(self, x: torch.Tensor | float | int, default: float = float("nan")) -> float:
         if self._scalar_tensor_is_finite(x):
             if isinstance(x, torch.Tensor):
@@ -3550,6 +3881,9 @@ class NN_Trainer:
             "seed_active_mask": decoder_out.get("seed_active_mask", None),
             "active_seed_ids": decoder_out.get("active_seed_ids", None),
             "seed_activity_weight": decoder_out.get("seed_activity_weight", None),
+            "seed_box_activity_weight": decoder_out.get("seed_box_activity_weight", None),
+            "seed_domain_activity_weight": decoder_out.get("seed_domain_activity_weight", None),
+            "seed_duplicate_activity_weight": decoder_out.get("seed_duplicate_activity_weight", None),
             "seeds_xyz": decoder_out.get("seeds_xyz", None),
             "edge_curves_uv": decoder_out.get("edge_curves_uv", None),
             "edge_curves_xyz": decoder_out.get("edge_curves_xyz", None),
@@ -6132,9 +6466,21 @@ class NN_Trainer:
             timelapse_output_folder = getattr(cfg, "timelapse_output_folder", None)
             if timelapse_output_folder:
                 timelapse_output_folder = os.path.normpath(str(timelapse_output_folder))
-                os.makedirs(timelapse_output_folder, exist_ok=True)
+
+                base_folder = timelapse_output_folder
+                counter = 1
+
+                while os.path.exists(timelapse_output_folder):
+                    timelapse_output_folder = f"{base_folder}{counter}"
+                    counter += 1
+
+                os.makedirs(timelapse_output_folder)
+
                 frame_out_dir = os.path.join(timelapse_output_folder, "timelapse_frames")
-                video_path = os.path.join(timelapse_output_folder, case_name + "_timelapse.avi")
+                video_path = os.path.join(
+                    timelapse_output_folder,
+                    case_name + "_timelapse.avi"
+                )
             else:
                 frame_out_dir = "timelapse_frames"
                 video_path = case_name + "_timelapse.avi"
@@ -6161,7 +6507,7 @@ class NN_Trainer:
                 fps=8,
                 header_title=(
                     f"{shape_path.name} ({geometry_summary}) | "
-                    f"BC: {cfg.LoadingCasee} (F = {load_value:.3f} , FEM elements: {fem_elems}) | "
+                    f"BC: {cfg.LoadingCase} (F = {load_value:.3f} , FEM elements: {fem_elems}) | "
                     f"Target volfrac: {cfg.target_volfrac:.3f}"
                 ),
                 header_subtitle=self._timelapse_optimized_parameter_summary(),
@@ -6191,8 +6537,16 @@ class NN_Trainer:
         norm_rep = RunningNorm()
         norm_bnd = RunningNorm()
         norm_fem = RunningNorm()
+        norm_density_weighted_cvt = RunningNorm()
+        norm_seed_domain_recovery = RunningNorm()
+        norm_seed_active = RunningNorm()
         norm_curve_length = RunningNorm()
         norm_cell_edge_uniform = RunningNorm()
+        target_active_seeds = (
+            cfg.seed_number
+            if cfg.min_active_seeds is None
+            else cfg.min_active_seeds
+        )
 
         # ------------------------------------------------------------
         # Best-state tracking
@@ -6273,6 +6627,10 @@ class NN_Trainer:
                     or step % cfg.log_every == 0
                     or step == cfg.num_steps - 1
                 )
+                should_record_timelapse = (
+                    bool(cfg.MakeTimelaps)
+                    and step % int(cfg.timelapse_frame_step) == 0
+                )
     
                 # if cfg.allow_seed_outside_domain is true and the warmup period is over, allow seeds to be placed outside the domain
                 allow_seed_outside_domain_step = self.allow_seed_outside_domain_for_step(step)
@@ -6303,6 +6661,8 @@ class NN_Trainer:
                 curve_length_terms = []
                 curve_length_values = []
                 cell_edge_uniform_terms = []
+                seed_domain_recovery_terms = []
+                seed_active_terms = []
                 w_geo_terms = []
                 h_terms = []
                 centerline_radius_terms = []
@@ -6313,21 +6673,35 @@ class NN_Trainer:
                 raw_seed_count_total = 0
                 topology_seed_count_total = 0
                 soft_active_total = 0.0
+                hard_active_total = 0.0
 
                 # Activate losses based on their lambda values in the configuration (cfg). If a lambda value is set to 0.0, the corresponding loss will not be computed during training
                 compute_rep_loss = cfg.lam_rep != 0.0
                 compute_bnd_loss = cfg.lam_bnd != 0.0
                 compute_vol_loss = cfg.lam_vol != 0.0
+                compute_density_weighted_cvt_loss = self._lambda_cvt() != 0.0
+                compute_seed_domain_recovery_loss = (
+                    getattr(cfg, "lam_seed_domain_recovery", 0.0) != 0.0
+                    and bool(getattr(cfg, "use_smooth_seed_activity_in_losses", True))
+                )
+                compute_seed_active_loss = getattr(cfg, "lam_seed_active", 0.0) != 0.0
                 compute_curve_length_loss = getattr(cfg, "lam_curve_length", 0.0) != 0.0
                 compute_cell_edge_uniform_loss = (
                     getattr(cfg, "lam_cell_edge_uniform", 0.0) != 0.0
                 )
+                collect_curve_metrics = (
+                    should_log
+                    or should_record_timelapse
+                    or compute_curve_length_loss
+                )
+                collect_topology_metrics = should_log or should_record_timelapse
                 curve_only_training = (
                     compute_curve_length_loss
                     and cfg.lam_vol == 0.0
                     and cfg.lam_fem == 0.0
                     and cfg.lam_rep == 0.0
                     and cfg.lam_bnd == 0.0
+                    and not compute_density_weighted_cvt_loss
                     and getattr(cfg, "lam_cell_edge_uniform", 0.0) == 0.0
                 )
 
@@ -6340,7 +6714,7 @@ class NN_Trainer:
                         and bool(getattr(cfg, "disable_rolling_seed_anchors_for_curve_only", True))
                     )
                     and step >= int(round(float(cfg.seed_anchor_warmup_frac) * float(cfg.num_steps)))
-                    and (anchor_update_allowed or not cfg.guard_seed_anchor_updates)
+                    and (anchor_update_allowed or not cfg.anchor_guard_updates)
                 )
 
                 seed_offset_scale_step = self.seed_offset_scale_for_step(step)
@@ -6381,13 +6755,19 @@ class NN_Trainer:
                             dtype=torch.long,
                             device=device,
                         )
-                    seed_domain_mask_i = self._seed_domain_mask_for_face(ft)
-
-
                     decoder_out = decoder(
                         seeds_uv=seeds_raw_i,
                         w_raw=w_raw_i,
                         generate_density_fiber=getattr(cfg, "generate_decoder_density_fiber", True),
+                    )
+                    seed_activity_weight_live_i = decoder_out["seed_activity_weight"]
+                    seed_domain_activity_weight_i = decoder_out[
+                        "seed_domain_activity_weight"
+                    ]
+                    seed_activity_weight_i = (
+                        seed_activity_weight_live_i
+                        if cfg.use_smooth_seed_activity_in_losses
+                        else None
                     )
 
                     self._require_decoder_keys(
@@ -6397,20 +6777,75 @@ class NN_Trainer:
                         ],
                     )
 
-                    reported_curve_lengths_i = self.curve_3d_edge_lengths(
-                        decoder_out,
-                        edge_types=getattr(cfg, "curve_length_report_edge_types", (0,)),
-                    ).detach()
-                    curve_length_values.append(reported_curve_lengths_i)
-                    topology_metrics_i = self.solution_topology_metrics(
-                        decoder_out,
-                        curve_lengths=reported_curve_lengths_i,
+                    need_curve_geometry = needs_shared_curve_geometry(
+                        compute_curve_length_loss=compute_curve_length_loss,
+                        compute_cell_edge_uniform_loss=compute_cell_edge_uniform_loss,
+                        collect_curve_metrics=collect_curve_metrics,
+                        collect_topology_metrics=collect_topology_metrics,
                     )
+                    curve_geometry_i = (
+                        build_shared_curve_geometry(
+                            decoder_out,
+                            require_edge_type=True,
+                            require_edge_seed_pair=compute_cell_edge_uniform_loss,
+                        )
+                        if need_curve_geometry
+                        else None
+                    )
+                    if need_curve_geometry and curve_geometry_i is None:
+                        raise ValueError(
+                            "Shared curve geometry was required, but decoder_out "
+                            "does not contain edge_curves_xyz."
+                        )
+
+                    reported_curve_lengths_i = None
+                    topology_metrics_i = None
+                    if collect_curve_metrics:
+                        reported_curve_lengths_i = self.curve_3d_edge_lengths(
+                            curve_geometry_i,
+                        ).detach()
+                        curve_length_values.append(reported_curve_lengths_i)
+                    if collect_topology_metrics:
+                        topology_metrics_i = self.solution_topology_metrics(
+                            decoder_out,
+                            curve_lengths=reported_curve_lengths_i,
+                        )
                     if compute_curve_length_loss:
-                        curve_length_terms.append(self.curve_length_similarity_loss(decoder_out))
+                        # Activity-dependent participation coefficients remain graph-connected
+                        # here, so they can contribute positional gradients through activity.
+                        curve_length_terms.append(
+                            self.curve_length_similarity_loss(
+                                curve_geometry_i,
+                                seed_active_weights=seed_activity_weight_i,
+                            )
+                        )
                     if compute_cell_edge_uniform_loss:
+                        # Activity-dependent participation coefficients remain graph-connected
+                        # here, so they can contribute positional gradients through activity.
                         cell_edge_uniform_terms.append(
-                            self.cell_edge_uniformity_loss(decoder_out)
+                            self.cell_edge_uniformity_loss(
+                                curve_geometry_i,
+                                seed_active_weights=seed_activity_weight_i,
+                            )
+                        )
+                    if compute_seed_domain_recovery_loss:
+                        seed_domain_recovery_terms.append(
+                            self.loss_seed_domain_recovery(
+                                seed_domain_activity_weight_i
+                            )
+                        )
+                    if compute_seed_active_loss:
+                        # Activity weights are differentiable functions of seed locations, not
+                        # independent trainable parameters. Gradients through these weights update
+                        # seed coordinates through the decoder's activity computation.
+                        seed_active_terms.append(
+                            self.loss_seed_active(
+                                seed_active_weights=seed_activity_weight_live_i,
+                                target_active=float(target_active_seeds),
+                                mode=cfg.seed_active_loss_mode,
+                                temperature=cfg.seed_active_loss_temperature,
+                                eps=cfg.eps,
+                            )
                         )
 
                     seeds_i = decoder_out["seeds"]
@@ -6456,6 +6891,7 @@ class NN_Trainer:
                     topology_seed_count_total += topology_seed_count_i
                     if math.isfinite(soft_active_i):
                         soft_active_total += soft_active_i
+                    hard_active_total += float(decoder_out["seed_active_mask"].sum().detach().item())
                     total_seed_i_for_frac = max(total_seed_i, 1)
                     participating_count_total += active_count_i
                     participating_frac_sum += active_count_i / float(total_seed_i_for_frac)
@@ -6514,6 +6950,9 @@ class NN_Trainer:
                         "seed_active_mask": decoder_out["seed_active_mask"].detach().clone(),
                         "active_seed_ids": decoder_out["active_seed_ids"].detach().clone(),
                         "seed_activity_weight": decoder_out["seed_activity_weight"].detach().clone(),
+                        "seed_box_activity_weight": decoder_out.get("seed_box_activity_weight", None).detach().clone() if isinstance(decoder_out.get("seed_box_activity_weight", None), torch.Tensor) else None,
+                        "seed_domain_activity_weight": decoder_out.get("seed_domain_activity_weight", None).detach().clone() if isinstance(decoder_out.get("seed_domain_activity_weight", None), torch.Tensor) else None,
+                        "seed_duplicate_activity_weight": decoder_out.get("seed_duplicate_activity_weight", None).detach().clone() if isinstance(decoder_out.get("seed_duplicate_activity_weight", None), torch.Tensor) else None,
                         "topology_seeds_uv": decoder_out["topology_seeds_uv"].detach().clone(),
                         "seeds_xyz": decoder_out["seeds_xyz"].detach().clone() if isinstance(decoder_out.get("seeds_xyz"), torch.Tensor) else None,
                         "edge_curves_uv": decoder_out["edge_curves_uv"].detach().clone() if isinstance(decoder_out.get("edge_curves_uv"), torch.Tensor) else None,
@@ -6522,27 +6961,51 @@ class NN_Trainer:
                         "edge_seed_pair": decoder_out["graph"]["edge_seed_pair"].detach().clone() if isinstance(decoder_out.get("graph"), dict) and isinstance(decoder_out["graph"].get("edge_seed_pair"), torch.Tensor) else None,
                         "edge_type": decoder_out["graph"]["edge_type"].detach().clone() if isinstance(decoder_out.get("graph"), dict) and isinstance(decoder_out["graph"].get("edge_type"), torch.Tensor) else None,
                         "graph": self._clone_detached_tree(decoder_out.get("graph")),
-                        "number_of_edges": int(topology_metrics_i["number_of_edges"]),
-                        "topology_identifier": topology_metrics_i["topology_identifier"],
+                        "number_of_edges": (
+                            int(topology_metrics_i["number_of_selected_edges"])
+                            if topology_metrics_i is not None
+                            else None
+                        ),
+                        "number_of_total_edges": (
+                            int(topology_metrics_i["number_of_total_edges"])
+                            if topology_metrics_i is not None
+                            else None
+                        ),
+                        "topology_identifier": (
+                            topology_metrics_i["topology_identifier"]
+                            if topology_metrics_i is not None
+                            else ""
+                        ),
                     })
 
                     if compute_rep_loss:
+                        # Activity-dependent participation coefficients remain graph-connected
+                        # here, so they can contribute positional gradients through activity.
                         rep_terms.append(
                             self.loss_rep(
                                 seeds=seeds_i,
-                                seed_active_weights=None,
+                                seed_active_weights=seed_activity_weight_i,
                                 sigma=cfg.seed_repulsion_sigma,
                                 min_dist=float(cfg.collapse_min_seed_dist_factor) * float(cfg.w_min),
+                                activity_floor=cfg.activity_weight_floor,
+                                activity_power=cfg.activity_weight_power,
+                                recovery_floor=cfg.activity_recovery_floor,
+                                recovery_power=cfg.activity_recovery_power,
+                                duplicate_recovery_strength=cfg.repulsion_inactive_recovery_strength,
                                 eps=cfg.eps,
                             )
                         )
 
                     if compute_bnd_loss:
+                        # Activity-dependent participation coefficients remain graph-connected
+                        # here, so they can contribute positional gradients through activity.
                         bnd_terms.append(
                             self.loss_boundary(
                                 seeds=seeds_i,
                                 boundary_uv=boundary_uv_i,
-                                seed_active_weights=None,
+                                seed_active_weights=seed_activity_weight_i,
+                                activity_floor=cfg.activity_weight_floor,
+                                activity_power=cfg.activity_weight_power,
                                 margin=cfg.boundary_margin,
                                 eps=cfg.eps,
                             )
@@ -6594,6 +7057,17 @@ class NN_Trainer:
                 loss_cell_edge_uniform = (
                     cell_edge_uniform_terms[0]
                     if compute_cell_edge_uniform_loss and cell_edge_uniform_terms
+                    else zero
+                )
+                loss_density_weighted_cvt = zero
+                loss_seed_domain_recovery = (
+                    seed_domain_recovery_terms[0]
+                    if compute_seed_domain_recovery_loss and seed_domain_recovery_terms
+                    else zero
+                )
+                loss_seed_active = (
+                    seed_active_terms[0]
+                    if compute_seed_active_loss and seed_active_terms
                     else zero
                 )
 
@@ -6662,6 +7136,8 @@ class NN_Trainer:
                 loss_comp = fem_out["compliance_loss"]
                 comp_val = fem_out["comp"]
                 fem_is_valid = bool(fem_out["fem_valid"])
+                if(cfg.lam_fem != 0.0 and not cfg.generate_decoder_density_fiber):
+                    fem_is_valid = "-"
                 fem_failure_reason = fem_out["failure_reason"]
                 fem_density_field = fem_out.get("density_field", None)
                 fem_stress_field = fem_out.get("stress_field", None)
@@ -6731,6 +7207,33 @@ class NN_Trainer:
                     disp_p95 = float("nan")
                     disp_p99 = float("nan")
 
+                if compute_density_weighted_cvt_loss:
+                    # Activity-dependent participation coefficients remain graph-connected
+                    # here, so they can contribute positional gradients through activity.
+                    cvt_importance = self._surface_importance_from_fem(
+                        face_tensor=ft,
+                        fem_out=fem_out,
+                        num_samples=ft["uv"].shape[0],
+                        dtype=dtype,
+                        device=device,
+                    )
+                    seed_xyz_cvt = self._eval_uv_to_xyz_differentiable(seeds_raw_i)
+                    loss_density_weighted_cvt = self.loss_density_weighted_cvt(
+                        seeds_uv=seeds_raw_i,
+                        sample_uv=ft["uv"],
+                        seed_xyz=seed_xyz_cvt,
+                        sample_xyz=ft["points_xyz"],
+                        sample_area_weights=A_local,
+                        importance=cvt_importance,
+                        seed_active_weights=seed_activity_weight_i,
+                        temperature=float(getattr(cfg, "cvt_temperature", 0.02)),
+                        activity_floor=cfg.activity_weight_floor,
+                        activity_power=cfg.activity_weight_power,
+                        activity_log_floor=cfg.cvt_activity_log_floor,
+                        activity_temperature=cfg.cvt_activity_temperature,
+                        eps=float(cfg.eps),
+                    )
+
                 # ----------------------------------------------------
                 # Normalize losses
                 # ----------------------------------------------------
@@ -6738,24 +7241,37 @@ class NN_Trainer:
                     n_vol = norm_vol.update(loss_vol.detach().item())
                     n_rep = norm_rep.update(loss_rep.detach().item())
                     n_bnd = norm_bnd.update(loss_bnd.detach().item())
+                    n_density_weighted_cvt = norm_density_weighted_cvt.update(
+                        loss_density_weighted_cvt.detach().item()
+                    )
+                    n_seed_domain_recovery = norm_seed_domain_recovery.update(
+                        loss_seed_domain_recovery.detach().item()
+                    )
+                    n_seed_active = norm_seed_active.update(
+                        loss_seed_active.detach().item()
+                    )
                     n_curve_length = norm_curve_length.update(loss_curve_length.detach().item())
                     n_cell_edge_uniform = norm_cell_edge_uniform.update(
                         loss_cell_edge_uniform.detach().item()
                     )
                     n_fem = norm_fem.update(loss_fem.detach().item()) if (cfg.lam_fem != 0.0 and fem_is_valid) else 1.0
                 else:
-                    n_vol = n_rep = n_bnd = n_fem = n_curve_length = n_cell_edge_uniform = 1.0
+                    n_vol = n_rep = n_bnd = n_fem = n_density_weighted_cvt = n_seed_domain_recovery = n_seed_active = n_curve_length = n_cell_edge_uniform = 1.0
 
                 # ----------------------------------------------------
                 # Total loss
                 # ----------------------------------------------------
-                lam_width_active_eff = 0.0
-
                 L_total = (
                     zero
                     + cfg.lam_vol * (loss_vol / n_vol)
                     + cfg.lam_rep * (loss_rep / n_rep)
                     + cfg.lam_bnd * (loss_bnd / n_bnd)
+                    + self._lambda_cvt()
+                    * (loss_density_weighted_cvt / n_density_weighted_cvt)
+                    + cfg.lam_seed_domain_recovery
+                    * (loss_seed_domain_recovery / n_seed_domain_recovery)
+                    + cfg.lam_seed_active
+                    * (loss_seed_active / n_seed_active)
                     + cfg.lam_curve_length * (loss_curve_length / n_curve_length)
                     + cfg.lam_cell_edge_uniform
                     * (loss_cell_edge_uniform / n_cell_edge_uniform)
@@ -6773,6 +7289,9 @@ class NN_Trainer:
                     ("loss_vol", loss_vol),
                     ("loss_rep", loss_rep),
                     ("loss_bnd", loss_bnd),
+                    ("loss_density_weighted_cvt", loss_density_weighted_cvt),
+                    ("loss_seed_domain_recovery", loss_seed_domain_recovery),
+                    ("loss_seed_active", loss_seed_active),
                     ("loss_curve_length", loss_curve_length),
                     ("loss_cell_edge_uniform", loss_cell_edge_uniform),
                     ("loss_fem", loss_fem),
@@ -6876,6 +7395,16 @@ class NN_Trainer:
                         and total_is_finite
                         and raw_seed_count_total >= int(cfg.min_active_seeds or 1)
                     )
+                    curve_length_summary = self._curve_length_summary(
+                        curve_length_values,
+                        zero,
+                    )
+                    curve_length_min = curve_length_summary["min"]
+                    curve_length_max = curve_length_summary["max"]
+                    curve_length_mean = curve_length_summary["mean"]
+                    curve_length_std = curve_length_summary["std"]
+                    curve_length_cv = curve_length_summary["cv"]
+                    curve_length_ratio = curve_length_summary["ratio"]
 
                     prev_best_step = best_step
                     improvement_gap = (step - prev_best_step) if prev_best_step >= 0 else None
@@ -6957,7 +7486,9 @@ class NN_Trainer:
                                 f"best_active_units={best_active_count:.1f} | "
                                 f"VolFrac={best_volfrac_report:.6f} | "
                                 f"comp={best_comp:.6e} | "
-                                f"w={best_w_geo:.6e}"
+                                f"w={best_w_geo:.6e} | "
+                                f"L(min/max/ratio)="
+                                f"{curve_length_min:.6e}/{curve_length_max:.6e}/{curve_length_ratio:.2f}"
                             )
 
                     if rho0 is None:
@@ -6972,32 +7503,22 @@ class NN_Trainer:
                     rho_min = float(rho.min().item())
                     rho_mean = float(rho.mean().item())
                     rho_max = float(rho.max().item())
-                    nonempty_curve_lengths = [
-                        v.reshape(-1) for v in curve_length_values if v.numel() > 0
-                    ]
-                    if nonempty_curve_lengths:
-                        curve_lengths = torch.cat(nonempty_curve_lengths, dim=0)
-                    else:
-                        curve_lengths = zero.new_empty((0,))
-                    if curve_lengths.numel() > 0:
-                        curve_length_min = float(curve_lengths.min().item())
-                        curve_length_max = float(curve_lengths.max().item())
-                        curve_length_mean = float(curve_lengths.mean().item())
-                        curve_length_std = float(curve_lengths.std(unbiased=False).item())
-                        curve_length_cv = (
-                            curve_length_std / curve_length_mean
-                            if math.isfinite(curve_length_mean) and abs(curve_length_mean) > float(cfg.eps)
-                            else float("nan")
-                        )
-                        curve_length_ratio = curve_length_max / max(curve_length_min, float(cfg.eps))
-                    else:
-                        curve_length_min = float("nan")
-                        curve_length_max = float("nan")
-                        curve_length_mean = float("nan")
-                        curve_length_std = float("nan")
-                        curve_length_cv = float("nan")
-                        curve_length_ratio = float("nan")
-                    solution_metrics = dict(topology_metrics_i)
+                    solution_metrics = (
+                        dict(topology_metrics_i)
+                        if topology_metrics_i is not None
+                        else {
+                            "minimum_length": float("nan"),
+                            "maximum_length": float("nan"),
+                            "mean_length": float("nan"),
+                            "standard_deviation": float("nan"),
+                            "coefficient_of_variation": float("nan"),
+                            "maximum_minimum_ratio": float("nan"),
+                            "number_of_selected_edges": float("nan"),
+                            "number_of_total_edges": float("nan"),
+                            "number_of_edges": float("nan"),
+                            "topology_identifier": "",
+                        }
+                    )
                     solution_metrics.update({
                         "minimum_length": curve_length_min,
                         "maximum_length": curve_length_max,
@@ -7080,6 +7601,9 @@ class NN_Trainer:
                         "loss_vol": self._finite_or_default(loss_vol),
                         "loss_rep": self._finite_or_default(loss_rep),
                         "loss_bnd": self._finite_or_default(loss_bnd),
+                        "loss_density_weighted_cvt": self._finite_or_default(loss_density_weighted_cvt),
+                        "loss_seed_domain_recovery": self._finite_or_default(loss_seed_domain_recovery),
+                        "loss_seed_active": self._finite_or_default(loss_seed_active),
                         "loss_curve_length": self._finite_or_default(loss_curve_length),
                         "curve_length_min": curve_length_min,
                         "curve_length_max": curve_length_max,
@@ -7095,6 +7619,8 @@ class NN_Trainer:
                         "maximum_minimum_ratio": solution_metrics["maximum_minimum_ratio"],
                         "minimum_seed_distance": min_seed_dist,
                         "number_of_edges": solution_metrics["number_of_edges"],
+                        "number_of_selected_edges": solution_metrics["number_of_selected_edges"],
+                        "number_of_total_edges": solution_metrics["number_of_total_edges"],
                         "topology_identifier": solution_metrics["topology_identifier"],
                         "loss_cell_edge_uniform": self._finite_or_default(loss_cell_edge_uniform),
                         "loss_fem": l_fem_current,
@@ -7154,6 +7680,8 @@ class NN_Trainer:
                         "raw_seed_units_total": raw_seed_count_total,
                         "topology_seed_units_total": topology_seed_count_total,
                         "soft_active_units_total": soft_active_total,
+                        "soft_active_mass": soft_active_total,
+                        "hard_active_count": hard_active_total,
                         "anchor_update_allowed": 1.0 if anchor_update_allowed else 0.0,
                         "collapse_active": (
                             1.0
@@ -7169,6 +7697,8 @@ class NN_Trainer:
                         comp=f"{row['comp']:.2e}",
                         w=f"{row['w_geo_mean']:.3e}",
                         clr=f"{row['centerline_radius_mean']:.3e}",
+                        lcvt=f"{row['loss_density_weighted_cvt']:.2e}",
+                        lseed=f"{row['loss_seed_active']:.2e}",
                         lcurve=f"{row['loss_curve_length']:.2e}",
                         lcell=f"{row['loss_cell_edge_uniform']:.2e}",
                         dmin=f"{row['min_seed_dist']:.3e}",
@@ -7177,7 +7707,7 @@ class NN_Trainer:
                         refresh=False,
                     )
 
-                    if cfg.MakeTimelaps and step % cfg.timelapse_frame_step == 0:
+                    if should_record_timelapse:
                         if getattr(cfg, "timelapse_show_3d_tubes", True):
                             cad_img = self._render_current_3d_tube_frame_cached(
                                 seeds_list=seeds_list,
@@ -7206,6 +7736,8 @@ class NN_Trainer:
                             "L_FEM": row["loss_fem"],
                             "L_Bnd": row["loss_bnd"],
                             "L_Rep": row["loss_rep"],
+                            "L_DWCVT": row["loss_density_weighted_cvt"],
+                            "L_SeedActive": row["loss_seed_active"],
                             "L_CurveLen": row["loss_curve_length"],
                             "L_CellEdge": row["loss_cell_edge_uniform"],
                         }
@@ -7245,17 +7777,16 @@ class NN_Trainer:
                         tqdm.write(
                             f"[{step:05d}] | "
                             f"Active Units/Total={participating_count_total:.0f}/{participating_count_total+inactive_count_total:.0f} | "
-                            f"Raw/Active/Inactive/Topology={raw_seed_count_total:.0f}/{participating_count_total:.0f}/{inactive_count_total:.0f}/{topology_seed_count_total:.0f} | "
-                            f"SoftActive={soft_active_total:.2f} | "
-
                             f"L_total={row['L_total']:.4e} | "
                             f"L_vol={row['loss_vol']:.3e} "
                             f"L_fem={row['loss_fem']:.3e} "
+                            f"L_dwcvt={row['loss_density_weighted_cvt']:.3e} "
+                            f"L_curve={row['loss_curve_length']:.3e} "
+                            f"L_cell_edge={row['loss_cell_edge_uniform']:.3e} "
                             f"L_rep={row['loss_rep']:.3e} "
                             f"L_bnd={row['loss_bnd']:.3e} "
-                            f"L_curve={row['loss_curve_length']:.3e} "
-                            f"L(min/max/mean/ratio)={row['curve_length_min']:.3e}/{row['curve_length_max']:.3e}/{row['curve_length_mean']:.3e}/{row['curve_length_ratio']:.2f} "
-                            f"L_cell_edge={row['loss_cell_edge_uniform']:.3e} |"
+                            f"L_seed_active={row['loss_seed_active']:.3e} |"
+                            f"L(min/max/mean/ratio)={row['curve_length_min']:.3e}/{row['curve_length_max']:.3e}/{row['curve_length_mean']:.3e}/{row['curve_length_ratio']:.2f} |"
                             f"VolFrac={row['VolFrac']:.3f} "
                             f"(/{cfg.target_volfrac:.3f}) "
                             f"os={row['seed_offset_scale']:.2e} "
@@ -7265,7 +7796,7 @@ class NN_Trainer:
                             f"rho(min/mean/max)={rho_min:.3f}/{rho_mean:.3f}/{rho_max:.3f} "
                             f"Δrho={drho:.2e} Δseed={dseed:.2e} "
                             f"dmin={min_seed_dist:.2e} grad_mean={g_mean:.2e} | "
-                                                        f"Filter Δrho mean={row['filter_delta_mean']:.2e} "
+                            f"Filter Δrho mean={row['filter_delta_mean']:.2e} "
                             f"Filter Δrho max={row['filter_delta_max']:.2e} "
                             f"Projection Δrho mean={row['projection_delta_mean']:.2e} "
                             f"Projection Δrho max={row['projection_delta_max']:.2e} | "
@@ -7274,7 +7805,6 @@ class NN_Trainer:
                             f"rho_final_mean={row['rho_final_mean']:.3f} | "
                             f"fem={fem_status} | "
                             f"best={best_score:.4e}@{best_step} | "
-                            f"best_hard={best_hard_score:.4e}@{best_hard_step}"
                         )
 
                     rep_value = float(row["loss_rep"])
@@ -7559,17 +8089,28 @@ class NN_Trainer:
 
         computation_time_sec = time.perf_counter() - train_start_time
         final_centerline_radius = float("nan")
+        best_row = None
         if history and best_step >= 0:
             for hist_row in reversed(history):
                 if int(hist_row["step"]) == int(best_step):
+                    best_row = hist_row
                     final_centerline_radius = float(hist_row.get("centerline_radius_mean", float("nan")))
                     break
+        final_curve_length_min = float("nan")
+        final_curve_length_max = float("nan")
+        final_curve_length_ratio = float("nan")
+        if best_row is not None:
+            final_curve_length_min = float(best_row.get("curve_length_min", float("nan")))
+            final_curve_length_max = float(best_row.get("curve_length_max", float("nan")))
+            final_curve_length_ratio = float(best_row.get("curve_length_ratio", float("nan")))
 
         tqdm.write(
             f"FINAL RETURNED: best_step={best_step}, best_score={best_score:.6f} | "
             f"VolFrac={best_vol_frac:.3e}, "
             f"comp={best_comp:.3e}, w_geo={best_w_geo:.3e}, "
             f"centerline_radius={final_centerline_radius:.3e} | "
+            f"L(min/max/ratio)="
+            f"{final_curve_length_min:.3e}/{final_curve_length_max:.3e}/{final_curve_length_ratio:.2f} | "
             f"active_units={float(best_active_count or 0.0):.0f}, inactive_units={float(best_inactive_count or 0.0):.0f} | "
             f"source={returned_best_source} | "
             f"time={self._format_elapsed_time(computation_time_sec)}"
@@ -7579,13 +8120,6 @@ class NN_Trainer:
             self.writer.flush()
             self.writer.close()
             self.writer = None
-
-        best_row = None
-        if history and best_step >= 0:
-            for row in reversed(history):
-                if int(row["step"]) == int(best_step):
-                    best_row = row
-                    break
 
         if best_row is not None:
             tqdm.write(
@@ -7602,6 +8136,8 @@ class NN_Trainer:
             "maximum_minimum_ratio",
             "minimum_seed_distance",
             "number_of_edges",
+            "number_of_selected_edges",
+            "number_of_total_edges",
             "topology_identifier",
         ]
         best_solution_metrics = {
@@ -7667,6 +8203,7 @@ class NN_Trainer:
                     "L_FEM": float(best_row["loss_fem"]) if best_row is not None else float("nan"),
                     "L_Bnd": float(best_row["loss_bnd"]) if best_row is not None else float("nan"),
                     "L_Rep": float(best_row["loss_rep"]) if best_row is not None else float("nan"),
+                    "L_DWCVT": float(best_row["loss_density_weighted_cvt"]) if best_row is not None else float("nan"),
                     "L_CurveLen": float(best_row["loss_curve_length"]) if best_row is not None else float("nan"),
                     "L_CellEdge": float(best_row["loss_cell_edge_uniform"]) if best_row is not None else float("nan"),
                 }

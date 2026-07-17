@@ -1,7 +1,12 @@
 import torch
 import matplotlib.pyplot as plt
 
-from Decoder_CLasses.ContinuousVoronoiDecoder import ContinuousVoronoiDecoder
+from Decoder_CLasses.ContinuousVoronoiDecoder import (
+    GUARD_SEED_EPS,
+    ContinuousVoronoiDecoder,
+    fixed_guard_seeds,
+    remap_guard_seed_pairs,
+)
 
 
 def make_decoder(**kwargs):
@@ -11,7 +16,7 @@ def make_decoder(**kwargs):
         "Xv": None,
         "points_xyz": None,
     }
-    return ContinuousVoronoiDecoder(None, face_mesh, return_xyz=False, **kwargs)
+    return ContinuousVoronoiDecoder(None, face_mesh, **kwargs)
 
 
 def test_scipy_topology_returns_unified_boundary_graph_fields():
@@ -82,7 +87,7 @@ def test_scipy_topology_can_keep_isolated_vertices_for_debugging():
         dtype=torch.float64,
     )
 
-    out = decoder.forward_scipy_topology(seeds, return_xyz=False, keep_isolated_vertices=True)
+    out = decoder.forward_scipy_topology(seeds, return_xyz=False)
     diagnostics = out["diagnostics"]
 
     assert out["vertices_uv"].shape[0] == diagnostics["num_final_nodes"]
@@ -205,7 +210,7 @@ def test_dense_smooth_cad_boundary_samples_do_not_become_nodes():
 
 
 def test_guard_seed_topology_uses_only_finite_real_real_ridges():
-    decoder = make_decoder(strict_guard_topology=True)
+    decoder = make_decoder()
     seeds = torch.tensor(
         [
             [0.10, 0.10],
@@ -284,21 +289,103 @@ def test_finite_segment_vertices_are_differentiable_and_guards_are_constant():
     assert (not same_shape) or (not torch.allclose(out["vertices_uv"], moved_out["vertices_uv"]))
 
 
-def test_strict_guard_topology_raises_when_real_real_infinite_ridges_remain():
-    decoder = make_decoder(use_guard_seeds=False, strict_guard_topology=True)
+def test_fixed_guard_topology_rejects_periodic_domains():
+    decoder = make_decoder(face_u_periodic=True)
     seeds = torch.tensor(
-        [
-            [0.15, 0.15],
-            [0.85, 0.15],
-            [0.50, 0.85],
-            [0.50, 0.45],
-        ],
+        [[0.15, 0.15], [0.85, 0.15], [0.50, 0.85], [0.50, 0.45]],
         dtype=torch.float64,
     )
 
     try:
-        decoder.forward_scipy_topology(seeds, return_xyz=False)
-    except RuntimeError as error:
-        assert "Guard seeds failed to close all real-real ridges" in str(error)
+        decoder.forward_scipy_topology(seeds, u_periodic=True)
+    except NotImplementedError as error:
+        assert "non-periodic [0,1]^2" in str(error)
     else:
-        raise AssertionError("strict_guard_topology should raise when infinite real-real ridges remain.")
+        raise AssertionError("periodic fixed-guard topology should fail clearly.")
+
+
+def test_fixed_guard_seeds_coordinates_and_gradient_state():
+    guards = fixed_guard_seeds(device=torch.device("cpu"), dtype=torch.float64)
+    d = float(torch.tensor(2.0, dtype=torch.float64).sqrt().item() + GUARD_SEED_EPS)
+    expected = torch.tensor(
+        [
+            [0.5, -d],
+            [1.0 + d, 0.5],
+            [0.5, 1.0 + d],
+            [-d, 0.5],
+        ],
+        dtype=torch.float64,
+    )
+
+    assert guards.shape == (4, 2)
+    assert guards.requires_grad is False
+    assert guards.grad_fn is None
+    assert torch.allclose(guards, expected)
+
+
+def test_fixed_guard_concat_preserves_real_seed_gradients_only():
+    real = torch.tensor(
+        [[0.3, 0.4], [0.7, 0.6]],
+        dtype=torch.double,
+        requires_grad=True,
+    )
+    guards = fixed_guard_seeds(device=real.device, dtype=real.dtype)
+    combined = torch.cat([real, guards], dim=0)
+
+    loss = combined[:2].square().sum()
+    loss.backward()
+
+    assert real.grad is not None
+    assert torch.isfinite(real.grad).all()
+    assert guards.grad is None
+
+
+def test_fixed_guards_are_not_registered_parameters_or_state():
+    decoder = make_decoder()
+    guards = fixed_guard_seeds(device=torch.device("cpu"), dtype=torch.float64)
+
+    assert list(decoder.parameters()) == []
+    for value in decoder.state_dict().values():
+        assert not (value.shape == guards.shape and torch.allclose(value.cpu(), guards))
+
+
+def test_guard_seed_pair_remapping_filters_guard_guard_edges():
+    pairs = torch.tensor(
+        [
+            [0, 1],
+            [0, 4],
+            [5, 1],
+            [4, 5],
+        ],
+        dtype=torch.long,
+    )
+
+    keep, remapped = remap_guard_seed_pairs(pairs, real_seed_count=4)
+
+    assert torch.equal(keep, torch.tensor([True, True, True, False]))
+    assert torch.equal(
+        remapped[keep],
+        torch.tensor([[0, 1], [0, -1], [-1, 1]], dtype=torch.long),
+    )
+
+
+def test_fixed_guards_do_not_change_nearest_real_seed_inside_unit_square():
+    real = torch.tensor(
+        [
+            [0.15, 0.15],
+            [0.85, 0.15],
+            [0.20, 0.85],
+            [0.80, 0.80],
+            [0.50, 0.50],
+        ],
+        dtype=torch.double,
+    )
+    guards = fixed_guard_seeds(device=real.device, dtype=real.dtype)
+    grid_1d = torch.linspace(0.0, 1.0, 31, dtype=real.dtype)
+    uu, vv = torch.meshgrid(grid_1d, grid_1d, indexing="ij")
+    query = torch.stack((uu.reshape(-1), vv.reshape(-1)), dim=1)
+
+    nearest_real = torch.cdist(query, real).argmin(dim=1)
+    nearest_augmented = torch.cdist(query, torch.cat([real, guards], dim=0)).argmin(dim=1)
+
+    assert torch.equal(nearest_augmented, nearest_real)
