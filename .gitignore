@@ -11,3 +11,14 @@ Case_Studies/
 
 # Archives
 *.zip
+# Generated outputs
+runs/
+Case_Studies/
+
+# Archives and videos
+*.zip
+*.avi
+
+# Python cache
+__pycache__/
+*.py[cod]
