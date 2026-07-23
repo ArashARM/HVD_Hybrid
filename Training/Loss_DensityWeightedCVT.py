@@ -18,7 +18,7 @@ class LossDensityWeightedCVT:
         sample_area_weights: torch.Tensor,
         importance: torch.Tensor | None = None,
         seed_active_weights: torch.Tensor | None = None,
-        temperature: float = 0.02,
+        temperature: float = 0.001,
         activity_floor: float = 0.02,
         activity_power: float = 1.0,
         activity_log_floor: float = 1e-4,

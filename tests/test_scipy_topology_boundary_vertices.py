@@ -144,6 +144,14 @@ def test_box_boundary_shell_is_closed_without_pair_bisector_completion():
     assert corner_ids.numel() == 4
     assert int((edge_type == 4).sum()) == 4
     assert not torch.any(source_type == 3)
+    shell_pairs = graph["edge_seed_pair"][edge_type == 4]
+    assert shell_pairs.shape == (4, 2)
+    assert torch.all(shell_pairs[:, 0] >= 0)
+    assert torch.all(shell_pairs[:, 1] == -1)
+    assert "cell_boundary_edge_indices" in graph
+    assert "cell_boundary_edge_directions" in graph
+    assert "cell_boundary_seed_ids" in graph
+    assert graph["cell_boundary_seed_ids"].numel() == seeds.shape[0]
     for node_id in corner_ids.tolist():
         incident = (edges == node_id).any(dim=1)
         assert int((incident & (edge_type == 4)).sum()) == 2

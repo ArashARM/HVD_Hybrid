@@ -109,6 +109,12 @@ CELL_GEOMETRY_EDGE_TYPES = (
     EDGE_INTERIOR_VORONOI,
     EDGE_CLIPPED_ONE_SIDE,
     EDGE_CLIPPED_TWO_SIDE,
+    EDGE_DOMAIN_SHELL,
+)
+CELL_LENGTH_EDGE_TYPES = (
+    EDGE_INTERIOR_VORONOI,
+    EDGE_CLIPPED_ONE_SIDE,
+    EDGE_CLIPPED_TWO_SIDE,
 )
 
 
@@ -192,6 +198,9 @@ class SharedCurveGeometry:
     finite_edge_mask: torch.Tensor
     edge_type: torch.Tensor
     edge_seed_pair: torch.Tensor | None
+    cell_boundary_edge_indices: list[torch.Tensor] | None = None
+    cell_boundary_edge_directions: list[torch.Tensor] | None = None
+    cell_boundary_seed_ids: torch.Tensor | None = None
 
 
 def build_shared_curve_geometry(
@@ -216,6 +225,16 @@ def build_shared_curve_geometry(
             "edge_seed_pair_original",
             graph.get("edge_seed_pair", None),
         )
+        cell_boundary_edge_indices = graph.get("cell_boundary_edge_indices", None)
+        cell_boundary_edge_directions = graph.get("cell_boundary_edge_directions", None)
+        cell_boundary_seed_ids = graph.get(
+            "cell_boundary_seed_ids_original",
+            graph.get("cell_boundary_seed_ids", None),
+        )
+    else:
+        cell_boundary_edge_indices = None
+        cell_boundary_edge_directions = None
+        cell_boundary_seed_ids = None
 
     if edge_type is None:
         if require_edge_type:
@@ -265,6 +284,9 @@ def build_shared_curve_geometry(
         finite_edge_mask=finite_edge_mask,
         edge_type=edge_type,
         edge_seed_pair=edge_seed_pair,
+        cell_boundary_edge_indices=cell_boundary_edge_indices,
+        cell_boundary_edge_directions=cell_boundary_edge_directions,
+        cell_boundary_seed_ids=cell_boundary_seed_ids,
     )
 
 
@@ -281,6 +303,35 @@ def needs_shared_curve_geometry(
         or collect_curve_metrics
         or collect_topology_metrics
     )
+
+
+@dataclass(frozen=True)
+class StageSpec:
+    stage_id: int
+    name: str
+    min_steps: int
+    max_steps: int
+    patience: int
+    min_delta_abs: float
+    min_delta_rel: float
+
+
+@dataclass
+class StageRuntime:
+    spec: StageSpec
+    local_step: int = 0
+    monitor_ema: torch.Tensor | None = None
+    best_raw_monitor: float = float("inf")
+    best_monitor_ema: float = float("inf")
+    patience_counter: int = 0
+    topology_grace_remaining: int = 0
+    previous_active_count: int | None = None
+    previous_topology_identifier: str | None = None
+    previous_edge_count: int | None = None
+    stage_best_raw_checkpoint: dict[str, Any] | None = None
+    stage_best_checkpoint: dict[str, Any] | None = None
+    stage_last_valid_checkpoint: dict[str, Any] | None = None
+    end_reason: str | None = None
 
 
 @dataclass
@@ -382,6 +433,7 @@ class TrainingConfig:
     lam_cell_edge_uniform: float = 1.0
     lam_cell_angle_uniform: float = 1.0
     lam_cell_radial_uniform: float = 0.5
+    include_shell_in_length_loss: bool = False
 
     comp_normalize_by: float | None = 1e10
     normalize_losses: bool = True
@@ -425,6 +477,73 @@ class TrainingConfig:
     lr_delta_head: float = 2e-4
     lr_mlp: float = 2e-4
     lr_w_head: float = 2e-4
+
+    use_three_stage_optimization: bool = False
+    stage1_lam_vol_scale: float = 0.0
+    stage1_lam_fem_scale: float = 0.2
+    stage1_lambda_cvt_scale: float = 1.0
+    stage1_lam_rep_scale: float = 1.0
+    stage1_lam_bnd_scale: float = 0.2
+    stage1_lam_seed_domain_recovery_scale: float = 1.0
+    stage1_lam_seed_active_scale: float = 1.0
+    stage1_lam_curve_length_scale: float = 0.2
+    stage1_lam_cell_edge_uniform_scale: float = 0.1
+    stage1_freeze_seeds: bool = False
+    stage1_freeze_w: bool = True
+    stage2_lam_vol_scale: float = 0.0
+    stage2_lam_fem_scale: float = 0.5
+    stage2_lambda_cvt_scale: float = 0.7
+    stage2_lam_rep_scale: float = 0.7
+    stage2_lam_bnd_scale: float = 0.5
+    stage2_lam_seed_domain_recovery_scale: float = 0.5
+    stage2_lam_seed_active_scale: float = 0.5
+    stage2_lam_curve_length_scale: float = 1.0
+    stage2_lam_cell_edge_uniform_scale: float = 1.0
+    stage2_freeze_seeds: bool = False
+    stage2_freeze_w: bool = True
+    stage3_lam_vol_scale: float = 1.0
+    stage3_lam_fem_scale: float = 1.0
+    stage3_lambda_cvt_scale: float = 0.25
+    stage3_lam_rep_scale: float = 0.2
+    stage3_lam_bnd_scale: float = 0.5
+    stage3_lam_seed_domain_recovery_scale: float = 0.2
+    stage3_lam_seed_active_scale: float = 0.2
+    stage3_lam_curve_length_scale: float = 0.3
+    stage3_lam_cell_edge_uniform_scale: float = 0.3
+    stage3_freeze_seeds: bool = True
+    stage3_freeze_w: bool = False
+
+    # Adaptive stage scheduling
+    use_adaptive_stage_stopping: bool = True
+    stage1_min_steps: int = 150
+    stage1_max_steps: int = 300
+    stage1_patience: int = 60
+    stage2_min_steps: int = 250
+    stage2_max_steps: int = 500
+    stage2_patience: int = 100
+    stage3_min_steps: int = 50
+    stage3_max_steps: int = 200
+    stage3_patience: int = 40
+    stage_monitor_ema_beta: float = 0.9
+    stage1_min_delta_abs: float = 1e-4
+    stage1_min_delta_rel: float = 1e-3
+    stage2_min_delta_abs: float = 1e-4
+    stage2_min_delta_rel: float = 1e-3
+    stage3_min_delta_abs: float = 1e-5
+    stage3_min_delta_rel: float = 1e-3
+    stage_topology_grace_steps: int = 20
+    debug_stage_controller: bool = False
+    restore_transition_checkpoint: bool = True
+    reset_optimizer_between_stages: bool = True
+    stage_transition_selection: str = "next_stage_objective"
+    final_checkpoint_selection: str = "fixed_evaluation"
+    stage3_fem_monitor_threshold: float = 1e-6
+    stage3_monitor_fem_weight: float = 1.0
+    fixed_eval_lam_fem: float = 1.0
+    fixed_eval_lam_vol: float = 1.0
+    fixed_eval_lambda_cvt: float = 0.2
+    fixed_eval_lam_cell_edge: float = 0.05
+    fixed_eval_lam_rep: float = 0.0
 
     log_every: int = 50
     early_stop_start: float = 0.30
@@ -579,6 +698,37 @@ class TrainingConfig:
                 "lr_independent_seed_offsets must be >= 0, "
                 f"got {self.lr_independent_seed_offsets}"
             )
+        for name in (
+            "stage1_lam_vol_scale",
+            "stage1_lam_fem_scale",
+            "stage1_lambda_cvt_scale",
+            "stage1_lam_rep_scale",
+            "stage1_lam_bnd_scale",
+            "stage1_lam_seed_domain_recovery_scale",
+            "stage1_lam_seed_active_scale",
+            "stage1_lam_curve_length_scale",
+            "stage1_lam_cell_edge_uniform_scale",
+            "stage2_lam_vol_scale",
+            "stage2_lam_fem_scale",
+            "stage2_lambda_cvt_scale",
+            "stage2_lam_rep_scale",
+            "stage2_lam_bnd_scale",
+            "stage2_lam_seed_domain_recovery_scale",
+            "stage2_lam_seed_active_scale",
+            "stage2_lam_curve_length_scale",
+            "stage2_lam_cell_edge_uniform_scale",
+            "stage3_lam_vol_scale",
+            "stage3_lam_fem_scale",
+            "stage3_lambda_cvt_scale",
+            "stage3_lam_rep_scale",
+            "stage3_lam_bnd_scale",
+            "stage3_lam_seed_domain_recovery_scale",
+            "stage3_lam_seed_active_scale",
+            "stage3_lam_curve_length_scale",
+            "stage3_lam_cell_edge_uniform_scale",
+        ):
+            if float(getattr(self, name)) < 0.0:
+                raise ValueError(f"{name} must be >= 0, got {getattr(self, name)}")
         if self.seed_offset_scale_start is not None and self.seed_offset_scale_start <= 0.0:
             raise ValueError(
                 f"seed_offset_scale_start must be > 0, got {self.seed_offset_scale_start}"
@@ -596,6 +746,44 @@ class TrainingConfig:
             raise ValueError(f"min_active_seeds must be >= 1, got {self.min_active_seeds}")
         if self.prune_patience is not None and self.prune_patience < 1:
             raise ValueError(f"prune_patience must be >= 1, got {self.prune_patience}")
+        if not (0.0 <= float(self.stage_monitor_ema_beta) < 1.0):
+            raise ValueError(
+                "stage_monitor_ema_beta must satisfy 0 <= beta < 1, "
+                f"got {self.stage_monitor_ema_beta}"
+            )
+        for sid in (1, 2, 3):
+            min_steps = int(getattr(self, f"stage{sid}_min_steps"))
+            max_steps = int(getattr(self, f"stage{sid}_max_steps"))
+            patience = int(getattr(self, f"stage{sid}_patience"))
+            if min_steps < 0:
+                raise ValueError(f"stage{sid}_min_steps must be >= 0, got {min_steps}")
+            if max_steps < min_steps:
+                raise ValueError(
+                    f"stage{sid}_max_steps must be >= stage{sid}_min_steps, "
+                    f"got {max_steps} < {min_steps}"
+                )
+            if patience < 1:
+                raise ValueError(f"stage{sid}_patience must be >= 1, got {patience}")
+        if self.stage_transition_selection not in {
+            "next_stage_objective",
+            "stage_monitor",
+            "last",
+        }:
+            raise ValueError(
+                "stage_transition_selection must be one of "
+                "{'next_stage_objective', 'stage_monitor', 'last'}, "
+                f"got {self.stage_transition_selection!r}"
+            )
+        if self.final_checkpoint_selection not in {
+            "fixed_evaluation",
+            "stage3_best",
+            "stage3_final",
+        }:
+            raise ValueError(
+                "final_checkpoint_selection must be one of "
+                "{'fixed_evaluation', 'stage3_best', 'stage3_final'}, "
+                f"got {self.final_checkpoint_selection!r}"
+            )
         if self.auto_update_wmin:
             if self.min_feature_size_3d is None:
                 raise ValueError(
@@ -818,22 +1006,31 @@ def apply_density_postprocess_to_output(
 
 
 class RunningNorm:
-    def __init__(self, momentum: float = 0.99, eps: float = 1e-12):
+    def __init__(
+        self,
+        momentum: float = 0.99,
+        eps: float = 1e-12,
+        min_scale: float = 1.0,
+    ):
         self.val = None
         self.momentum = momentum
         self.eps = eps
+        self.min_scale = min_scale
 
     def update(self, x: float) -> float:
         x = abs(float(x))
         if not math.isfinite(x):
-            return max(self.val if self.val is not None else 1.0, 1e-8)
+            return max(self.val if self.val is not None else self.min_scale, self.min_scale)
+
+        if x <= self.min_scale:
+            return max(self.val if self.val is not None else self.min_scale, self.min_scale)
 
         x = x + self.eps
         if self.val is None:
             self.val = x
         else:
             self.val = self.momentum * self.val + (1.0 - self.momentum) * x
-        return max(self.val, 1e-8)
+        return max(self.val, self.min_scale)
 
 
 def _cpu_detached_tree(value):
@@ -863,6 +1060,75 @@ def _tree_to_device(value, device=None, dtype=None):
     return value
 
 
+def _safe_int_or_none(value, default=None):
+    if value is None:
+        return default
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return default
+        value = value.detach().reshape(-1)[0].cpu().item()
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _portable_face_tensor(face_tensor):
+    if face_tensor is None:
+        return None
+    keep_keys = {
+        "uv",
+        "Xu",
+        "Xv",
+        "points_xyz",
+        "faces_ijk",
+        "face_areas",
+        "global_vertex_idx",
+        "boundary_idx_ring1",
+        "u_periodic",
+        "v_periodic",
+        "face_id",
+        "seed_domain_uv_support",
+        "seed_domain_sigma",
+        "seed_domain_mask_grid",
+        "seed_domain_sdf_grid",
+        "seed_domain_sdf_uv_min",
+        "seed_domain_sdf_uv_max",
+        "boundary_curve_uv",
+        "boundary_curve_offsets",
+        "boundary_curve_loop_id",
+    }
+    return {
+        key: _cpu_detached_tree(value)
+        for key, value in dict(face_tensor).items()
+        if key in keep_keys
+    }
+
+
+def _portable_cad_domain(face_tensor=None, best_pred=None):
+    data = {}
+    sources = []
+    if isinstance(face_tensor, dict):
+        sources.append(face_tensor)
+    if isinstance(best_pred, dict) and isinstance(best_pred.get("graph"), dict):
+        sources.append(best_pred["graph"])
+
+    for source in sources:
+        for key in (
+            "boundary_curve_uv",
+            "boundary_curve_offsets",
+            "boundary_curve_loop_id",
+            "seed_domain_sdf_grid",
+            "seed_domain_sdf_uv_min",
+            "seed_domain_sdf_uv_max",
+        ):
+            value = source.get(key, None)
+            if value is not None and key not in data:
+                data[key] = _cpu_detached_tree(value)
+
+    return data or None
+
+
 def _import_symbol(module_name: str, class_name: str):
     module = importlib.import_module(module_name)
     return getattr(module, class_name)
@@ -876,7 +1142,7 @@ class OptimizedShellFunction:
         (u, v), Xu, Xv -> density rho and 3D fiber direction.
     """
 
-    package_version = 1
+    package_version = 2
 
     def __init__(self, package: dict[str, Any], decoder_cls=None, device=None):
         self.package = package
@@ -891,8 +1157,17 @@ class OptimizedShellFunction:
         self.decoder_cls = decoder_cls
 
         self.config = package.get("config", {})
+        self.face_tensor = _tree_to_device(
+            package.get("face_tensor", None),
+            device=self.device,
+        )
+        decoder_init_kwargs_raw = dict(package["decoder_init_kwargs"])
+        if self.face_tensor is not None:
+            decoder_init_kwargs_raw["face_mesh"] = self.face_tensor
+        if decoder_init_kwargs_raw.get("Cad_domain", None) is None:
+            decoder_init_kwargs_raw["Cad_domain"] = package.get("cad_domain", None)
         self.decoder_init_kwargs = _tree_to_device(
-            package["decoder_init_kwargs"],
+            decoder_init_kwargs_raw,
             device=self.device,
         )
         self.decoder = self.decoder_cls(**self.decoder_init_kwargs).to(self.device)
@@ -903,6 +1178,14 @@ class OptimizedShellFunction:
 
         self.best_pred = _tree_to_device(package["best_pred"], device=self.device)
         self.face_metadata = package.get("face_metadata", {})
+        self.final_shape_density = _tree_to_device(
+            package.get("final_shape_density", None),
+            device=self.device,
+        )
+        self.final_shape_fiber_direction = _tree_to_device(
+            package.get("final_shape_fiber_direction", None),
+            device=self.device,
+        )
 
     @classmethod
     def load(cls, path, decoder_cls=None, device=None):
@@ -1067,21 +1350,58 @@ class OptimizedShellFunction:
             # full mesh/face tensor and is applied by evaluate_face().
             use_u_periodic = self.decoder._bool_value(getattr(self.decoder, "face_u_periodic", False))
             use_v_periodic = self.decoder._bool_value(getattr(self.decoder, "face_v_periodic", False))
-            return self.decoder.build_swept_tube_fields(
-                points_uv=points_uv,
-                points_3d=points_xyz,
-                seeds_uv=pred["seeds_raw"],
-                w_raw=pred["w_raw"],
-                Xu=Xu,
-                Xv=Xv,
-                cad_domain=getattr(self.decoder, "Cad_domain", None),
-                u_periodic=use_u_periodic,
-                v_periodic=use_v_periodic,
-                return_xyz=True,
-                generate_density_fiber=bool(self.config.get("generate_decoder_density_fiber", True)),
-            )
+            if hasattr(self.decoder, "build_swept_tube_fields"):
+                return self.decoder.build_swept_tube_fields(
+                    points_uv=points_uv,
+                    points_3d=points_xyz,
+                    seeds_uv=pred["seeds_raw"],
+                    w_raw=pred["w_raw"],
+                    Xu=Xu,
+                    Xv=Xv,
+                    cad_domain=getattr(self.decoder, "Cad_domain", None),
+                    u_periodic=use_u_periodic,
+                    v_periodic=use_v_periodic,
+                    return_xyz=True,
+                    generate_density_fiber=bool(self.config.get("generate_decoder_density_fiber", True)),
+                )
 
-    def evaluate_face(self, face_tensor, hard_seed_mask=True):
+            if points_xyz is None:
+                raise ValueError(
+                    "points_xyz is required for decoders that evaluate from their face mesh."
+                )
+
+            old_points_uv = getattr(self.decoder, "points_uv", None)
+            old_points_3d = getattr(self.decoder, "points_3d", None)
+            old_Xu = getattr(self.decoder, "Xu", None)
+            old_Xv = getattr(self.decoder, "Xv", None)
+            old_cad_domain = getattr(self.decoder, "Cad_domain", None)
+            try:
+                self.decoder.points_uv = points_uv
+                self.decoder.points_3d = points_xyz
+                self.decoder.Xu = Xu
+                self.decoder.Xv = Xv
+                if face_tensor is not None and face_tensor.get("Cad_domain", None) is not None:
+                    self.decoder.Cad_domain = face_tensor["Cad_domain"]
+                return self.decoder(
+                    seeds_uv=pred["seeds_raw"],
+                    w_raw=pred["w_raw"],
+                    generate_density_fiber=bool(self.config.get("generate_decoder_density_fiber", True)),
+                )
+            finally:
+                self.decoder.points_uv = old_points_uv
+                self.decoder.points_3d = old_points_3d
+                self.decoder.Xu = old_Xu
+                self.decoder.Xv = old_Xv
+                self.decoder.Cad_domain = old_cad_domain
+
+    def evaluate_face(self, face_tensor=None, hard_seed_mask=True):
+        if face_tensor is None:
+            face_tensor = self.face_tensor
+        if face_tensor is None:
+            raise ValueError(
+                "face_tensor is required because this optimized shell package "
+                "does not contain a saved face_tensor snapshot."
+            )
         ft = _tree_to_device(
             dict(face_tensor),
             device=self.device,
@@ -1113,7 +1433,7 @@ class OptimizedShellFunction:
 
 def evaluate_optimized_shell_function(
     optimized_function,
-    face_tensors,
+    face_tensors=None,
     face_index: int = 0,
     hard_seed_mask: bool = True,
 ):
@@ -1123,13 +1443,39 @@ def evaluate_optimized_shell_function(
     Returns surface density and 3D fiber direction, ready for later
     visualization or export to a custom FEM workflow.
     """
-    if isinstance(face_tensors, dict) and "face_tensors" in face_tensors:
+    if face_tensors is None:
+        face_tensor = getattr(optimized_function, "face_tensor", None)
+    elif isinstance(face_tensors, dict) and "face_tensors" in face_tensors:
         face_tensors = face_tensors["face_tensors"]
-
-    if isinstance(face_tensors, (list, tuple)):
+        face_tensor = face_tensors[int(face_index)]
+    elif isinstance(face_tensors, (list, tuple)):
         face_tensor = face_tensors[int(face_index)]
     else:
         face_tensor = face_tensors
+
+    if face_tensors is None:
+        final_density = getattr(optimized_function, "final_shape_density", None)
+        final_fiber = getattr(optimized_function, "final_shape_fiber_direction", None)
+        if final_density is not None and final_fiber is not None:
+            density = final_density
+            fiber_3d = final_fiber
+            density_binary = (density >= 0.5).to(dtype=density.dtype)
+            return {
+                "2d_density": density,
+                "2d_fiberDir": None,
+                "3d_density": density,
+                "3d_fiberDir": fiber_3d,
+                "density": density,
+                "density_binary": density_binary,
+                "fiber_direction": fiber_3d,
+                "rho": density,
+                "rho_raw_decoder": density,
+                "rho_postprocessed": density,
+                "fiber3d": fiber_3d,
+                "t_uv": None,
+                "decoder_output": None,
+                "face_tensor": face_tensor,
+            }
 
     out = optimized_function.evaluate_face(
         face_tensor,
@@ -1270,7 +1616,12 @@ def visualize_optimized_shell_fields(
     faces = _field_to_numpy(face_tensor["faces_ijk"]).astype(np.int64)
 
     density_2d = _field_to_numpy(fields["2d_density"]).reshape(-1).astype(np.float64)
-    fiber_2d = _field_to_numpy(fields["2d_fiberDir"]).reshape(-1, 2).astype(np.float64)
+    fiber_2d_raw = fields.get("2d_fiberDir", None)
+    fiber_2d = (
+        None
+        if fiber_2d_raw is None
+        else _field_to_numpy(fiber_2d_raw).reshape(-1, 2).astype(np.float64)
+    )
     density_3d = _field_to_numpy(fields["3d_density"]).reshape(-1).astype(np.float64)
     fiber_3d = _field_to_numpy(fields["3d_fiberDir"]).reshape(-1, 3).astype(np.float64)
 
@@ -1333,16 +1684,19 @@ def visualize_optimized_shell_fields(
                 linewidths=0,
             )
 
-        fiber_norm_2d = np.linalg.norm(fiber_2d, axis=1)
-        mask_2d = np.isfinite(density_2d) & np.isfinite(fiber_2d).all(axis=1)
-        mask_2d &= density_2d >= float(fiber_min_density)
-        mask_2d &= fiber_norm_2d > 1e-12
-        if fiber_stride > 1:
-            stride_mask = np.zeros(mask_2d.shape[0], dtype=bool)
-            stride_mask[::int(fiber_stride)] = True
-            mask_2d &= stride_mask
+        if fiber_2d is not None:
+            fiber_norm_2d = np.linalg.norm(fiber_2d, axis=1)
+            mask_2d = np.isfinite(density_2d) & np.isfinite(fiber_2d).all(axis=1)
+            mask_2d &= density_2d >= float(fiber_min_density)
+            mask_2d &= fiber_norm_2d > 1e-12
+            if fiber_stride > 1:
+                stride_mask = np.zeros(mask_2d.shape[0], dtype=bool)
+                stride_mask[::int(fiber_stride)] = True
+                mask_2d &= stride_mask
+        else:
+            mask_2d = np.zeros(density_2d.shape[0], dtype=bool)
 
-        if np.any(mask_2d):
+        if fiber_2d is not None and np.any(mask_2d):
             ax_fiber.quiver(
                 uv[mask_2d, 0],
                 uv[mask_2d, 1],
@@ -1700,26 +2054,200 @@ class NN_Trainer:
 
     @staticmethod
     def topology_identifier_from_graph(graph: dict | None) -> str:
+        """
+        Build a stable identifier for meaningful Voronoi topology.
+
+        The signature ignores:
+        - node numbering;
+        - edge ordering;
+        - differentiable node coordinates;
+        - edge_index endpoint IDs.
+
+        It uses canonical seed-pair ownership and edge type.
+        """
         if not isinstance(graph, dict):
             return ""
 
+        edge_seed_pair = graph.get(
+            "edge_seed_pair_original",
+            graph.get("edge_seed_pair"),
+        )
+        edge_type = graph.get("edge_type")
+
+        if edge_seed_pair is None:
+            return ""
+
+        if torch.is_tensor(edge_seed_pair):
+            pairs = edge_seed_pair.detach().cpu().to(torch.long).numpy()
+        else:
+            pairs = np.asarray(edge_seed_pair, dtype=np.int64)
+
+        if pairs.ndim != 2 or pairs.shape[1] != 2:
+            return ""
+
+        if edge_type is None:
+            types = np.zeros((pairs.shape[0],), dtype=np.int64)
+        elif torch.is_tensor(edge_type):
+            types = edge_type.detach().cpu().to(torch.long).numpy().reshape(-1)
+        else:
+            types = np.asarray(edge_type, dtype=np.int64).reshape(-1)
+
+        if types.shape[0] != pairs.shape[0]:
+            return ""
+
+        # Seed ownership is undirected.
+        pairs = np.sort(pairs, axis=1)
+
+        # Each row represents one meaningful edge identity.
+        records = np.column_stack((pairs, types)).astype(np.int64, copy=False)
+
+        # Remove exact duplicates if graph construction produces any.
+        records = np.unique(records, axis=0)
+
+        # Canonical ordering independent of decoder/SciPy output order.
+        if records.shape[0] > 1:
+            order = np.lexsort(
+                (
+                    records[:, 2],  # edge type
+                    records[:, 1],  # larger seed ID
+                    records[:, 0],  # smaller seed ID
+                )
+            )
+            records = records[order]
+
         digest = hashlib.sha1()
-        wrote_any = False
-        for key in ("edge_index", "edge_seed_pair", "edge_type"):
-            value = graph.get(key, None)
-            if value is None:
-                continue
-            if isinstance(value, torch.Tensor):
-                arr = value.detach().cpu().numpy()
+        digest.update(str(records.shape).encode("utf-8"))
+        digest.update(records.tobytes())
+
+        return digest.hexdigest()[:16]
+
+    @staticmethod
+    def topology_edge_count_from_graph(graph: dict | None) -> int | None:
+        if not isinstance(graph, dict):
+            return None
+
+        edge_seed_pair = graph.get(
+            "edge_seed_pair_original",
+            graph.get("edge_seed_pair"),
+        )
+        if edge_seed_pair is not None:
+            if torch.is_tensor(edge_seed_pair):
+                return int(edge_seed_pair.shape[0])
+            return int(np.asarray(edge_seed_pair).shape[0])
+
+        edge_index = graph.get("edge_index", None)
+        if edge_index is not None:
+            if torch.is_tensor(edge_index):
+                return int(edge_index.shape[0])
+            return int(np.asarray(edge_index).shape[0])
+
+        return None
+
+    @staticmethod
+    def update_adaptive_stage_controller(
+        runtime: StageRuntime,
+        row: dict[str, Any],
+        *,
+        stage_monitor_ema: float,
+        meaningful_improvement: bool,
+        stage_topology_grace_steps: int,
+        debug_stage_controller: bool = False,
+        global_step: int | None = None,
+    ) -> dict[str, bool | int | str | None]:
+        spec = runtime.spec
+        topology_identifier = str(row.get("topology_identifier", ""))
+
+        edge_count_raw = row.get("number_of_total_edges", None)
+        edge_count = (
+            int(edge_count_raw)
+            if isinstance(edge_count_raw, (int, float))
+            and math.isfinite(float(edge_count_raw))
+            else None
+        )
+
+        active_count = int(round(float(row.get("active_units_total", 0.0))))
+
+        previous_active_count = runtime.previous_active_count
+        previous_identifier = runtime.previous_topology_identifier
+        previous_edge_count = runtime.previous_edge_count
+
+        active_count_changed = (
+            previous_active_count is not None
+            and active_count != previous_active_count
+        )
+        identifier_changed = (
+            previous_identifier is not None
+            and bool(previous_identifier)
+            and bool(topology_identifier)
+            and topology_identifier != previous_identifier
+        )
+        edge_count_changed = (
+            previous_edge_count is not None
+            and edge_count is not None
+            and edge_count != previous_edge_count
+        )
+        topology_changed = (
+            active_count_changed
+            or identifier_changed
+            or edge_count_changed
+        )
+
+        runtime.previous_active_count = active_count
+        runtime.previous_topology_identifier = topology_identifier
+        runtime.previous_edge_count = edge_count
+
+        patience_active = runtime.local_step + 1 >= spec.min_steps
+        if patience_active:
+            if topology_changed:
+                runtime.patience_counter = 0
+                runtime.topology_grace_remaining = int(stage_topology_grace_steps)
+            elif runtime.topology_grace_remaining > 0:
+                runtime.topology_grace_remaining = max(
+                    int(runtime.topology_grace_remaining) - 1,
+                    0,
+                )
+            elif meaningful_improvement:
+                runtime.patience_counter = 0
             else:
-                arr = np.asarray(value)
-            arr = np.ascontiguousarray(arr)
-            digest.update(key.encode("utf-8"))
-            digest.update(str(arr.shape).encode("utf-8"))
-            digest.update(str(arr.dtype).encode("utf-8"))
-            digest.update(arr.tobytes())
-            wrote_any = True
-        return digest.hexdigest()[:16] if wrote_any else ""
+                runtime.patience_counter += 1
+        else:
+            runtime.patience_counter = 0
+            runtime.topology_grace_remaining = 0
+        diagnostics = {
+            "topology_changed": bool(topology_changed),
+            "topology_identifier_short": topology_identifier[:8] if topology_identifier else "",
+            "patience_active": bool(patience_active),
+            "meaningful_improvement": bool(meaningful_improvement),
+            "active_count_changed": bool(active_count_changed),
+            "identifier_changed": bool(identifier_changed),
+            "edge_count_changed": bool(edge_count_changed),
+            "previous_topology_identifier": previous_identifier,
+            "current_topology_identifier": topology_identifier,
+            "previous_edge_count": previous_edge_count,
+            "current_edge_count": edge_count,
+        }
+
+        if topology_changed and debug_stage_controller:
+            print(
+                "[Topology change] "
+                f"global_step={global_step if global_step is not None else 'None'} "
+                f"stage={runtime.spec.stage_id} "
+                f"local_step={runtime.local_step} "
+                f"active_changed={active_count_changed} "
+                f"identifier_changed={identifier_changed} "
+                f"edge_count_changed={edge_count_changed} "
+                f"previous_id={previous_identifier[:8] if previous_identifier else 'None'} "
+                f"current_id={topology_identifier[:8] if topology_identifier else 'None'} "
+                f"previous_edges={previous_edge_count} "
+                f"current_edges={edge_count}"
+            )
+
+        row["best_stage_monitor"] = runtime.best_monitor_ema
+        row["stage_patience_counter"] = runtime.patience_counter
+        row["topology_grace_remaining"] = runtime.topology_grace_remaining
+        row.update(diagnostics)
+
+        return diagnostics
 
     def solution_topology_metrics(
         self,
@@ -1731,11 +2259,9 @@ class NN_Trainer:
             raise ValueError("solution_topology_metrics requires preselected curve_lengths.")
 
         graph = decoder_out.get("graph", None)
-        edge_index = graph.get("edge_index", None) if isinstance(graph, dict) else None
-        if isinstance(edge_index, torch.Tensor):
-            number_of_total_edges = int(edge_index.shape[0])
-        elif edge_index is not None:
-            number_of_total_edges = int(np.asarray(edge_index).shape[0])
+        topology_edge_count = self.topology_edge_count_from_graph(graph)
+        if topology_edge_count is not None:
+            number_of_total_edges = topology_edge_count
         else:
             curves = decoder_out.get("edge_curves_xyz", decoder_out.get("edge_curves_uv", None))
             number_of_total_edges = int(curves.shape[0]) if isinstance(curves, torch.Tensor) and curves.ndim >= 1 else 0
@@ -1892,12 +2418,10 @@ class NN_Trainer:
         finite_curves = torch.isfinite(curves).all(dim=(1, 2))
         finite_lengths = curve_geometry.finite_edge_mask
 
-        selected_loss_types = resolve_edge_types_in_losses(cfg.Edge_in_losses)
-        cell_length_types = tuple(
-            edge_type_value
-            for edge_type_value in selected_loss_types
-            if edge_type_value in CELL_GEOMETRY_EDGE_TYPES
-        )
+        if bool(getattr(cfg, "include_shell_in_length_loss", False)):
+            cell_length_types = CELL_GEOMETRY_EDGE_TYPES
+        else:
+            cell_length_types = CELL_LENGTH_EDGE_TYPES
         loss_edge_type_mask = build_edge_type_mask(
             edge_type,
             cell_length_types,
@@ -1908,8 +2432,8 @@ class NN_Trainer:
         )
 
         # Edges associated with at least one valid seed cell. Cell polygon
-        # reconstruction uses all valid Voronoi-derived edges (0, 1, 3),
-        # while the scalar length component uses Edge_in_losses.
+        # reconstruction uses all valid geometry edges (0, 1, 3, 4), while
+        # the scalar length component uses CELL_LENGTH_EDGE_TYPES by default.
         base_cell_mask = (
             finite_curves
             & finite_lengths
@@ -2005,7 +2529,12 @@ class NN_Trainer:
 
             return vertices.index_select(0, order)
 
-        def polygon_angle_loss(vertices):
+        def safe_normalize(x):
+            return x / torch.sqrt(
+                (x * x).sum(dim=-1, keepdim=True) + angle_eps
+            )
+
+        def polygon_angle_loss(vertices, true_corner_mask=None):
             if vertices is None or vertices.shape[0] < 3:
                 return None
 
@@ -2015,8 +2544,8 @@ class NN_Trainer:
             vector_a = previous - vertices
             vector_b = following - vertices
 
-            norm_a = torch.linalg.vector_norm(vector_a, dim=1)
-            norm_b = torch.linalg.vector_norm(vector_b, dim=1)
+            norm_a = torch.sqrt((vector_a * vector_a).sum(dim=1) + angle_eps)
+            norm_b = torch.sqrt((vector_b * vector_b).sum(dim=1) + angle_eps)
 
             valid = (
                 torch.isfinite(norm_a)
@@ -2024,32 +2553,49 @@ class NN_Trainer:
                 & (norm_a > angle_eps)
                 & (norm_b > angle_eps)
             )
+            if true_corner_mask is not None:
+                true_corner_mask = true_corner_mask.to(
+                    device=vertices.device,
+                    dtype=torch.bool,
+                )
+                if true_corner_mask.shape[0] == valid.shape[0]:
+                    valid = valid & true_corner_mask
 
             if int(valid.detach().sum().item()) < 3:
                 return None
 
             cosine = (
-                vector_a[valid] * vector_b[valid]
-            ).sum(dim=1) / (
-                norm_a[valid] * norm_b[valid]
-            ).clamp_min(angle_eps)
+                safe_normalize(vector_a[valid])
+                * safe_normalize(vector_b[valid])
+            ).sum(dim=1).clamp(-1.0 + 1e-6, 1.0 - 1e-6)
 
-            angles = torch.acos(
-                cosine.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
-            )
-
-            mean_angle = angles.mean().clamp_min(angle_eps)
+            mean_cosine = cosine.mean()
+            scale = mean_cosine.abs().clamp_min(angle_eps)
 
             return (
-                angles.var(unbiased=False)
-                / mean_angle.square()
+                cosine.var(unbiased=False)
+                / scale.square()
             )
 
-        def polygon_radial_loss(vertices):
+        def polygon_radial_loss(vertices, vertex_weights=None):
             if vertices is None or vertices.shape[0] < 3:
                 return None
 
-            center = vertices.mean(dim=0)
+            if vertex_weights is not None:
+                vertex_weights = vertex_weights.to(
+                    device=vertices.device,
+                    dtype=vertices.dtype,
+                ).reshape(-1)
+                if vertex_weights.shape[0] != vertices.shape[0]:
+                    vertex_weights = None
+
+            if vertex_weights is None:
+                center = vertices.mean(dim=0)
+            else:
+                weight_sum = vertex_weights.sum().clamp_min(eps)
+                center = (
+                    vertex_weights.unsqueeze(-1) * vertices
+                ).sum(dim=0) / weight_sum
 
             radial = torch.linalg.vector_norm(
                 vertices - center,
@@ -2065,12 +2611,120 @@ class NN_Trainer:
                 return None
 
             radial = radial[valid]
-            mean_radial = radial.mean().clamp_min(eps)
+            if vertex_weights is None:
+                weights = torch.ones_like(radial)
+            else:
+                weights = vertex_weights[valid].clamp_min(0.0)
+            weight_sum = weights.sum().clamp_min(eps)
+            mean_radial = (
+                weights * radial
+            ).sum().div(weight_sum).clamp_min(eps)
 
             return (
-                radial.var(unbiased=False)
+                (
+                    weights
+                    * (radial - mean_radial).square()
+                ).sum()
+                / weight_sum
                 / mean_radial.square()
             )
+
+        def ordered_cell_boundary(cell_id: int):
+            indices_by_cell = curve_geometry.cell_boundary_edge_indices
+            directions_by_cell = curve_geometry.cell_boundary_edge_directions
+            seed_ids = curve_geometry.cell_boundary_seed_ids
+            num_shell_samples = 8
+            if (
+                indices_by_cell is None
+                or directions_by_cell is None
+                or seed_ids is None
+            ):
+                return None, None, None
+
+            seed_ids = torch.as_tensor(
+                seed_ids,
+                dtype=torch.long,
+                device=curves.device,
+            ).reshape(-1)
+            matches = torch.nonzero(seed_ids == cell_id, as_tuple=False).flatten()
+            if matches.numel() == 0:
+                return None, None, None
+
+            boundary_id = int(matches[0].detach().item())
+            edge_indices = indices_by_cell[boundary_id].to(
+                device=curves.device,
+                dtype=torch.long,
+            )
+            edge_directions = directions_by_cell[boundary_id].to(
+                device=curves.device,
+                dtype=torch.long,
+            )
+            if edge_indices.numel() == 0:
+                return None, None, None
+
+            parts = []
+            corner_masks = []
+
+            def fixed_shell_samples(edge_points):
+                if edge_points.shape[0] == num_shell_samples:
+                    return edge_points
+                if edge_points.shape[0] < 2:
+                    return edge_points
+                t = torch.linspace(
+                    0.0,
+                    1.0,
+                    num_shell_samples,
+                    dtype=edge_points.dtype,
+                    device=edge_points.device,
+                )
+                scaled = t * float(edge_points.shape[0] - 1)
+                left = torch.floor(scaled).to(dtype=torch.long)
+                right = torch.clamp(left + 1, max=edge_points.shape[0] - 1)
+                alpha = (scaled - left.to(dtype=edge_points.dtype)).unsqueeze(-1)
+                return (
+                    (1.0 - alpha) * edge_points.index_select(0, left)
+                    + alpha * edge_points.index_select(0, right)
+                )
+
+            for local_index in range(int(edge_indices.numel())):
+                edge_index_value = int(edge_indices[local_index].detach().item())
+                if edge_index_value < 0 or edge_index_value >= curves.shape[0]:
+                    continue
+                edge_points = curves[edge_index_value]
+                if edge_points.shape[0] < 2:
+                    continue
+                if int(edge_directions[local_index].detach().item()) < 0:
+                    edge_points = edge_points.flip(0)
+                if int(edge_type[edge_index_value].detach().item()) == EDGE_DOMAIN_SHELL:
+                    edge_points = fixed_shell_samples(edge_points)
+                edge_points = edge_points[:-1]
+                if edge_points.shape[0] == 0:
+                    continue
+                is_corner = torch.zeros(
+                    edge_points.shape[0],
+                    dtype=torch.bool,
+                    device=curves.device,
+                )
+                is_corner[0] = True
+                parts.append(edge_points)
+                corner_masks.append(is_corner)
+
+            if not parts:
+                return None, None, None
+
+            boundary_points = torch.cat(parts, dim=0)
+            true_corners = torch.cat(corner_masks, dim=0)
+            next_points = torch.roll(boundary_points, shifts=-1, dims=0)
+            segment_lengths = torch.linalg.vector_norm(
+                next_points - boundary_points,
+                dim=-1,
+            )
+            vertex_weights = 0.5 * (
+                segment_lengths
+                + torch.roll(segment_lengths, shifts=1, dims=0)
+            )
+
+            return boundary_points, true_corners, vertex_weights
 
         cell_ids = torch.unique(pairs[base_cell_mask])
         cell_ids = cell_ids[cell_ids >= 0]
@@ -2114,10 +2768,49 @@ class NN_Trainer:
                 has_component = True
 
             # Reconstruct the complete cell polygon using all valid cell edges,
-            # not only the selected equal-length edge types.
-            cell_curves = curves[belongs_geometry]
+            # not only the selected equal-length edge types. Prefer the
+            # topology-provided order so shell samples stay on the cell
+            # boundary without differentiable hard sorting.
+            ordered_boundary_result = ordered_cell_boundary(cell_id)
+            ordered_boundary, true_corner_mask, radial_weights = (
+                ordered_boundary_result
+                if ordered_boundary_result[0] is not None
+                else (None, None, None)
+            )
 
-            if cell_curves.shape[0] > 0:
+            if ordered_boundary is not None and ordered_boundary.shape[0] >= 3:
+                if lam_angle != 0.0:
+                    angle_loss = polygon_angle_loss(
+                        ordered_boundary,
+                        true_corner_mask,
+                    )
+
+                    if angle_loss is not None:
+                        cell_loss = (
+                            cell_loss
+                            + lam_angle * angle_loss
+                        )
+                        has_component = True
+
+                if lam_radial != 0.0:
+                    radial_loss = polygon_radial_loss(
+                        ordered_boundary,
+                        radial_weights,
+                    )
+
+                    if radial_loss is not None:
+                        cell_loss = (
+                            cell_loss
+                            + lam_radial * radial_loss
+                        )
+                        has_component = True
+
+            else:
+                cell_curves = curves[belongs_geometry]
+
+                if cell_curves.shape[0] == 0:
+                    continue
+
                 endpoints = torch.cat(
                     (
                         cell_curves[:, 0, :],
@@ -2213,6 +2906,16 @@ class NN_Trainer:
         print(f"TensorBoard log dir: {self.tensorboard_log_dir}")
 
     def close(self):
+        if stage_end_summaries:
+            tqdm.write("Stage end summaries:")
+            for summary in stage_end_summaries:
+                tqdm.write(
+                    f"  Stage {summary['stage']}: reason={summary['reason']}, "
+                    f"local_steps={summary['local_steps']}, "
+                    f"best_monitor={summary['best_monitor']:.6e}, "
+                    f"transition={summary['transition_checkpoint']}"
+                )
+
         if self.writer is not None:
             self.writer.flush()
             self.writer.close()
@@ -2376,6 +3079,19 @@ class NN_Trainer:
     ):
         if self.writer is None:
             return
+
+        self._tb_add_scalar("Stage/Index", row.get("stage", 0.0), step)
+        self._tb_add_scalar("Stage/FreezeSeeds", row.get("stage_freeze_seeds", 0.0), step)
+        self._tb_add_scalar("Stage/FreezeW", row.get("stage_freeze_w", 0.0), step)
+        self._tb_add_scalar("StageLambda/Volume", row.get("lam_vol_eff", 0.0), step)
+        self._tb_add_scalar("StageLambda/FEM", row.get("lam_fem_eff", 0.0), step)
+        self._tb_add_scalar("StageLambda/CVT", row.get("lambda_cvt_eff", 0.0), step)
+        self._tb_add_scalar("StageLambda/Repulsion", row.get("lam_rep_eff", 0.0), step)
+        self._tb_add_scalar("StageLambda/Boundary", row.get("lam_bnd_eff", 0.0), step)
+        self._tb_add_scalar("StageLambda/SeedDomainRecovery", row.get("lam_seed_domain_recovery_eff", 0.0), step)
+        self._tb_add_scalar("StageLambda/SeedActive", row.get("lam_seed_active_eff", 0.0), step)
+        self._tb_add_scalar("StageLambda/CurveLength", row.get("lam_curve_length_eff", 0.0), step)
+        self._tb_add_scalar("StageLambda/CellEdgeUniform", row.get("lam_cell_edge_uniform_eff", 0.0), step)
 
         self._tb_add_scalar("Loss/Total", row["L_total"], step)
         self._tb_add_scalar("Loss/Volume", row["loss_vol"], step)
@@ -2824,9 +3540,17 @@ class NN_Trainer:
 
     def _timelapse_optimized_parameter_summary(self) -> str:
         cfg = self.cfg
+        if bool(getattr(cfg, "use_three_stage_optimization", False)):
+            width_summary = "staged width"
+        else:
+            width_summary = (
+                "global strut width"
+                if not cfg.freeze_w
+                else f"width fixed={float(cfg.w_const):.6g}"
+            )
         params = [
             f"seed positions ({int(cfg.seed_number)})",
-            "global strut width" if not cfg.freeze_w else f"width fixed={float(cfg.w_const):.6g}",
+            width_summary,
         ]
         return "Optimized: " + ", ".join(params)
 
@@ -2951,15 +3675,7 @@ class NN_Trainer:
             n_seeds=seed_number,
             freeze_w=self.cfg.freeze_w,
             w_const=self.cfg.w_const,   
-            w_head_bias_init=(
-                float(self.cfg.decoder_raw_temp)
-                * math.atanh(
-                    2.0 * max(min(float(self.cfg.width_target_frac), 1.0 - 1e-4), 1e-4)
-                    - 1.0
-                )
-                if self.cfg.w_head_bias_init is None
-                else float(self.cfg.w_head_bias_init)
-            ),
+            w_head_bias_init=self._initial_w_head_bias(),
             allow_seed_outside_domain=(
                 bool(self.cfg.allow_seed_outside_domain)
                 and float(self.cfg.allow_seed_outside_domain_warmup_frac) <= 0.0
@@ -2987,14 +3703,38 @@ class NN_Trainer:
         return {
             "Cad_domain": self.Cad_domain,
             "face_mesh": self._decoder_face_mesh_for_face(face_tensor),
-            "return_xyz": True,
-            "tube_curve_samples": 64,
-            "edge_trim_samples": 32,
+            "return_xyz": bool(self.cfg.decoder_return_xyz),
+            "tube_curve_samples": int(self.cfg.tube_curve_samples),
+            "edge_trim_samples": int(self.cfg.decoder_edge_trim_samples),
+            "tube_lift_tau": float(self.cfg.tube_lift_tau),
+            "tube_lift_max_values": int(self.cfg.tube_lift_max_values),
             "tube_density_tau": 0.002,
             "tube_fiber_tau": 0.002,
             "face_u_periodic": bool(u_periodic),
             "face_v_periodic": bool(v_periodic),
+            "eps": float(self.cfg.decoder_eps),
+            "solve_reg": float(self.cfg.decoder_solve_reg),
+            "tau_voronoi": float(self.cfg.decoder_tau_voronoi),
+            "tau_box": float(self.cfg.decoder_tau_box),
+            "tau_trim": float(self.cfg.decoder_tau_trim),
+            "use_trim_activity": bool(self.cfg.decoder_use_trim_activity),
+            "vertex_boundary_margin": float(self.cfg.decoder_vertex_boundary_margin),
+            "edge_trim_reduction": self.cfg.decoder_edge_trim_reduction,
+            "edge_trim_reduce_tau": float(self.cfg.decoder_edge_trim_reduce_tau),
+            "use_edge_trim_gate": bool(self.cfg.decoder_use_edge_trim_gate),
+            "nearest_segment_k": int(self.cfg.decoder_nearest_segment_k),
+            "use_segment_distance": bool(self.cfg.decoder_use_segment_distance),
+            "use_spatial_pruning": bool(self.cfg.decoder_use_spatial_pruning),
+            "min_tube_spacing": float(self.cfg.decoder_min_tube_spacing),
+            "tube_target_spacing_ratio": float(self.cfg.decoder_tube_target_spacing_ratio),
+            "use_seed_activation": bool(self.cfg.decoder_use_seed_activation),
+            "n_seeds": None if seed_number is None else int(seed_number),
+            "w_min": self.cfg.w_min,
+            "w_max_ratio": self.cfg.w_max_ratio,
+            "raw_temp": self.cfg.decoder_raw_temp,
             "duplicate_merge_sigma": self.cfg.decoder_duplicate_merge_sigma,
+            "duplicate_effect_temp_ratio": self.cfg.decoder_duplicate_effect_temp_ratio,
+            "rho_min": float(self.cfg.rho_min),
         }
 
     def _build_face_model(self, face_tensor, device):
@@ -3028,6 +3768,28 @@ class NN_Trainer:
         os.makedirs(save_dir, exist_ok=True)
         path = os.path.join(save_dir, "optimized_shell_function.pt")
         device = face_tensor["uv"].device
+        portable_face_tensor = _portable_face_tensor(face_tensor)
+        portable_cad_domain = _portable_cad_domain(
+            face_tensor=face_tensor,
+            best_pred=best_pred,
+        )
+        seed_number = _safe_int_or_none(getattr(decoder, "n_seeds", None))
+        if seed_number is None:
+            seeds_raw = best_pred.get("seeds_raw", None)
+            if isinstance(seeds_raw, torch.Tensor):
+                seed_number = int(seeds_raw.shape[0])
+        if seed_number is None:
+            seed_number = int(self.cfg.seed_number)
+        decoder_init_kwargs = self._decoder_init_kwargs(
+            device=device,
+            seed_number=seed_number,
+            u_periodic=face_tensor.get("u_periodic", False),
+            v_periodic=face_tensor.get("v_periodic", False),
+            face_tensor=face_tensor,
+        )
+        decoder_init_kwargs = dict(decoder_init_kwargs)
+        decoder_init_kwargs["Cad_domain"] = portable_cad_domain
+        decoder_init_kwargs["face_mesh"] = portable_face_tensor
 
         package = {
             "package_type": "OptimizedShellFunction",
@@ -3042,23 +3804,17 @@ class NN_Trainer:
                 "module": ppnet.__class__.__module__,
                 "name": ppnet.__class__.__name__,
             },
-            "decoder_init_kwargs": _cpu_detached_tree(
-                self._decoder_init_kwargs(
-                    device=device,
-                    seed_number=int(getattr(decoder, "n_seeds", self.cfg.seed_number)),
-                    u_periodic=face_tensor.get("u_periodic", False),
-                    v_periodic=face_tensor.get("v_periodic", False),
-                    face_tensor=face_tensor,
-                )
-            ),
+            "decoder_init_kwargs": _cpu_detached_tree(decoder_init_kwargs),
+            "cad_domain": _cpu_detached_tree(portable_cad_domain),
+            "face_tensor": portable_face_tensor,
             "decoder_state_dict": _cpu_detached_tree(decoder.state_dict()),
             "ppnet_state_dict": _cpu_detached_tree(ppnet.state_dict()),
             "best_pred": _cpu_detached_tree(best_pred),
             "best_score": float(best_score),
-            "best_step": int(best_step),
+            "best_step": _safe_int_or_none(best_step, default=-1),
             "returned_best_source": returned_best_source,
             "face_metadata": {
-                "face_id": _cpu_detached_tree(face_tensor.get("face_id", 0)),
+                "face_id": self._face_id_key(face_tensor.get("face_id", 0)),
                 "u_periodic": bool(face_tensor.get("u_periodic", False)),
                 "v_periodic": bool(face_tensor.get("v_periodic", False)),
                 "num_surface_points": int(face_tensor["uv"].shape[0]),
@@ -3067,6 +3823,29 @@ class NN_Trainer:
             "final_shape_fiber_direction": _cpu_detached_tree(final_shape_fiber_direction),
         }
         torch.save(package, path)
+        metadata_path = os.path.join(save_dir, "optimized_shell_function.json")
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "package_type": package["package_type"],
+                    "package_version": package["package_version"],
+                    "created_at": package["created_at"],
+                    "best_score": package["best_score"],
+                    "best_step": package["best_step"],
+                    "returned_best_source": package["returned_best_source"],
+                    "face_metadata": package["face_metadata"],
+                    "decoder_class": package["decoder_class"],
+                    "ppnet_class": package["ppnet_class"],
+                    "portable": True,
+                    "contains_face_tensor": portable_face_tensor is not None,
+                    "contains_final_shape_fields": (
+                        final_shape_density is not None
+                        and final_shape_fiber_direction is not None
+                    ),
+                },
+                f,
+                indent=2,
+            )
         return path
 
     @staticmethod
@@ -3077,15 +3856,22 @@ class NN_Trainer:
         cfg = self.cfg
         param_groups = []
 
+        def trainable(params):
+            return [p for p in params if p.requires_grad]
+
         seed_refine_params = list(ppnet.seed_refine.parameters())
         if getattr(ppnet, "seed_id_embed", None) is not None:
             seed_refine_params.extend(ppnet.seed_id_embed.parameters())
+        seed_refine_params = trainable(seed_refine_params)
+        if seed_refine_params:
+            param_groups.append({"params": seed_refine_params, "lr": cfg.lr_seed_refine})
 
-        param_groups.extend([
-            {"params": seed_refine_params, "lr": cfg.lr_seed_refine},
-            {"params": ppnet.delta_head.parameters(), "lr": cfg.lr_delta_head},
-            {"params": [ppnet.global_latent], "lr": cfg.lr_mlp},
-        ])
+        delta_head_params = trainable(ppnet.delta_head.parameters())
+        if delta_head_params:
+            param_groups.append({"params": delta_head_params, "lr": cfg.lr_delta_head})
+
+        if getattr(ppnet, "global_latent", None) is not None and ppnet.global_latent.requires_grad:
+            param_groups.append({"params": [ppnet.global_latent], "lr": cfg.lr_mlp})
 
         independent_seed_offsets = getattr(ppnet, "independent_seed_offsets", None)
         if independent_seed_offsets is not None and independent_seed_offsets.requires_grad:
@@ -3098,8 +3884,12 @@ class NN_Trainer:
 
         w_head = getattr(ppnet, "w_head", None)
         if w_head is not None:
-            param_groups.append({"params": w_head.parameters(), "lr": cfg.lr_w_head})
+            w_head_params = trainable(w_head.parameters())
+            if w_head_params:
+                param_groups.append({"params": w_head_params, "lr": cfg.lr_w_head})
 
+        if not param_groups:
+            raise ValueError("No trainable parameters remain for the optimizer.")
         return torch.optim.Adam(param_groups)
 
     def _build_scheduler(self, opt, milestones):
@@ -3279,11 +4069,7 @@ class NN_Trainer:
 
     @staticmethod
     def _face_id_key(face_id) -> int:
-        if isinstance(face_id, torch.Tensor):
-            if face_id.numel() == 0:
-                return 0
-            return int(face_id.detach().reshape(-1)[0].item())
-        return int(face_id)
+        return _safe_int_or_none(face_id, default=0)
     
     def _init_face_seed(self, face_tensor):
         cfg = self.cfg
@@ -3352,6 +4138,402 @@ class NN_Trainer:
         if hasattr(self.cfg, "lambda_cvt"):
             return float(getattr(self.cfg, "lambda_cvt"))
         return float(getattr(self.cfg, "lam_density_weighted_cvt", 0.0))
+
+    @staticmethod
+    def _raw_width_from_geo_width(
+        width_geo: torch.Tensor,
+        raw_temp: float,
+        eps: float,
+    ) -> torch.Tensor:
+        temp = width_geo.new_tensor(max(float(raw_temp), float(eps)))
+        soft_zero = width_geo.new_tensor(math.log(2.0))
+        arg = (width_geo.clamp_min(0.0) / temp) + soft_zero
+        return temp * torch.log(torch.expm1(arg).clamp_min(eps))
+
+    def _bound_w_raw_for_decoder(
+        self,
+        w_raw: torch.Tensor,
+        seeds_uv: torch.Tensor | None,
+    ) -> torch.Tensor:
+        cfg = self.cfg
+
+        raw_temp = float(getattr(cfg, "decoder_raw_temp", 1.0))
+        w_min = max(float(getattr(cfg, "w_min", 0.0)), 0.0)
+        w_max = max(float(getattr(cfg, "w_max_ratio", 0.0)), w_min)
+
+        w_min = w_raw.new_tensor(w_min)
+        w_max = w_raw.new_tensor(w_max)
+
+        # Smoothly map raw values to [w_min, w_max]
+        WW = w_min + (w_max - w_min) * torch.sigmoid(w_raw / raw_temp)
+
+        return WW
+
+    def _initial_w_head_bias(self) -> float:
+        cfg = self.cfg
+        if cfg.w_head_bias_init is not None:
+            return float(cfg.w_head_bias_init)
+
+        raw_temp = float(getattr(cfg, "decoder_raw_temp", 1.0))
+        eps = float(getattr(cfg, "eps", 1e-12))
+        w_min = max(float(getattr(cfg, "w_min", 0.0)), 0.0)
+        w_max = max(float(getattr(cfg, "w_max_ratio", 0.5)), w_min)
+        frac = max(min(float(getattr(cfg, "width_target_frac", 0.20)), 1.0), 0.0)
+        width_geo = w_min + frac * (w_max - w_min)
+        width_tensor = torch.tensor(width_geo, dtype=torch.float64)
+        return float(self._raw_width_from_geo_width(width_tensor, raw_temp, eps).item())
+
+    def _stage_settings_for_step(self, step: int) -> dict[str, float | bool | int]:
+        cfg = self.cfg
+        if not bool(getattr(cfg, "use_three_stage_optimization", False)):
+            return {
+                "stage": 0,
+                "freeze_seeds": False,
+                "freeze_w": bool(getattr(cfg, "freeze_w", False)),
+                "lam_vol": float(cfg.lam_vol),
+                "lam_fem": float(cfg.lam_fem),
+                "lambda_cvt": self._lambda_cvt(),
+                "lam_rep": float(cfg.lam_rep),
+                "lam_bnd": float(cfg.lam_bnd),
+                "lam_seed_domain_recovery": float(getattr(cfg, "lam_seed_domain_recovery", 0.0)),
+                "lam_seed_active": float(getattr(cfg, "lam_seed_active", 0.0)),
+                "lam_curve_length": float(getattr(cfg, "lam_curve_length", 0.0)),
+                "lam_cell_edge_uniform": float(getattr(cfg, "lam_cell_edge_uniform", 0.0)),
+            }
+
+        stage1_cutoff = int(getattr(cfg, "stage1_max_steps"))
+        stage2_cutoff = stage1_cutoff + int(getattr(cfg, "stage2_max_steps"))
+        if int(step) < stage1_cutoff:
+            prefix = "stage1"
+            stage = 1
+        elif int(step) < stage2_cutoff:
+            prefix = "stage2"
+            stage = 2
+        else:
+            prefix = "stage3"
+            stage = 3
+
+        return {
+            "stage": stage,
+            "freeze_seeds": bool(getattr(cfg, f"{prefix}_freeze_seeds")),
+            "freeze_w": bool(getattr(cfg, f"{prefix}_freeze_w")),
+            "lam_vol": float(cfg.lam_vol) * float(getattr(cfg, f"{prefix}_lam_vol_scale")),
+            "lam_fem": float(cfg.lam_fem) * float(getattr(cfg, f"{prefix}_lam_fem_scale")),
+            "lambda_cvt": self._lambda_cvt() * float(getattr(cfg, f"{prefix}_lambda_cvt_scale")),
+            "lam_rep": float(cfg.lam_rep) * float(getattr(cfg, f"{prefix}_lam_rep_scale")),
+            "lam_bnd": float(cfg.lam_bnd) * float(getattr(cfg, f"{prefix}_lam_bnd_scale")),
+            "lam_seed_domain_recovery": float(getattr(cfg, "lam_seed_domain_recovery", 0.0))
+            * float(getattr(cfg, f"{prefix}_lam_seed_domain_recovery_scale")),
+            "lam_seed_active": float(getattr(cfg, "lam_seed_active", 0.0))
+            * float(getattr(cfg, f"{prefix}_lam_seed_active_scale")),
+            "lam_curve_length": float(getattr(cfg, "lam_curve_length", 0.0))
+            * float(getattr(cfg, f"{prefix}_lam_curve_length_scale")),
+            "lam_cell_edge_uniform": float(getattr(cfg, "lam_cell_edge_uniform", 0.0))
+            * float(getattr(cfg, f"{prefix}_lam_cell_edge_uniform_scale")),
+        }
+
+    def _stage_settings_for_stage_id(self, stage_id: int) -> dict[str, float | bool | int]:
+        cfg = self.cfg
+        if int(stage_id) <= 0:
+            return self._stage_settings_for_step(0)
+        prefix = f"stage{int(stage_id)}"
+        return {
+            "stage": int(stage_id),
+            "freeze_seeds": bool(getattr(cfg, f"{prefix}_freeze_seeds")),
+            "freeze_w": bool(getattr(cfg, f"{prefix}_freeze_w")),
+            "lam_vol": float(cfg.lam_vol) * float(getattr(cfg, f"{prefix}_lam_vol_scale")),
+            "lam_fem": float(cfg.lam_fem) * float(getattr(cfg, f"{prefix}_lam_fem_scale")),
+            "lambda_cvt": self._lambda_cvt() * float(getattr(cfg, f"{prefix}_lambda_cvt_scale")),
+            "lam_rep": float(cfg.lam_rep) * float(getattr(cfg, f"{prefix}_lam_rep_scale")),
+            "lam_bnd": float(cfg.lam_bnd) * float(getattr(cfg, f"{prefix}_lam_bnd_scale")),
+            "lam_seed_domain_recovery": float(getattr(cfg, "lam_seed_domain_recovery", 0.0))
+            * float(getattr(cfg, f"{prefix}_lam_seed_domain_recovery_scale")),
+            "lam_seed_active": float(getattr(cfg, "lam_seed_active", 0.0))
+            * float(getattr(cfg, f"{prefix}_lam_seed_active_scale")),
+            "lam_curve_length": float(getattr(cfg, "lam_curve_length", 0.0))
+            * float(getattr(cfg, f"{prefix}_lam_curve_length_scale")),
+            "lam_cell_edge_uniform": float(getattr(cfg, "lam_cell_edge_uniform", 0.0))
+            * float(getattr(cfg, f"{prefix}_lam_cell_edge_uniform_scale")),
+        }
+
+    def _adaptive_stage_specs(self) -> list[StageSpec]:
+        cfg = self.cfg
+        return [
+            StageSpec(
+                stage_id=1,
+                name="Stage 1",
+                min_steps=int(cfg.stage1_min_steps),
+                max_steps=int(cfg.stage1_max_steps),
+                patience=int(cfg.stage1_patience),
+                min_delta_abs=float(cfg.stage1_min_delta_abs),
+                min_delta_rel=float(cfg.stage1_min_delta_rel),
+            ),
+            StageSpec(
+                stage_id=2,
+                name="Stage 2",
+                min_steps=int(cfg.stage2_min_steps),
+                max_steps=int(cfg.stage2_max_steps),
+                patience=int(cfg.stage2_patience),
+                min_delta_abs=float(cfg.stage2_min_delta_abs),
+                min_delta_rel=float(cfg.stage2_min_delta_rel),
+            ),
+            StageSpec(
+                stage_id=3,
+                name="Stage 3",
+                min_steps=int(cfg.stage3_min_steps),
+                max_steps=int(cfg.stage3_max_steps),
+                patience=int(cfg.stage3_patience),
+                min_delta_abs=float(cfg.stage3_min_delta_abs),
+                min_delta_rel=float(cfg.stage3_min_delta_rel),
+            ),
+        ]
+
+    @staticmethod
+    def is_meaningful_improvement(
+        current: float,
+        best: float,
+        min_delta_abs: float,
+        min_delta_rel: float,
+    ) -> bool:
+        if not math.isfinite(float(current)):
+            return False
+        if not math.isfinite(float(best)):
+            return True
+        required_delta = max(
+            float(min_delta_abs),
+            float(min_delta_rel) * max(abs(float(best)), 1e-12),
+        )
+        return float(current) < float(best) - required_delta
+
+    def calculate_stage_monitor(
+        self,
+        stage_id: int,
+        loss_values: dict[str, torch.Tensor | float],
+        metrics: dict[str, Any],
+        effective_lambdas: dict[str, float],
+    ) -> torch.Tensor:
+        def tensor_value(name: str, fallback: float = 0.0) -> torch.Tensor:
+            value = loss_values.get(name, fallback)
+            if isinstance(value, torch.Tensor):
+                return value.detach()
+            ref = next((v for v in loss_values.values() if isinstance(v, torch.Tensor)), None)
+            device = ref.device if isinstance(ref, torch.Tensor) else None
+            dtype = ref.dtype if isinstance(ref, torch.Tensor) else torch.float64
+            return torch.tensor(float(value), dtype=dtype, device=device)
+
+        terms: list[torch.Tensor] = []
+        if int(stage_id) in (1, 2):
+            for lam_name, loss_name in (
+                ("lam_fem", "loss_fem_norm"),
+                ("lambda_cvt", "loss_density_weighted_cvt_norm"),
+                ("lam_cell_edge_uniform", "loss_cell_edge_uniform_norm"),
+                ("lam_rep", "loss_rep_norm"),
+            ):
+                lam = float(effective_lambdas.get(lam_name, 0.0))
+                if lam != 0.0:
+                    terms.append(tensor_value(loss_name) * lam)
+        elif int(stage_id) == 3:
+            vol_frac = metrics.get("vol_frac", metrics.get("VolFrac", float("nan")))
+            target = float(getattr(self.cfg, "target_volfrac", 0.0))
+            vol_tensor = tensor_value("_zero") + abs(float(vol_frac) - target)
+            terms.append(vol_tensor)
+            effective_fem = float(effective_lambdas.get("lam_fem", 0.0))
+            if effective_fem > float(getattr(self.cfg, "stage3_fem_monitor_threshold", 1e-6)):
+                terms.append(
+                    tensor_value("loss_fem_norm")
+                    * float(getattr(self.cfg, "stage3_monitor_fem_weight", 1.0))
+                )
+        if not terms:
+            return tensor_value("L_total")
+        monitor = sum(terms[1:], terms[0])
+        return monitor.detach()
+
+    def _calculate_fixed_evaluation_score(
+        self,
+        loss_values: dict[str, torch.Tensor | float],
+        metrics: dict[str, Any],
+    ) -> float:
+        cfg = self.cfg
+        def finite_float(value) -> float | None:
+            if isinstance(value, torch.Tensor):
+                if not self._scalar_tensor_is_finite(value):
+                    return None
+                value = float(value.detach().item())
+            try:
+                value = float(value)
+            except Exception:
+                return None
+            return value if math.isfinite(value) else None
+
+        volume_metric = None
+        vol_frac = metrics.get("vol_frac", metrics.get("VolFrac", None))
+        if vol_frac is not None:
+            vf = finite_float(vol_frac)
+            if vf is not None:
+                volume_metric = abs(vf - float(cfg.target_volfrac))
+        total = 0.0
+        terms = [
+            (float(cfg.fixed_eval_lam_fem), finite_float(loss_values.get("loss_fem_norm"))),
+            (float(cfg.fixed_eval_lam_vol), volume_metric),
+            (float(cfg.fixed_eval_lambda_cvt), finite_float(loss_values.get("loss_density_weighted_cvt_norm"))),
+            (float(cfg.fixed_eval_lam_cell_edge), finite_float(loss_values.get("loss_cell_edge_uniform_norm"))),
+            (float(cfg.fixed_eval_lam_rep), finite_float(loss_values.get("loss_rep_norm"))),
+        ]
+        used = False
+        for weight, value in terms:
+            if weight != 0.0 and value is not None:
+                total += weight * value
+                used = True
+        return total if used and math.isfinite(total) else float("inf")
+
+    def _apply_stage_trainability(self, ppnet, stage_settings: dict[str, Any]) -> None:
+        freeze_seeds = bool(stage_settings.get("freeze_seeds", False))
+        freeze_w = bool(stage_settings.get("freeze_w", False))
+        seed_modules = [getattr(ppnet, "seed_refine", None), getattr(ppnet, "seed_id_embed", None)]
+        for module in seed_modules:
+            if module is not None:
+                for p in module.parameters():
+                    p.requires_grad_(not freeze_seeds)
+        independent_seed_offsets = getattr(ppnet, "independent_seed_offsets", None)
+        if independent_seed_offsets is not None:
+            independent_seed_offsets.requires_grad_(not freeze_seeds)
+        w_head = getattr(ppnet, "w_head", None)
+        if w_head is not None:
+            for p in w_head.parameters():
+                p.requires_grad_(not freeze_w)
+        ppnet.freeze_w = freeze_w
+        for module in (getattr(ppnet, "delta_head", None),):
+            if module is not None:
+                for p in module.parameters():
+                    p.requires_grad_(True)
+        if getattr(ppnet, "global_latent", None) is not None:
+            ppnet.global_latent.requires_grad_(True)
+
+    def _stage_checkpoint_from_step(
+        self,
+        *,
+        source: str,
+        ppnet,
+        decoder,
+        opt,
+        scheduler,
+        uv_anchor: torch.Tensor,
+        row: dict[str, Any],
+        pred_list: list[dict[str, Any]],
+        seeds_list: list[torch.Tensor],
+        rho: torch.Tensor,
+        fiber_surface: torch.Tensor,
+        fem_density_field,
+        fem_stress_field,
+        fem_displacement_field,
+        stage_monitor_raw: float,
+        stage_monitor_ema: float,
+        fixed_evaluation_score: float,
+        effective_lambdas: dict[str, float],
+    ) -> dict[str, Any]:
+        return {
+            "source": source,
+            "ppnet_state_dict": self._clone_module_state_dict(ppnet),
+            "decoder_state_dict": self._clone_module_state_dict(decoder),
+            "optimizer_state_dict": _cpu_detached_tree(opt.state_dict()) if opt is not None else None,
+            "scheduler_state_dict": _cpu_detached_tree(scheduler.state_dict()) if scheduler is not None else None,
+            "uv_anchor": uv_anchor.detach().clone(),
+            "global_step": int(row.get("step", -1)),
+            "stage_id": int(row.get("stage", 0)),
+            "stage_local_step": int(row.get("stage_local_step", 0)),
+            "row": _cpu_detached_tree(dict(row)),
+            "raw_metrics": _cpu_detached_tree(dict(row)),
+            "pred_list": self._clone_pred_list(pred_list),
+            "seeds": [s.detach().clone() for s in seeds_list],
+            "rho": rho.detach().clone(),
+            "fiber_surface": fiber_surface.detach().clone(),
+            "fem_density_field": fem_density_field.detach().clone() if isinstance(fem_density_field, torch.Tensor) else None,
+            "fem_stress_field": fem_stress_field.detach().clone() if isinstance(fem_stress_field, torch.Tensor) else None,
+            "fem_displacement_field": fem_displacement_field.detach().clone() if isinstance(fem_displacement_field, torch.Tensor) else None,
+            "stage_monitor_raw": float(stage_monitor_raw),
+            "stage_monitor_ema": float(stage_monitor_ema),
+            "fixed_evaluation_score": float(fixed_evaluation_score),
+            "effective_lambdas": dict(effective_lambdas),
+            "active_seed_count": float(row.get("active_units_total", float("nan"))),
+            "volume_fraction": float(row.get("VolFrac", float("nan"))),
+            "compliance": float(row.get("comp", float("nan"))),
+            "selected_checkpoint_stage_loss": float(row.get("L_total", float("nan"))),
+            "valid": True,
+        }
+
+    def _restore_stage_checkpoint(self, checkpoint: dict[str, Any], ppnet, decoder, opt=None, scheduler=None):
+        ppnet.load_state_dict(checkpoint["ppnet_state_dict"])
+        decoder.load_state_dict(checkpoint["decoder_state_dict"])
+        if opt is not None and checkpoint.get("optimizer_state_dict") is not None:
+            opt.load_state_dict(checkpoint["optimizer_state_dict"])
+        if scheduler is not None and checkpoint.get("scheduler_state_dict") is not None:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        return checkpoint["uv_anchor"].detach().clone()
+
+    def _checkpoint_stage_monitor_for_stage(self, checkpoint: dict[str, Any], stage_id: int) -> float:
+        row = checkpoint.get("row", {})
+        settings = self._stage_settings_for_stage_id(stage_id)
+        loss_values = {
+            "L_total": float(row.get("L_total", float("inf"))),
+            "loss_fem_norm": float(row.get("loss_fem_norm", row.get("loss_fem", float("inf")))),
+            "loss_density_weighted_cvt_norm": float(row.get("loss_density_weighted_cvt_norm", row.get("loss_density_weighted_cvt", float("inf")))),
+            "loss_cell_edge_uniform_norm": float(row.get("loss_cell_edge_uniform_norm", row.get("loss_cell_edge_uniform", float("inf")))),
+            "loss_rep_norm": float(row.get("loss_rep_norm", row.get("loss_rep", float("inf")))),
+            "_zero": 0.0,
+        }
+        metrics = {"VolFrac": row.get("VolFrac", checkpoint.get("volume_fraction", float("nan")))}
+        monitor = self.calculate_stage_monitor(stage_id, loss_values, metrics, settings)
+        value = float(monitor.detach().cpu().item()) if isinstance(monitor, torch.Tensor) else float(monitor)
+        return value if math.isfinite(value) else float("inf")
+
+    def _select_transition_checkpoint(
+        self,
+        runtime: StageRuntime,
+        next_stage_id: int,
+    ) -> tuple[str | None, dict[str, Any] | None, float]:
+        candidates = [
+            ("best_raw", runtime.stage_best_raw_checkpoint),
+            ("best_ema", runtime.stage_best_checkpoint),
+            ("last", runtime.stage_last_valid_checkpoint),
+        ]
+        candidates = [(name, ckpt) for name, ckpt in candidates if ckpt is not None and ckpt.get("valid", False)]
+        if not candidates:
+            return None, None, float("inf")
+        policy = str(getattr(self.cfg, "stage_transition_selection", "next_stage_objective"))
+        if policy == "last":
+            for name, ckpt in candidates:
+                if name == "last":
+                    return name, ckpt, float(ckpt.get("stage_monitor_ema", float("inf")))
+            return None, None, float("inf")
+        if policy == "stage_monitor":
+            fallback_order = ("best_ema", "best_raw", "last")
+            for fallback_name in fallback_order:
+                for name, ckpt in candidates:
+                    if name == fallback_name:
+                        score_key = "stage_monitor_ema" if name == "best_ema" else "stage_monitor_raw"
+                        return name, ckpt, float(ckpt.get(score_key, float("inf")))
+            return None, None, float("inf")
+        scored = []
+        for name, ckpt in candidates:
+            score = self._checkpoint_stage_monitor_for_stage(ckpt, next_stage_id)
+            if math.isfinite(float(score)):
+                scored.append((score, name, ckpt))
+        if not scored:
+            return None, None, float("inf")
+        score, name, ckpt = min(scored, key=lambda item: item[0])
+        return name, ckpt, float(score)
+
+    @staticmethod
+    def _stage_lambda_summary(row: dict[str, Any]) -> str:
+        return (
+            f"S{int(row.get('stage', 0))} "
+            f"(vol={float(row.get('lam_vol_eff', 0.0)):.2g}, "
+            f"fem={float(row.get('lam_fem_eff', 0.0)):.2g}, "
+            f"cvt={float(row.get('lambda_cvt_eff', 0.0)):.2g}, "
+            f"rep={float(row.get('lam_rep_eff', 0.0)):.2g}, "
+            f"cell={float(row.get('lam_cell_edge_uniform_eff', 0.0)):.2g}, "
+            f"curve={float(row.get('lam_curve_length_eff', 0.0)):.2g})"
+        )
 
     def _eval_uv_to_xyz_differentiable(self, uv: torch.Tensor) -> torch.Tensor:
         evaluator_owner = self.Cad_domain if self.Cad_domain is not None else self.generator
@@ -6090,136 +7272,6 @@ class NN_Trainer:
     def visualize_result_final_fiber_direction_3d(self, *args, **kwargs):
         return self.Visualize_fresult_final_fiber_Direction(*args, **kwargs)
 
-    def Visualize_fresult_final_fiber_Direction_2D(
-        self,
-        result,
-        points_xyz=None,
-        faces_ijk=None,
-        shape_or_path=None,
-        thr: float = 0.5,
-        grid_res_u: int = 120,
-        grid_res_v: int = 120,
-        uv_mask_tol: float | None = None,
-        dense_factor: float = 1.0,
-        max_arrows_per_face: int = 1200,
-        arrow_scale: float = 28.0,
-        arrow_width: float = 0.0025,
-        cmap: str = "viridis",
-        show_boundary: bool = True,
-    ):
-        import numpy as np
-        import matplotlib.pyplot as plt
-
-        if result.get("Final_shape_fiber_direction", None) is None:
-            raise ValueError(
-                "result['Final_shape_fiber_direction'] is missing. "
-                "Run training with the updated trainer result output."
-            )
-
-        density_global = self._get_result_final_density(result).detach().cpu()
-        fiber_global = result["Final_shape_fiber_direction"].detach().cpu()
-        face_tensors = result["face_tensors"]
-
-        n_faces = len(face_tensors)
-        ncols = min(3, max(1, n_faces))
-        nrows = int(np.ceil(n_faces / ncols))
-        fig, axes = plt.subplots(
-            nrows,
-            ncols,
-            figsize=(5.5 * ncols, 5.0 * nrows),
-            squeeze=False,
-        )
-
-        plotted_faces = []
-
-        for ax, ft in zip(axes.ravel(), face_tensors):
-            face_id = self._face_id_key(ft.get("face_id", 0))
-            gidx = ft["global_vertex_idx"].detach().cpu()
-
-            uv_face = ft["uv"].detach().cpu().numpy().astype(np.float32)
-            Xu_face = ft["Xu"].detach().cpu().numpy().astype(np.float32)
-            Xv_face = ft["Xv"].detach().cpu().numpy().astype(np.float32)
-            rho_face = density_global[gidx].numpy().astype(np.float32)
-            fiber_face = fiber_global[gidx].numpy().astype(np.float32)
-
-            t_uv_face = self._fiber3d_to_uv_direction(
-                Xu_np=Xu_face,
-                Xv_np=Xv_face,
-                fiber_np=fiber_face,
-            )
-
-            keep = (
-                np.isfinite(rho_face)
-                & np.isfinite(t_uv_face).all(axis=1)
-                & (rho_face >= float(thr))
-                & (np.linalg.norm(t_uv_face, axis=1) > 1e-10)
-            )
-
-            arrow_points = 0
-            if np.count_nonzero(keep) > 0:
-                uv_keep = uv_face[keep]
-                rho_keep = rho_face[keep]
-                t_uv_keep = t_uv_face[keep]
-
-                if uv_keep.shape[0] > int(max_arrows_per_face):
-                    pick = np.linspace(
-                        0,
-                        uv_keep.shape[0] - 1,
-                        num=int(max_arrows_per_face),
-                    ).round().astype(np.int64)
-                    uv_keep = uv_keep[pick]
-                    rho_keep = rho_keep[pick]
-                    t_uv_keep = t_uv_keep[pick]
-
-                ax.quiver(
-                    uv_keep[:, 0],
-                    uv_keep[:, 1],
-                    t_uv_keep[:, 0],
-                    t_uv_keep[:, 1],
-                    rho_keep,
-                    cmap=cmap,
-                    clim=(0.0, 1.0),
-                    angles="xy",
-                    scale_units="xy",
-                    scale=float(arrow_scale),
-                    width=float(arrow_width),
-                )
-                arrow_points = int(uv_keep.shape[0])
-
-            ax.set_title(f"Face {face_id} | arrows={arrow_points}")
-            ax.set_xlabel("u")
-            ax.set_ylabel("v")
-            ax.set_aspect("equal")
-            plotted_faces.append(face_id)
-
-        for ax in axes.ravel()[len(face_tensors):]:
-            ax.axis("off")
-
-        fig.suptitle(
-            f"Final fiber direction in UV domain on training points | thr={float(thr):.3f}",
-            y=0.98,
-        )
-        fig.tight_layout()
-        plt.show()
-
-        print(
-            f"2D fiber-direction visualization: plotted {len(plotted_faces)} faces "
-            f"with threshold {thr:.3f}"
-        )
-
-        return {
-            "figure": fig,
-            "face_ids": plotted_faces,
-            "thr_used": float(thr),
-            "uv_by_face": {
-                self._face_id_key(ft.get("face_id", 0)): ft["uv"].detach().cpu().numpy().astype(np.float32)
-                for ft in face_tensors
-            },
-        }
-
-    def visualize_result_final_fiber_direction_2d(self, *args, **kwargs):
-        return self.Visualize_fresult_final_fiber_Direction_2D(*args, **kwargs)
-
     @staticmethod
     def _fiber3d_to_uv_direction(Xu_np, Xv_np, fiber_np, eps=1e-12):
         a11 = np.sum(Xu_np * Xu_np, axis=1)
@@ -6398,7 +7450,6 @@ class NN_Trainer:
 
         # validate the selected face tensor before training
         self._validate_face_tensors(face_tensors)
-        self._auto_update_w_min_from_face_scale(face_tensor)
 
         # Assign device and data type used during training process
         ref_uv = face_tensor["uv"]
@@ -6454,6 +7505,27 @@ class NN_Trainer:
         #print(f"scheduler_milestones: {milestones}")
 
         scheduler = self._build_scheduler(opt, milestones)
+
+        adaptive_stage_enabled = (
+            bool(getattr(cfg, "use_three_stage_optimization", False))
+            and bool(getattr(cfg, "use_adaptive_stage_stopping", True))
+        )
+        stage_specs = self._adaptive_stage_specs() if adaptive_stage_enabled else []
+        stage_runtimes = [StageRuntime(spec=spec) for spec in stage_specs]
+        current_stage_index = 0
+        current_stage_runtime = stage_runtimes[0] if stage_runtimes else None
+        stage_end_summaries: list[dict[str, Any]] = []
+        best_fixed_evaluation_checkpoint = None
+        best_fixed_evaluation_score = float("inf")
+        last_valid_checkpoint = None
+        selected_checkpoint_source = "global"
+        selected_checkpoint_stage_loss = float("nan")
+
+        if adaptive_stage_enabled and current_stage_runtime is not None:
+            stage_settings_initial = self._stage_settings_for_stage_id(current_stage_runtime.spec.stage_id)
+            self._apply_stage_trainability(ppnet, stage_settings_initial)
+            opt = self._build_optimizer(ppnet, decoder)
+            scheduler = self._build_scheduler(opt, milestones)
 
         # ------------------------------------------------------------
         # Optional timelapse setup
@@ -6676,19 +7748,37 @@ class NN_Trainer:
                 hard_active_total = 0.0
 
                 # Activate losses based on their lambda values in the configuration (cfg). If a lambda value is set to 0.0, the corresponding loss will not be computed during training
-                compute_rep_loss = cfg.lam_rep != 0.0
-                compute_bnd_loss = cfg.lam_bnd != 0.0
-                compute_vol_loss = cfg.lam_vol != 0.0
-                compute_density_weighted_cvt_loss = self._lambda_cvt() != 0.0
+                if adaptive_stage_enabled and current_stage_runtime is not None:
+                    stage_settings = self._stage_settings_for_stage_id(current_stage_runtime.spec.stage_id)
+                    stage_local_step = int(current_stage_runtime.local_step)
+                else:
+                    stage_settings = self._stage_settings_for_step(step)
+                    stage_local_step = 0
+                stage_id = int(stage_settings["stage"])
+                freeze_seed_motion_step = bool(stage_settings["freeze_seeds"])
+                self._apply_stage_trainability(ppnet, stage_settings)
+                ppnet.freeze_w = bool(stage_settings["freeze_w"])
+                lam_vol_step = float(stage_settings["lam_vol"])
+                lam_fem_step = float(stage_settings["lam_fem"])
+                lambda_cvt_step = float(stage_settings["lambda_cvt"])
+                lam_rep_step = float(stage_settings["lam_rep"])
+                lam_bnd_step = float(stage_settings["lam_bnd"])
+                lam_seed_domain_recovery_step = float(stage_settings["lam_seed_domain_recovery"])
+                lam_seed_active_step = float(stage_settings["lam_seed_active"])
+                lam_curve_length_step = float(stage_settings["lam_curve_length"])
+                lam_cell_edge_uniform_step = float(stage_settings["lam_cell_edge_uniform"])
+
+                compute_rep_loss = lam_rep_step != 0.0
+                compute_bnd_loss = lam_bnd_step != 0.0
+                compute_vol_loss = lam_vol_step != 0.0
+                compute_density_weighted_cvt_loss = lambda_cvt_step != 0.0
                 compute_seed_domain_recovery_loss = (
-                    getattr(cfg, "lam_seed_domain_recovery", 0.0) != 0.0
+                    lam_seed_domain_recovery_step != 0.0
                     and bool(getattr(cfg, "use_smooth_seed_activity_in_losses", True))
                 )
-                compute_seed_active_loss = getattr(cfg, "lam_seed_active", 0.0) != 0.0
-                compute_curve_length_loss = getattr(cfg, "lam_curve_length", 0.0) != 0.0
-                compute_cell_edge_uniform_loss = (
-                    getattr(cfg, "lam_cell_edge_uniform", 0.0) != 0.0
-                )
+                compute_seed_active_loss = lam_seed_active_step != 0.0
+                compute_curve_length_loss = lam_curve_length_step != 0.0
+                compute_cell_edge_uniform_loss = lam_cell_edge_uniform_step != 0.0
                 collect_curve_metrics = (
                     should_log
                     or should_record_timelapse
@@ -6697,12 +7787,12 @@ class NN_Trainer:
                 collect_topology_metrics = should_log or should_record_timelapse
                 curve_only_training = (
                     compute_curve_length_loss
-                    and cfg.lam_vol == 0.0
-                    and cfg.lam_fem == 0.0
-                    and cfg.lam_rep == 0.0
-                    and cfg.lam_bnd == 0.0
+                    and lam_vol_step == 0.0
+                    and lam_fem_step == 0.0
+                    and lam_rep_step == 0.0
+                    and lam_bnd_step == 0.0
                     and not compute_density_weighted_cvt_loss
-                    and getattr(cfg, "lam_cell_edge_uniform", 0.0) == 0.0
+                    and lam_cell_edge_uniform_step == 0.0
                 )
 
                 # Determine whether to update seed anchors based on the configuration and current step, seed anchors are reference points used in the training process.
@@ -6715,6 +7805,7 @@ class NN_Trainer:
                     )
                     and step >= int(round(float(cfg.seed_anchor_warmup_frac) * float(cfg.num_steps)))
                     and (anchor_update_allowed or not cfg.anchor_guard_updates)
+                    and not freeze_seed_motion_step
                 )
 
                 seed_offset_scale_step = self.seed_offset_scale_for_step(step)
@@ -6740,7 +7831,15 @@ class NN_Trainer:
                         )[0]
                         pred_i["seeds_raw"] = pred_i["seeds_raw"].clone()
                         pred_i["seeds_raw"] = seeds_raw_i
+                    if freeze_seed_motion_step:
+                        seeds_raw_i = seeds_raw_i.detach()
+                        pred_i["seeds_raw"] = seeds_raw_i
                     w_raw_i = pred_i["w_raw"]
+                    w_raw_i = self._bound_w_raw_for_decoder(
+                        w_raw=w_raw_i,
+                        seeds_uv=seeds_raw_i,
+                    )
+                    pred_i["w_raw"] = w_raw_i
 
                     local_face_id = torch.zeros(ft["uv"].shape[0], dtype=torch.long, device=device)
 
@@ -7122,7 +8221,7 @@ class NN_Trainer:
                     "loaded_boundary_displacement_field": None,
                 }
 
-                if cfg.lam_fem != 0.0 and cfg.generate_decoder_density_fiber:
+                if lam_fem_step != 0.0 and cfg.generate_decoder_density_fiber:
                     fem_out = self.loss_fem.evaluate(
                         rho_surface=rho,
                         fiber_surface=fiber_surface,
@@ -7136,7 +8235,7 @@ class NN_Trainer:
                 loss_comp = fem_out["compliance_loss"]
                 comp_val = fem_out["comp"]
                 fem_is_valid = bool(fem_out["fem_valid"])
-                if(cfg.lam_fem != 0.0 and not cfg.generate_decoder_density_fiber):
+                if(lam_fem_step != 0.0 and not cfg.generate_decoder_density_fiber):
                     fem_is_valid = "-"
                 fem_failure_reason = fem_out["failure_reason"]
                 fem_density_field = fem_out.get("density_field", None)
@@ -7254,7 +8353,7 @@ class NN_Trainer:
                     n_cell_edge_uniform = norm_cell_edge_uniform.update(
                         loss_cell_edge_uniform.detach().item()
                     )
-                    n_fem = norm_fem.update(loss_fem.detach().item()) if (cfg.lam_fem != 0.0 and fem_is_valid) else 1.0
+                    n_fem = norm_fem.update(loss_fem.detach().item()) if (lam_fem_step != 0.0 and fem_is_valid) else 1.0
                 else:
                     n_vol = n_rep = n_bnd = n_fem = n_density_weighted_cvt = n_seed_domain_recovery = n_seed_active = n_curve_length = n_cell_edge_uniform = 1.0
 
@@ -7263,25 +8362,23 @@ class NN_Trainer:
                 # ----------------------------------------------------
                 L_total = (
                     zero
-                    + cfg.lam_vol * (loss_vol / n_vol)
-                    + cfg.lam_rep * (loss_rep / n_rep)
-                    + cfg.lam_bnd * (loss_bnd / n_bnd)
-                    + self._lambda_cvt()
-                    * (loss_density_weighted_cvt / n_density_weighted_cvt)
-                    + cfg.lam_seed_domain_recovery
+                    + lam_vol_step * (loss_vol / n_vol)
+                    + lam_rep_step * (loss_rep / n_rep)
+                    + lam_bnd_step * (loss_bnd / n_bnd)
+                    + lambda_cvt_step * (loss_density_weighted_cvt / n_density_weighted_cvt)
+                    + lam_seed_domain_recovery_step
                     * (loss_seed_domain_recovery / n_seed_domain_recovery)
-                    + cfg.lam_seed_active
+                    + lam_seed_active_step
                     * (loss_seed_active / n_seed_active)
-                    + cfg.lam_curve_length * (loss_curve_length / n_curve_length)
-                    + cfg.lam_cell_edge_uniform
-                    * (loss_cell_edge_uniform / n_cell_edge_uniform)
+                    + lam_curve_length_step * (loss_curve_length / n_curve_length)
+                    + lam_cell_edge_uniform_step * (loss_cell_edge_uniform / n_cell_edge_uniform)
                 )
 
-                if cfg.lam_fem != 0.0:
+                if lam_fem_step != 0.0:
                     if fem_is_valid:
-                        L_total = L_total + cfg.lam_fem * (loss_fem / n_fem)
+                        L_total = L_total + lam_fem_step * (loss_fem / n_fem)
                     elif not cfg.skip_bad_fem_steps:
-                        L_total = L_total + cfg.lam_fem * loss_fem
+                        L_total = L_total + lam_fem_step * loss_fem
 
                 total_is_finite = self._scalar_tensor_is_finite(L_total)
                 loss_debug_terms = [
@@ -7391,7 +8488,7 @@ class NN_Trainer:
                         score = float("inf")
 
                     best_candidate_is_valid = (
-                        ((cfg.lam_fem == 0.0) or fem_is_valid)
+                        ((lam_fem_step == 0.0) or fem_is_valid)
                         and total_is_finite
                         and raw_seed_count_total >= int(cfg.min_active_seeds or 1)
                     )
@@ -7595,12 +8692,101 @@ class NN_Trainer:
                         else float("nan")
                     )
 
+                    effective_lambdas = {
+                        "lam_vol": lam_vol_step,
+                        "lam_fem": lam_fem_step,
+                        "lambda_cvt": lambda_cvt_step,
+                        "lam_rep": lam_rep_step,
+                        "lam_bnd": lam_bnd_step,
+                        "lam_seed_domain_recovery": lam_seed_domain_recovery_step,
+                        "lam_seed_active": lam_seed_active_step,
+                        "lam_curve_length": lam_curve_length_step,
+                        "lam_cell_edge_uniform": lam_cell_edge_uniform_step,
+                    }
+                    monitor_loss_values = {
+                        "L_total": L_total.detach(),
+                        "loss_fem_norm": (loss_fem / n_fem).detach(),
+                        "loss_density_weighted_cvt_norm": (loss_density_weighted_cvt / n_density_weighted_cvt).detach(),
+                        "loss_cell_edge_uniform_norm": (loss_cell_edge_uniform / n_cell_edge_uniform).detach(),
+                        "loss_rep_norm": (loss_rep / n_rep).detach(),
+                        "_zero": zero.detach(),
+                    }
+                    monitor_metrics = {
+                        "vol_frac": volfrac_scalar,
+                        "VolFrac": volfrac_scalar,
+                        "comp": self._finite_or_default(comp_val),
+                    }
+                    stage_monitor_raw_tensor = self.calculate_stage_monitor(
+                        stage_id,
+                        monitor_loss_values,
+                        monitor_metrics,
+                        effective_lambdas,
+                    )
+                    stage_monitor_raw = self._finite_or_default(stage_monitor_raw_tensor, default=float("inf"))
+                    if adaptive_stage_enabled and current_stage_runtime is not None:
+                        if current_stage_runtime.monitor_ema is None:
+                            current_stage_runtime.monitor_ema = stage_monitor_raw_tensor.detach()
+                        else:
+                            beta = float(cfg.stage_monitor_ema_beta)
+                            current_stage_runtime.monitor_ema = (
+                                beta * current_stage_runtime.monitor_ema.detach()
+                                + (1.0 - beta) * stage_monitor_raw_tensor.detach()
+                            )
+                        stage_monitor_ema = self._finite_or_default(
+                            current_stage_runtime.monitor_ema,
+                            default=float("inf"),
+                        )
+                        best_stage_monitor = float(current_stage_runtime.best_monitor_ema)
+                        stage_patience_counter = int(current_stage_runtime.patience_counter)
+                        stage_patience_limit = int(current_stage_runtime.spec.patience)
+                        topology_grace_remaining = int(current_stage_runtime.topology_grace_remaining)
+                        stage_local_for_row = int(stage_local_step)
+                        stage_max_for_row = int(current_stage_runtime.spec.max_steps)
+                    else:
+                        stage_monitor_ema = stage_monitor_raw
+                        best_stage_monitor = best_score
+                        stage_patience_counter = steps_since_improve
+                        stage_patience_limit = int(cfg.patience)
+                        topology_grace_remaining = 0
+                        stage_local_for_row = int(step)
+                        stage_max_for_row = int(cfg.num_steps)
+                    fixed_evaluation_score = self._calculate_fixed_evaluation_score(
+                        monitor_loss_values,
+                        monitor_metrics,
+                    )
+
                     row = {
                         "step": step,
+                        "stage": stage_id,
+                        "stage_local_step": stage_local_for_row,
+                        "stage_max_steps": stage_max_for_row,
+                        "stage_monitor_raw": stage_monitor_raw,
+                        "stage_monitor_ema": stage_monitor_ema,
+                        "best_stage_monitor": best_stage_monitor,
+                        "stage_patience_counter": stage_patience_counter,
+                        "stage_patience_limit": stage_patience_limit,
+                        "topology_grace_remaining": topology_grace_remaining,
+                        "fixed_evaluation_score": fixed_evaluation_score,
+                        "best_fixed_evaluation_score": best_fixed_evaluation_score,
+                        "stage_freeze_seeds": 1.0 if freeze_seed_motion_step else 0.0,
+                        "stage_freeze_w": 1.0 if bool(stage_settings["freeze_w"]) else 0.0,
+                        "lam_vol_eff": lam_vol_step,
+                        "lam_fem_eff": lam_fem_step,
+                        "lambda_cvt_eff": lambda_cvt_step,
+                        "lam_rep_eff": lam_rep_step,
+                        "lam_bnd_eff": lam_bnd_step,
+                        "lam_seed_domain_recovery_eff": lam_seed_domain_recovery_step,
+                        "lam_seed_active_eff": lam_seed_active_step,
+                        "lam_curve_length_eff": lam_curve_length_step,
+                        "lam_cell_edge_uniform_eff": lam_cell_edge_uniform_step,
                         "L_total": self._finite_or_default(L_total),
                         "loss_vol": self._finite_or_default(loss_vol),
                         "loss_rep": self._finite_or_default(loss_rep),
                         "loss_bnd": self._finite_or_default(loss_bnd),
+                        "loss_fem_norm": self._finite_or_default(monitor_loss_values["loss_fem_norm"]),
+                        "loss_rep_norm": self._finite_or_default(monitor_loss_values["loss_rep_norm"]),
+                        "loss_density_weighted_cvt_norm": self._finite_or_default(monitor_loss_values["loss_density_weighted_cvt_norm"]),
+                        "loss_cell_edge_uniform_norm": self._finite_or_default(monitor_loss_values["loss_cell_edge_uniform_norm"]),
                         "loss_density_weighted_cvt": self._finite_or_default(loss_density_weighted_cvt),
                         "loss_seed_domain_recovery": self._finite_or_default(loss_seed_domain_recovery),
                         "loss_seed_active": self._finite_or_default(loss_seed_active),
@@ -7689,9 +8875,89 @@ class NN_Trainer:
                             else 0.0
                         ),
                     }
+                    stage_lam_text = self._stage_lambda_summary(row)
+                    Logg_stage = f"Stage {int(row.get('stage', 0))} "
+                    row["stage_lam_text"] = stage_lam_text
+
+                    trainable_params_finite = not self._nonfinite_param_info(ppnets)
+                    gradients_finite = not self._nonfinite_grad_info(ppnets)
+                    finite_diagnostics = all(
+                        math.isfinite(float(v))
+                        for v in (
+                            row.get("minimum_seed_distance", float("nan")),
+                            row.get("VolFrac", float("nan")),
+                            row.get("comp", float("nan")),
+                        )
+                    )
+                    stage_checkpoint_is_valid = (
+                        best_candidate_is_valid
+                        and math.isfinite(float(stage_monitor_raw))
+                        and math.isfinite(float(stage_monitor_ema))
+                        and gradients_finite
+                        and trainable_params_finite
+                        and finite_diagnostics
+                    )
+
+                    if stage_checkpoint_is_valid:
+                        last_valid_checkpoint = self._stage_checkpoint_from_step(
+                            source="last_valid",
+                            ppnet=ppnet,
+                            decoder=decoder,
+                            opt=opt,
+                            scheduler=scheduler,
+                            uv_anchor=uv_anchor,
+                            row=row,
+                            pred_list=pred_list,
+                            seeds_list=seeds_list,
+                            rho=rho,
+                            fiber_surface=fiber_surface,
+                            fem_density_field=fem_density_field,
+                            fem_stress_field=fem_stress_field,
+                            fem_displacement_field=fem_displacement_field,
+                            stage_monitor_raw=stage_monitor_raw,
+                            stage_monitor_ema=stage_monitor_ema,
+                            fixed_evaluation_score=fixed_evaluation_score,
+                            effective_lambdas=effective_lambdas,
+                        )
+                        if fixed_evaluation_score < best_fixed_evaluation_score - float(cfg.min_delta):
+                            best_fixed_evaluation_score = float(fixed_evaluation_score)
+                            best_fixed_evaluation_checkpoint = dict(last_valid_checkpoint)
+                            best_fixed_evaluation_checkpoint["source"] = "fixed_evaluation"
+
+                        if adaptive_stage_enabled and current_stage_runtime is not None:
+                            current_stage_runtime.stage_last_valid_checkpoint = dict(last_valid_checkpoint)
+                            spec = current_stage_runtime.spec
+                            if stage_monitor_raw < current_stage_runtime.best_raw_monitor:
+                                current_stage_runtime.best_raw_monitor = float(stage_monitor_raw)
+                                current_stage_runtime.stage_best_raw_checkpoint = dict(last_valid_checkpoint)
+                                current_stage_runtime.stage_best_raw_checkpoint["source"] = "best_raw"
+                            meaningful = self.is_meaningful_improvement(
+                                stage_monitor_ema,
+                                current_stage_runtime.best_monitor_ema,
+                                spec.min_delta_abs,
+                                spec.min_delta_rel,
+                            )
+                            if meaningful:
+                                current_stage_runtime.best_monitor_ema = float(stage_monitor_ema)
+                                current_stage_runtime.stage_best_checkpoint = dict(last_valid_checkpoint)
+                                current_stage_runtime.stage_best_checkpoint["source"] = "best_ema"
+                                current_stage_runtime.patience_counter = 0
+
+                            self.update_adaptive_stage_controller(
+                                current_stage_runtime,
+                                row,
+                                stage_monitor_ema=stage_monitor_ema,
+                                meaningful_improvement=meaningful,
+                                stage_topology_grace_steps=int(cfg.stage_topology_grace_steps),
+                                debug_stage_controller=bool(getattr(cfg, "debug_stage_controller", False)),
+                                global_step=step,
+                            )
+
+                    row["best_fixed_evaluation_score"] = best_fixed_evaluation_score
                     history.append(row)
 
                     pbar.set_postfix(
+                        stage=stage_lam_text,
                         loss=f"{row['L_total']:.3e}",
                         vol=f"{row['VolFrac']:.3f}",
                         comp=f"{row['comp']:.2e}",
@@ -7732,14 +8998,15 @@ class NN_Trainer:
 
                         loss_dict = {
                             "L_Total": row["L_total"],
-                            "L_Volume": row["loss_vol"],
-                            "L_FEM": row["loss_fem"],
-                            "L_Bnd": row["loss_bnd"],
-                            "L_Rep": row["loss_rep"],
-                            "L_DWCVT": row["loss_density_weighted_cvt"],
-                            "L_SeedActive": row["loss_seed_active"],
-                            "L_CurveLen": row["loss_curve_length"],
-                            "L_CellEdge": row["loss_cell_edge_uniform"],
+                            f"L_Volume (lam={row['lam_vol_eff']:.2g})": row["loss_vol"],
+                            f"L_FEM (lam={row['lam_fem_eff']:.2g})": row["loss_fem"],
+                            f"L_Bnd (lam={row['lam_bnd_eff']:.2g})": row["loss_bnd"],
+                            f"L_Rep (lam={row['lam_rep_eff']:.2g})": row["loss_rep"],
+                            f"L_DWCVT (lam={row['lambda_cvt_eff']:.2g})": row["loss_density_weighted_cvt"],
+                            f"L_SeedActive (lam={row['lam_seed_active_eff']:.2g})": row["loss_seed_active"],
+                            f"L_SeedDomain (lam={row['lam_seed_domain_recovery_eff']:.2g})": row["loss_seed_domain_recovery"],
+                            f"L_CurveLen (lam={row['lam_curve_length_eff']:.2g})": row["loss_curve_length"],
+                            f"L_CellEdge (lam={row['lam_cell_edge_uniform_eff']:.2g})": row["loss_cell_edge_uniform"],
                         }
 
                         recorder.add_frame(
@@ -7747,6 +9014,7 @@ class NN_Trainer:
                             cad_img=cad_img,
                             loss_dict=loss_dict,
                             title_text=(
+                                f"S{int(row['stage'])} | "
                                 f"L_FEM={row['loss_fem']:.2f} | "
                                 f"Best Step={int(row['best_step'])} | "
                                 f"Best L_FEM={row['L_FEM_best']:.2f} | "
@@ -7758,6 +9026,7 @@ class NN_Trainer:
                                 f"W={row['w_geo_mean']:.2f} | "
                                 f"Active Units={row['active_units_total']:.0f} | "
                             ),
+                            stage=row["stage"],
                         )
 
                     self._tb_log_step(
@@ -7775,17 +9044,29 @@ class NN_Trainer:
                     if step % cfg.log_every == 0 or step == cfg.num_steps - 1:
                         fem_status = "OK" if fem_is_valid else f"BAD({fem_failure_reason})"
                         tqdm.write(
-                            f"[{step:05d}] | "
+                            f"[{step:05d}] ({Logg_stage}) local={int(row.get('stage_local_step', 0))}/{int(row.get('stage_max_steps', cfg.num_steps))} | "
+                            f"monitor={float(row.get('stage_monitor_raw', float('nan'))):.3e} "
+                            f"ema={float(row.get('stage_monitor_ema', float('nan'))):.3e} "
+                            f"best_ema={float(row.get('best_stage_monitor', float('nan'))):.3e} "
+                            f"patience={int(row.get('stage_patience_counter', 0))}/{int(row.get('stage_patience_limit', cfg.patience))} "
+                            f"grace={int(row.get('topology_grace_remaining', 0))} "
+                            f"topo_changed={bool(row.get('topology_changed', False))} "
+                            f"topo_id={str(row.get('topology_identifier_short', ''))} "
+                            f"pat_active={bool(row.get('patience_active', False))} "
+                            f"meaningful={bool(row.get('meaningful_improvement', False))} "
+                            f"fixed_eval={float(row.get('fixed_evaluation_score', float('nan'))):.3e} "
+                            f"best_fixed={float(row.get('best_fixed_evaluation_score', float('nan'))):.3e} | "
                             f"Active Units/Total={participating_count_total:.0f}/{participating_count_total+inactive_count_total:.0f} | "
                             f"L_total={row['L_total']:.4e} | "
-                            f"L_vol={row['loss_vol']:.3e} "
-                            f"L_fem={row['loss_fem']:.3e} "
-                            f"L_dwcvt={row['loss_density_weighted_cvt']:.3e} "
-                            f"L_curve={row['loss_curve_length']:.3e} "
-                            f"L_cell_edge={row['loss_cell_edge_uniform']:.3e} "
-                            f"L_rep={row['loss_rep']:.3e} "
-                            f"L_bnd={row['loss_bnd']:.3e} "
-                            f"L_seed_active={row['loss_seed_active']:.3e} |"
+                            f"L_vol={row['loss_vol']:.3e}(lam={row['lam_vol_eff']:.2g}) "
+                            f"L_fem={row['loss_fem']:.3e}(lam={row['lam_fem_eff']:.2g}) "
+                            f"L_dwcvt={row['loss_density_weighted_cvt']:.3e}(lam={row['lambda_cvt_eff']:.2g}) "
+                            f"L_curve={row['loss_curve_length']:.3e}(lam={row['lam_curve_length_eff']:.2g}) "
+                            f"L_cell_edge={row['loss_cell_edge_uniform']:.3e}(lam={row['lam_cell_edge_uniform_eff']:.2g}) "
+                            f"L_rep={row['loss_rep']:.3e}(lam={row['lam_rep_eff']:.2g}) "
+                            f"L_bnd={row['loss_bnd']:.3e}(lam={row['lam_bnd_eff']:.2g}) "
+                            f"L_seed_active={row['loss_seed_active']:.3e}(lam={row['lam_seed_active_eff']:.2g}) "
+                            f"L_seed_domain={row['loss_seed_domain_recovery']:.3e}(lam={row['lam_seed_domain_recovery_eff']:.2g}) |"
                             f"L(min/max/mean/ratio)={row['curve_length_min']:.3e}/{row['curve_length_max']:.3e}/{row['curve_length_mean']:.3e}/{row['curve_length_ratio']:.2f} |"
                             f"VolFrac={row['VolFrac']:.3f} "
                             f"(/{cfg.target_volfrac:.3f}) "
@@ -7910,12 +9191,194 @@ class NN_Trainer:
                                 f"{old_seed_count_current} seed slots remain."
                             )
 
-                    if step >= self.early_stop_start_step() and steps_since_improve >= cfg.patience:
+                    if adaptive_stage_enabled and current_stage_runtime is not None:
+                        spec = current_stage_runtime.spec
+                        current_stage_runtime.local_step += 1
+                        stage_end_reason = None
+                        if current_stage_runtime.local_step >= spec.max_steps:
+                            stage_end_reason = "max_steps"
+                        elif (
+                            current_stage_runtime.local_step >= spec.min_steps
+                            and current_stage_runtime.patience_counter >= spec.patience
+                        ):
+                            stage_end_reason = "patience"
+
+                        if stage_end_reason is not None:
+                            current_stage_runtime.end_reason = stage_end_reason
+                            transition_name = None
+                            transition_score = float("inf")
+                            selected_transition_checkpoint = None
+                            next_stage_id = (
+                                stage_specs[current_stage_index + 1].stage_id
+                                if current_stage_index + 1 < len(stage_specs)
+                                else spec.stage_id
+                            )
+                            if current_stage_index + 1 < len(stage_specs):
+                                transition_name, selected_transition_checkpoint, transition_score = self._select_transition_checkpoint(
+                                    current_stage_runtime,
+                                    next_stage_id,
+                                )
+                                tqdm.write(
+                                    f"{spec.name} finished at local step {current_stage_runtime.local_step} "
+                                    f"(global step {step}) | reason={stage_end_reason}"
+                                )
+                                for cand_name, cand_ckpt in (
+                                    ("best_raw", current_stage_runtime.stage_best_raw_checkpoint),
+                                    ("best_ema", current_stage_runtime.stage_best_checkpoint),
+                                    ("last", current_stage_runtime.stage_last_valid_checkpoint),
+                                ):
+                                    if cand_ckpt is None:
+                                        tqdm.write(f"    {cand_name}: missing")
+                                    else:
+                                        cand_score = self._checkpoint_stage_monitor_for_stage(cand_ckpt, next_stage_id)
+                                        tqdm.write(f"    {cand_name}: next_stage_monitor={cand_score:.6e}")
+                            else:
+                                tqdm.write(
+                                    f"{spec.name} completed | reason={stage_end_reason} | "
+                                    f"local_steps={current_stage_runtime.local_step}"
+                                )
+
+                            stage_summary = {
+                                "stage": int(spec.stage_id),
+                                "stage_name": spec.name,
+                                "reason": stage_end_reason,
+                                "local_steps": int(current_stage_runtime.local_step),
+                                "best_local_step": (
+                                    int(current_stage_runtime.stage_best_checkpoint.get("stage_local_step", -1))
+                                    if current_stage_runtime.stage_best_checkpoint is not None
+                                    else -1
+                                ),
+                                "best_monitor": float(current_stage_runtime.best_monitor_ema),
+                                "best_raw_step": (
+                                    int(current_stage_runtime.stage_best_raw_checkpoint.get("stage_local_step", -1))
+                                    if current_stage_runtime.stage_best_raw_checkpoint is not None
+                                    else -1
+                                ),
+                                "last_valid_step": (
+                                    int(current_stage_runtime.stage_last_valid_checkpoint.get("stage_local_step", -1))
+                                    if current_stage_runtime.stage_last_valid_checkpoint is not None
+                                    else -1
+                                ),
+                                "transition_checkpoint": transition_name,
+                                "transition_score": float(transition_score),
+                                "optimizer_reset": bool(cfg.reset_optimizer_between_stages),
+                            }
+                            stage_end_summaries.append(stage_summary)
+                            tqdm.write(
+                                f"Stage {spec.stage_id} completed | reason={stage_end_reason} | "
+                                f"local_steps={stage_summary['local_steps']} | "
+                                f"best_local_step={stage_summary['best_local_step']} | "
+                                f"best_monitor={stage_summary['best_monitor']:.6e} | "
+                                f"best_raw_step={stage_summary['best_raw_step']} | "
+                                f"last_valid_step={stage_summary['last_valid_step']} | "
+                                f"transition_checkpoint={transition_name} | "
+                                f"transition_score={transition_score:.6e} | "
+                                f"optimizer_reset={bool(cfg.reset_optimizer_between_stages)}"
+                            )
+
+                            if current_stage_index + 1 >= len(stage_specs):
+                                break
+
+                            if bool(cfg.restore_transition_checkpoint) and selected_transition_checkpoint is not None:
+                                if bool(cfg.reset_optimizer_between_stages):
+                                    uv_anchor = self._restore_stage_checkpoint(
+                                        selected_transition_checkpoint,
+                                        ppnet,
+                                        decoder,
+                                    )
+                                else:
+                                    uv_anchor = self._restore_stage_checkpoint(
+                                        selected_transition_checkpoint,
+                                        ppnet,
+                                        decoder,
+                                        opt=opt,
+                                        scheduler=scheduler,
+                                    )
+                                tqdm.write(f"Selected transition checkpoint: {transition_name}")
+
+                            current_stage_index += 1
+                            current_stage_runtime = stage_runtimes[current_stage_index]
+                            next_stage_settings = self._stage_settings_for_stage_id(current_stage_runtime.spec.stage_id)
+                            self._apply_stage_trainability(ppnet, next_stage_settings)
+                            if bool(cfg.reset_optimizer_between_stages) or selected_transition_checkpoint is None:
+                                opt = self._build_optimizer(ppnet, decoder)
+                                remaining_milestones = [
+                                    max(1, int(m) - int(step))
+                                    for m in milestones
+                                    if int(m) > int(step)
+                                ]
+                                scheduler = self._build_scheduler(opt, sorted(set(remaining_milestones)))
+                            else:
+                                trainable_ids = {id(p) for p in ppnet.parameters() if p.requires_grad}
+                                optimizer_ids = {id(p) for group in opt.param_groups for p in group.get("params", [])}
+                                if trainable_ids != optimizer_ids:
+                                    opt = self._build_optimizer(ppnet, decoder)
+                                    scheduler = self._build_scheduler(opt, [])
+                            seeds0 = None
+                            continue
+
+                    if (not adaptive_stage_enabled) and step >= self.early_stop_start_step() and steps_since_improve >= cfg.patience:
                         tqdm.write(
                             f"Early stopping at step {step} | "
                             f"best_step={best_step} | best_score={best_score:.6f} |"
                         )
                         break
+
+        # ------------------------------------------------------------
+        # Adaptive final checkpoint selection
+        # ------------------------------------------------------------
+        if adaptive_stage_enabled:
+            final_policy = str(getattr(cfg, "final_checkpoint_selection", "fixed_evaluation"))
+            selected_final_checkpoint = None
+            if final_policy == "fixed_evaluation":
+                selected_final_checkpoint = best_fixed_evaluation_checkpoint
+                selected_checkpoint_source = "fixed_evaluation"
+            elif final_policy == "stage3_best" and stage_runtimes:
+                selected_final_checkpoint = stage_runtimes[-1].stage_best_checkpoint
+                selected_checkpoint_source = "stage3_best"
+            elif final_policy == "stage3_final" and stage_runtimes:
+                selected_final_checkpoint = stage_runtimes[-1].stage_last_valid_checkpoint
+                selected_checkpoint_source = "stage3_final"
+
+            if selected_final_checkpoint is None:
+                selected_final_checkpoint = last_valid_checkpoint
+                selected_checkpoint_source = "last_valid_fallback"
+
+            if selected_final_checkpoint is not None:
+                uv_anchor = self._restore_stage_checkpoint(
+                    selected_final_checkpoint,
+                    ppnet,
+                    decoder,
+                )
+                selected_checkpoint_stage_loss = float(
+                    selected_final_checkpoint.get("selected_checkpoint_stage_loss", float("nan"))
+                )
+                best_step = int(selected_final_checkpoint.get("global_step", -1))
+                if final_policy == "fixed_evaluation":
+                    best_score = float(selected_final_checkpoint.get("fixed_evaluation_score", float("inf")))
+                elif final_policy == "stage3_best":
+                    best_score = float(selected_final_checkpoint.get("stage_monitor_ema", float("inf")))
+                else:
+                    best_score = selected_checkpoint_stage_loss
+                row_sel = selected_final_checkpoint.get("row", {})
+                best_vol_frac = float(row_sel.get("VolFrac", selected_final_checkpoint.get("volume_fraction", float("nan"))))
+                best_comp = float(row_sel.get("comp", selected_final_checkpoint.get("compliance", float("nan"))))
+                best_w_geo = float(row_sel.get("w_geo_mean", float("nan")))
+                best_active_count = float(row_sel.get("active_units_total", selected_final_checkpoint.get("active_seed_count", 0.0)))
+                best_inactive_count = float(row_sel.get("inactive_units_total", 0.0))
+                best_raw_seed_count = int(row_sel.get("raw_seed_units_total", best_raw_seed_count or 0))
+                best_rho = selected_final_checkpoint["rho"].detach().clone()
+                best_fiber_surface = selected_final_checkpoint["fiber_surface"].detach().clone()
+                best_seeds = [s.detach().clone() for s in selected_final_checkpoint.get("seeds", [])]
+                best_pred = self._clone_pred_list(selected_final_checkpoint.get("pred_list", []))
+                if best_pred and isinstance(best_pred[0].get("seed_active_mask"), torch.Tensor):
+                    best_seed_active_mask = best_pred[0]["seed_active_mask"].detach().clone()
+                if best_pred and isinstance(best_pred[0].get("active_seed_ids"), torch.Tensor):
+                    best_active_seed_ids = best_pred[0]["active_seed_ids"].detach().clone()
+                best_fem_density_field = selected_final_checkpoint.get("fem_density_field", None)
+                best_fem_stress_field = selected_final_checkpoint.get("fem_stress_field", None)
+                best_fem_displacement_field = selected_final_checkpoint.get("fem_displacement_field", None)
+                returned_best_source = selected_checkpoint_source
 
         # ------------------------------------------------------------
         # Fallback best state
@@ -8164,102 +9627,149 @@ class NN_Trainer:
 
         if cfg.MakeTimelaps:
             try:
-                total_seed_slots = (
-                    int(best_pred[0]["seeds_raw"].shape[0])
-                    if best_pred
-                    else int(cfg.seed_number)
-                )
-                active_seed_count = int(round(float(best_active_count or 0.0)))
-                best_volfrac = (
-                    float(best_row["VolFrac"])
-                    if best_row is not None and "VolFrac" in best_row
-                    else float(best_vol_frac)
-                )
-                tuned_param_summary = {
-                    "best_step": f"{int(best_step)}",
-                    "active_units": f"{active_seed_count}/{total_seed_slots}",
-                    "w": f"{float(best_w_geo):.2f}",
-                }
-                if best_pred:
-                    def _mean_from_best_pred(key):
-                        vals = []
-                        for p in best_pred:
-                            v = p.get(key)
-                            if isinstance(v, torch.Tensor):
-                                vals.append(float(v.detach().mean().item()))
-                        if vals:
-                            return float(sum(vals) / len(vals))
-                        return float("nan")
+                def _checkpoint_lam(row, name):
+                    if row is None:
+                        return 0.0
+                    return float(row.get(name, 0.0))
 
-                    tuned_param_summary = {
-                        "best_step": f"{int(best_step)}",
-                        "active_units": f"{active_seed_count}/{total_seed_slots}",
-                        "w": f"{float(best_w_geo):.2f}",
+                def _checkpoint_loss_dict(row, score):
+                    def _row_float(name):
+                        if row is None:
+                            return float("nan")
+                        return float(row.get(name, float("nan")))
+
+                    return {
+                        "L_Total": float(score),
+                        f"L_Volume (lam={_checkpoint_lam(row, 'lam_vol_eff'):.2g})": _row_float("loss_vol"),
+                        f"L_FEM (lam={_checkpoint_lam(row, 'lam_fem_eff'):.2g})": _row_float("loss_fem"),
+                        f"L_Bnd (lam={_checkpoint_lam(row, 'lam_bnd_eff'):.2g})": _row_float("loss_bnd"),
+                        f"L_Rep (lam={_checkpoint_lam(row, 'lam_rep_eff'):.2g})": _row_float("loss_rep"),
+                        f"L_DWCVT (lam={_checkpoint_lam(row, 'lambda_cvt_eff'):.2g})": _row_float("loss_density_weighted_cvt"),
+                        f"L_SeedActive (lam={_checkpoint_lam(row, 'lam_seed_active_eff'):.2g})": _row_float("loss_seed_active"),
+                        f"L_SeedDomain (lam={_checkpoint_lam(row, 'lam_seed_domain_recovery_eff'):.2g})": _row_float("loss_seed_domain_recovery"),
+                        f"L_CurveLen (lam={_checkpoint_lam(row, 'lam_curve_length_eff'):.2g})": _row_float("loss_curve_length"),
+                        f"L_CellEdge (lam={_checkpoint_lam(row, 'lam_cell_edge_uniform_eff'):.2g})": _row_float("loss_cell_edge_uniform"),
                     }
 
-                best_loss_dict = {
-                    "L_Total": float(best_score),
-                    "L_Volume": float(best_row["loss_vol"]) if best_row is not None else float("nan"),
-                    "L_FEM": float(best_row["loss_fem"]) if best_row is not None else float("nan"),
-                    "L_Bnd": float(best_row["loss_bnd"]) if best_row is not None else float("nan"),
-                    "L_Rep": float(best_row["loss_rep"]) if best_row is not None else float("nan"),
-                    "L_DWCVT": float(best_row["loss_density_weighted_cvt"]) if best_row is not None else float("nan"),
-                    "L_CurveLen": float(best_row["loss_curve_length"]) if best_row is not None else float("nan"),
-                    "L_CellEdge": float(best_row["loss_cell_edge_uniform"]) if best_row is not None else float("nan"),
-                }
-                results_text = (
-                    f"VolFrac={best_volfrac:.2f} | "
-                    f"Best L_FEM={float(best_row['loss_fem']) if best_row is not None else float(best_comp):.2f} | "
-                    f"Com. Red. = {float(best_row['compliance_reduction_pct']) if best_row is not None else float('nan'):.1f}% | "
-                    f"compute_time={self._format_elapsed_time(computation_time_sec)}"
-                )
-                tuned_param_title = " | ".join(f"{key}={value}" for key, value in tuned_param_summary.items())
+                def _checkpoint_results_text(row):
+                    volfrac = float(row.get("VolFrac", float("nan"))) if row is not None else float("nan")
+                    fem_loss = float(row.get("loss_fem", float("nan"))) if row is not None else float("nan")
+                    compliance_reduction = (
+                        float(row.get("compliance_reduction_pct", float("nan")))
+                        if row is not None
+                        else float("nan")
+                    )
+                    return (
+                        f"VolFrac={volfrac:.2f} | "
+                        f"L_FEM={fem_loss:.2f} | "
+                        f"Com. Red. = {compliance_reduction:.1f}% | "
+                        f"compute_time={self._format_elapsed_time(computation_time_sec)}"
+                    )
 
-                decoder_seed_state = None
-                if best_pred:
-                    decoder_seed_state = self._decoder_seed_state_for_pred(decoder, best_pred[0], device)
-                try:
-                    if getattr(cfg, "timelapse_show_3d_tubes", True):
-                        best_cad_img = self._render_current_3d_tube_frame_cached(
-                            seeds_list=best_seeds,
-                            decoders=decoders,
-                            pred_list=best_pred,
-                            render_cache=render_cache,
-                            loading_img=self.timelapse_loading_img,
-                            fem_density_field=best_fem_density_field,
-                            fem_stress_field=best_fem_stress_field,
-                            fem_displacement_field=best_fem_displacement_field,
-                            history_rows=history,
-                        )
-                    else:
-                        best_cad_img = self._render_current_cad_frame_cached(
-                            seeds_list=best_seeds,
-                            decoders=decoders,
-                            pred_list=best_pred,
-                            render_cache=render_cache,
-                            thr=getattr(cfg, "vis_thr", cfg.TM_laps_Thr),
-                            loading_img=self.timelapse_loading_img,
-                        )
-                finally:
-                    if decoder_seed_state is not None:
+                def _render_checkpoint_timelapse_frame(
+                    *,
+                    checkpoint: dict[str, Any] | None,
+                    pred_list_for_frame: list[dict[str, Any]],
+                    seeds_for_frame: list[torch.Tensor],
+                    frame_step: int,
+                    score: float,
+                    output_filename: str | None,
+                    chart_title: str,
+                    summary_title: str,
+                ):
+                    if checkpoint is None or recorder is None or not pred_list_for_frame:
+                        return None
+                    row = checkpoint.get("row", {})
+                    total_seed_slots = int(pred_list_for_frame[0]["seeds_raw"].shape[0])
+                    active_seed_count = int(round(float(row.get("active_units_total", checkpoint.get("active_seed_count", 0.0)))))
+                    title_parts = [
+                        f"S{int(row.get('stage', checkpoint.get('stage_id', 0)))}",
+                        f"best_step={int(checkpoint.get('global_step', frame_step))}",
+                        f"active_units={active_seed_count}/{total_seed_slots}",
+                        f"w={float(row.get('w_geo_mean', float('nan'))):.2f}",
+                    ]
+                    decoder_seed_state = self._decoder_seed_state_for_pred(decoder, pred_list_for_frame[0], device)
+                    try:
+                        if getattr(cfg, "timelapse_show_3d_tubes", True):
+                            cad_img = self._render_current_3d_tube_frame_cached(
+                                seeds_list=seeds_for_frame,
+                                decoders=decoders,
+                                pred_list=pred_list_for_frame,
+                                render_cache=render_cache,
+                                loading_img=self.timelapse_loading_img,
+                                fem_density_field=checkpoint.get("fem_density_field", None),
+                                fem_stress_field=checkpoint.get("fem_stress_field", None),
+                                fem_displacement_field=checkpoint.get("fem_displacement_field", None),
+                                history_rows=history,
+                            )
+                        else:
+                            cad_img = self._render_current_cad_frame_cached(
+                                seeds_list=seeds_for_frame,
+                                decoders=decoders,
+                                pred_list=pred_list_for_frame,
+                                render_cache=render_cache,
+                                thr=getattr(cfg, "vis_thr", cfg.TM_laps_Thr),
+                                loading_img=self.timelapse_loading_img,
+                            )
+                    finally:
                         self._restore_decoder_seed_state(decoder, decoder_seed_state)
-                best_frame_path = recorder.add_frame(
-                    step=cfg.num_steps + 1,
-                    cad_img=best_cad_img,
-                    loss_dict=best_loss_dict,
-                    title_text=tuned_param_title,
-                    highlight_best=True,
+
+                    frame_path = recorder.add_frame(
+                        step=frame_step,
+                        cad_img=cad_img,
+                        loss_dict=_checkpoint_loss_dict(row, score),
+                        title_text=" | ".join(title_parts),
+                        highlight_best=True,
+                        chart_title=chart_title,
+                        summary_title=summary_title,
+                        prefix_step_in_summary=False,
+                        results_title="Results",
+                        results_text=_checkpoint_results_text(row),
+                        stage=row.get("stage", checkpoint.get("stage_id", None)),
+                    )
+                    if timelapse_output_folder and output_filename:
+                        shutil.copy2(frame_path, os.path.join(timelapse_output_folder, output_filename))
+                    return frame_path
+
+                for stage_runtime in stage_runtimes:
+                    stage_ckpt = stage_runtime.stage_best_checkpoint
+                    if stage_ckpt is None:
+                        continue
+                    stage_id_for_frame = int(stage_ckpt.get("stage_id", stage_runtime.spec.stage_id))
+                    _render_checkpoint_timelapse_frame(
+                        checkpoint=stage_ckpt,
+                        pred_list_for_frame=stage_ckpt.get("pred_list", []),
+                        seeds_for_frame=stage_ckpt.get("seeds", []),
+                        frame_step=int(cfg.num_steps) + stage_id_for_frame + 1,
+                        score=float(stage_ckpt.get("stage_monitor_ema", float("inf"))),
+                        output_filename=f"stage{stage_id_for_frame}_best_result_frame.png",
+                        chart_title=f"Stage {stage_id_for_frame} Best Losses",
+                        summary_title="Stage Best Parameters",
+                    )
+
+                best_checkpoint_for_frame = {
+                    "row": best_row or {},
+                    "pred_list": best_pred,
+                    "seeds": best_seeds,
+                    "stage_id": int(best_row.get("stage", 0)) if best_row is not None else 0,
+                    "global_step": int(best_step),
+                    "active_seed_count": float(best_active_count or 0.0),
+                    "fem_density_field": best_fem_density_field,
+                    "fem_stress_field": best_fem_stress_field,
+                    "fem_displacement_field": best_fem_displacement_field,
+                }
+                best_frame_path = _render_checkpoint_timelapse_frame(
+                    checkpoint=best_checkpoint_for_frame,
+                    pred_list_for_frame=best_pred,
+                    seeds_for_frame=best_seeds,
+                    frame_step=cfg.num_steps + 1,
+                    score=float(best_score),
+                    output_filename="best_result_frame.png",
                     chart_title="Best Result Losses",
                     summary_title="Tuned Parameters",
-                    prefix_step_in_summary=False,
-                    results_title="Results",
-                    results_text=results_text,
                 )
-                if timelapse_output_folder:
-                    shutil.copy2(
-                        best_frame_path,
-                        os.path.join(timelapse_output_folder, "best_result_frame.png"),
-                    )
+                if best_frame_path is None:
+                    raise RuntimeError("Could not render best result frame.")
                 recorder.build_video(hold_last_seconds=10.0)
             except Exception as e:
                 tqdm.write(f"Failed to build timelapse video: {e}")
@@ -8301,6 +9811,20 @@ class NN_Trainer:
             "prune_events": prune_events,
             "best_score": best_score,
             "best_step": best_step,
+            "best_stage_monitor": (
+                float(best_row.get("stage_monitor_ema", float("nan")))
+                if best_row is not None
+                else float("nan")
+            ),
+            "best_fixed_evaluation_score": best_fixed_evaluation_score,
+            "selected_checkpoint_source": selected_checkpoint_source,
+            "selected_stage": (
+                int(best_row.get("stage", 0))
+                if best_row is not None and best_row.get("stage", None) is not None
+                else None
+            ),
+            "stage_end_summaries": stage_end_summaries,
+            "selected_checkpoint_stage_loss": selected_checkpoint_stage_loss,
             "best_solution_metrics": best_solution_metrics,
             "best_raw_seed_count": int(best_raw_seed_count or 0),
             "best_active_units": float(best_active_count or 0.0),

@@ -395,6 +395,61 @@ class ContinuousVoronoiDecoder(nn.Module):
                 result_curves.append(curves[edge_id])
         return torch.stack(result_curves, dim=0)
 
+    @staticmethod
+    def _project_point_to_fixed_segment_torch(
+        point: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ab = b - a
+        denom = (ab * ab).sum() + eps
+        t = (((point - a) * ab).sum() / denom).clamp(0.0, 1.0)
+        return a + t * ab, t
+
+    @staticmethod
+    def _sample_polyline_by_arclength_torch(
+        points: torch.Tensor,
+        n_samples: int,
+        eps: float,
+    ) -> torch.Tensor:
+        if points.ndim != 2 or points.shape[-1] != 2:
+            raise ValueError("points must have shape [P, 2].")
+        if points.shape[0] == 0:
+            return points.new_empty((int(n_samples), 2))
+        if points.shape[0] == 1:
+            return points.expand(int(n_samples), -1)
+
+        deltas = points[1:] - points[:-1]
+        lengths = torch.linalg.vector_norm(deltas, dim=-1)
+        safe_lengths = lengths.clamp_min(eps)
+        cumulative = torch.cat(
+            (lengths.new_zeros(1), torch.cumsum(lengths, dim=0)),
+            dim=0,
+        )
+        total = cumulative[-1].clamp_min(eps)
+        targets = torch.linspace(
+            0.0,
+            1.0,
+            int(n_samples),
+            dtype=points.dtype,
+            device=points.device,
+        ) * total
+
+        segment_ids = torch.searchsorted(
+            cumulative[1:],
+            targets,
+            right=False,
+        ).clamp(max=lengths.numel() - 1)
+        a = points.index_select(0, segment_ids)
+        b = points.index_select(0, segment_ids + 1)
+        s0 = cumulative.index_select(0, segment_ids)
+        local_t = (
+            (targets - s0)
+            / safe_lengths.index_select(0, segment_ids)
+        ).clamp(0.0, 1.0)
+        return a + local_t.unsqueeze(-1) * (b - a)
+
     def sample_cad_boundary_edge_uv(self, p0: torch.Tensor, p1: torch.Tensor, graph: dict[str, torch.Tensor], n_samples: int) -> torch.Tensor | None:
         """Sample a shell edge along packed CAD boundary polylines."""
         boundary_uv = graph.get('boundary_curve_uv')
@@ -413,20 +468,23 @@ class ContinuousVoronoiDecoder(nn.Module):
         if loop_id.numel() != offsets.numel() - 1:
             return None
 
+        # Discrete path/topology selection uses detached endpoint copies.
+        # Continuous endpoint projection and curve sampling below remain
+        # differentiable with respect to live p0 and p1.
         p0_np = p0.detach().cpu().numpy()
         p1_np = p1.detach().cpu().numpy()
         uv_np = boundary_uv.detach().cpu().numpy()
         offsets_np = offsets.detach().cpu().numpy()
         loop_np = loop_id.detach().cpu().numpy()
 
-        def project_point_to_polyline(point: np.ndarray, polyline: np.ndarray) -> tuple[float, float, np.ndarray]:
+        def project_point_to_polyline(point: np.ndarray, polyline: np.ndarray) -> tuple[float, float, int]:
             starts = polyline[:-1]
             ends = polyline[1:]
             deltas = ends - starts
             lengths2 = np.sum(deltas * deltas, axis=1)
             valid = lengths2 > 1e-16
             if not np.any(valid):
-                return (float('inf'), 0.0, polyline[0])
+                return (float('inf'), 0.0, 0)
             starts_v = starts[valid]
             deltas_v = deltas[valid]
             lengths2_v = lengths2[valid]
@@ -440,60 +498,111 @@ class ContinuousVoronoiDecoder(nn.Module):
             lengths = np.linalg.norm(deltas, axis=1)
             cumulative = np.concatenate(([0.0], np.cumsum(lengths)))
             s = float(cumulative[seg_id] + local_t[best] * lengths[seg_id])
-            return (float(d2[best]), s, proj[best])
+            return (float(d2[best]), s, seg_id)
 
         best = None
         for loop_value in sorted(set(int(v) for v in loop_np.tolist())):
             piece_ids = np.nonzero(loop_np == loop_value)[0]
             if piece_ids.size == 0:
                 continue
-            parts = []
+            point_ids: list[int] = []
             for local_id, piece_id in enumerate(piece_ids.tolist()):
                 start = int(offsets_np[piece_id])
                 end = int(offsets_np[piece_id + 1])
                 if end <= start:
                     continue
-                pts = uv_np[start:end]
-                parts.append(pts if local_id == 0 else pts[1:])
-            if not parts:
+                ids = list(range(start, end))
+                point_ids.extend(ids if local_id == 0 else ids[1:])
+            if not point_ids:
                 continue
-            polyline = np.concatenate(parts, axis=0)
+            polyline = uv_np[point_ids]
             if polyline.shape[0] < 2:
                 continue
             closed = np.linalg.norm(polyline[0] - polyline[-1]) <= 1e-8
             if not closed:
                 polyline = np.concatenate((polyline, polyline[:1]), axis=0)
-            d0, s0, _ = project_point_to_polyline(p0_np, polyline)
-            d1, s1, _ = project_point_to_polyline(p1_np, polyline)
+                point_ids = point_ids + [point_ids[0]]
+            d0, s0, seg0 = project_point_to_polyline(p0_np, polyline)
+            d1, s1, seg1 = project_point_to_polyline(p1_np, polyline)
             score = d0 + d1
             if best is None or score < best[0]:
-                best = (score, polyline, s0, s1)
+                lengths = np.linalg.norm(np.diff(polyline, axis=0), axis=1)
+                total = float(np.sum(lengths))
+                if total <= 1e-12:
+                    continue
+                forward = (s1 - s0) % total
+                reverse = (s0 - s1) % total
+                use_forward = forward <= reverse
+                best = (score, point_ids, seg0, seg1, use_forward)
         if best is None:
             return None
 
-        _, polyline, s0, s1 = best
-        deltas = np.diff(polyline, axis=0)
-        lengths = np.linalg.norm(deltas, axis=1)
-        total = float(np.sum(lengths))
-        if total <= 1e-12:
+        _, point_ids, seg0, seg1, use_forward = best
+        loop_points = boundary_uv.index_select(
+            0,
+            torch.as_tensor(point_ids, dtype=torch.long, device=p0.device),
+        )
+        if loop_points.shape[0] < 2:
             return None
-        if s1 < s0:
-            s1 += total
-        if s1 - s0 > 0.5 * total:
-            s0, s1 = s1, s0 + total
-        sample_s = np.linspace(s0, s1, int(n_samples))
-        cumulative = np.concatenate(([0.0], np.cumsum(lengths)))
-        curve = []
-        for value in sample_s:
-            value_wrapped = value % total
-            seg_id = int(np.searchsorted(cumulative, value_wrapped, side='right') - 1)
-            seg_id = min(max(seg_id, 0), len(lengths) - 1)
-            if lengths[seg_id] <= 1e-12:
-                curve.append(polyline[seg_id])
-                continue
-            local_t = (value_wrapped - cumulative[seg_id]) / lengths[seg_id]
-            curve.append(polyline[seg_id] + local_t * deltas[seg_id])
-        return torch.as_tensor(np.asarray(curve), dtype=p0.dtype, device=p0.device)
+
+        q0, _ = self._project_point_to_fixed_segment_torch(
+            p0,
+            loop_points[seg0],
+            loop_points[seg0 + 1],
+            self.eps,
+        )
+        q1, _ = self._project_point_to_fixed_segment_torch(
+            p1,
+            loop_points[seg1],
+            loop_points[seg1 + 1],
+            self.eps,
+        )
+
+        if use_forward:
+            if seg0 < seg1:
+                intermediate = loop_points[seg0 + 1:seg1 + 1]
+            elif seg0 == seg1:
+                intermediate = loop_points.new_empty((0, 2))
+            else:
+                intermediate = torch.cat(
+                    (loop_points[seg0 + 1:-1], loop_points[:seg1 + 1]),
+                    dim=0,
+                )
+            path_points = torch.cat(
+                (q0.unsqueeze(0), intermediate, q1.unsqueeze(0)),
+                dim=0,
+            )
+        else:
+            if seg1 < seg0:
+                intermediate = loop_points[seg1 + 1:seg0 + 1].flip(0)
+            elif seg1 == seg0:
+                intermediate = loop_points.new_empty((0, 2))
+            else:
+                intermediate = torch.cat(
+                    (loop_points[seg1 + 1:-1], loop_points[:seg0 + 1]),
+                    dim=0,
+                ).flip(0)
+            path_points = torch.cat(
+                (q0.unsqueeze(0), intermediate, q1.unsqueeze(0)),
+                dim=0,
+            )
+
+        deltas = path_points[1:] - path_points[:-1]
+        keep = torch.cat(
+            (
+                torch.ones((1,), dtype=torch.bool, device=path_points.device),
+                torch.linalg.vector_norm(deltas, dim=-1) > self.eps,
+            ),
+            dim=0,
+        )
+        path_points = path_points[keep]
+        if path_points.shape[0] == 1:
+            path_points = torch.cat((path_points, path_points), dim=0)
+        return self._sample_polyline_by_arclength_torch(
+            path_points,
+            n_samples=int(n_samples),
+            eps=self.eps,
+        )
 
     def sample_smooth_edge_curves_xyz(self, cad_domain: Any, curves_uv: torch.Tensor) -> torch.Tensor:
         """Lift UV curves through a differentiable Torch UV-to-XYZ evaluator."""
@@ -729,23 +838,160 @@ class ContinuousVoronoiDecoder(nn.Module):
         aabb_max = torch.maximum(seg_a, seg_b)
         return (seg_a, seg_b, tangents, aabb_min, aabb_max)
 
-    def point_to_segments_distance(self, query_xyz: torch.Tensor, seg_a: torch.Tensor, seg_b: torch.Tensor) -> torch.Tensor:
-        """Return point-to-segment distances for every query/segment pair."""
+    def point_to_segments_distance(
+        self,
+        query_xyz: torch.Tensor,
+        seg_a: torch.Tensor,
+        seg_b: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Calculate distances from every query point to every segment.
+
+        Parameters
+        ----------
+        query_xyz:
+            Tensor with shape [M, 3].
+        seg_a:
+            Segment start points with shape [G, 3].
+        seg_b:
+            Segment end points with shape [G, 3].
+
+        Returns
+        -------
+        torch.Tensor
+            Distance matrix with shape [M, G].
+
+        Notes
+        -----
+        This implementation avoids constructing [M, G, 3] tensors.
+        It is intended mainly for nearest-segment searching, normally
+        under torch.no_grad().
+        """
         if query_xyz.ndim != 2 or query_xyz.shape[-1] != 3:
-            raise ValueError('query_xyz must have shape [M, 3].')
-        if seg_a.ndim != 2 or seg_a.shape[-1] != 3 or seg_b.shape != seg_a.shape:
-            raise ValueError('seg_a and seg_b must have shape [G, 3].')
+            raise ValueError("query_xyz must have shape [M, 3].")
+
+        if (
+            seg_a.ndim != 2
+            or seg_a.shape[-1] != 3
+            or seg_b.shape != seg_a.shape
+        ):
+            raise ValueError("seg_a and seg_b must have shape [G, 3].")
+
         if query_xyz.device != seg_a.device or seg_b.device != seg_a.device:
-            raise ValueError('query_xyz, seg_a, and seg_b must share a device.')
+            raise ValueError(
+                "query_xyz, seg_a, and seg_b must use the same device."
+            )
+
         if query_xyz.dtype != seg_a.dtype or seg_b.dtype != seg_a.dtype:
-            raise ValueError('query_xyz, seg_a, and seg_b must share a dtype.')
+            raise ValueError(
+                "query_xyz, seg_a, and seg_b must use the same dtype."
+            )
+
+        distance_eps = max(float(self.eps), 1e-12)
+
         ab = seg_b - seg_a
-        aq = query_xyz[:, None, :] - seg_a[None, :, :]
-        denom = (ab * ab).sum(dim=-1).clamp_min(self.eps)
-        t = (aq * ab[None, :, :]).sum(dim=-1) / denom[None, :]
-        t = t.clamp(0.0, 1.0)
-        closest = seg_a[None, :, :] + t[..., None] * ab[None, :, :]
-        return torch.linalg.vector_norm(query_xyz[:, None, :] - closest, dim=-1)
+        ab_sq = (ab * ab).sum(dim=-1).clamp_min(distance_eps)
+
+        projection = (
+            query_xyz @ ab.transpose(0, 1)
+            - (seg_a * ab).sum(dim=-1)[None, :]
+        )
+
+        t = (projection / ab_sq[None, :]).clamp(0.0, 1.0)
+
+        q_sq = (query_xyz * query_xyz).sum(
+            dim=-1,
+            keepdim=True,
+        )
+        a_sq = (seg_a * seg_a).sum(dim=-1)[None, :]
+        q_dot_a = query_xyz @ seg_a.transpose(0, 1)
+
+        qa_sq = q_sq + a_sq - 2.0 * q_dot_a
+
+        distance_sq = (
+            qa_sq
+            - 2.0 * t * projection
+            + t.square() * ab_sq[None, :]
+        )
+
+        return torch.sqrt(
+            distance_sq.clamp_min(0.0) + distance_eps
+        )
+
+    def point_to_selected_segments_distance(
+        self,
+        query_xyz: torch.Tensor,
+        seg_a_selected: torch.Tensor,
+        seg_b_selected: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Calculate differentiable distances from each query point to
+        a small set of selected segments.
+
+        Parameters
+        ----------
+        query_xyz:
+            Query points with shape [M, 3].
+        seg_a_selected:
+            Selected segment start points with shape [M, K, 3].
+        seg_b_selected:
+            Selected segment end points with shape [M, K, 3].
+
+        Returns
+        -------
+        torch.Tensor
+            Distances with shape [M, K].
+        """
+        if query_xyz.ndim != 2 or query_xyz.shape[-1] != 3:
+            raise ValueError("query_xyz must have shape [M, 3].")
+
+        if (
+            seg_a_selected.ndim != 3
+            or seg_a_selected.shape[-1] != 3
+            or seg_b_selected.shape != seg_a_selected.shape
+            or seg_a_selected.shape[0] != query_xyz.shape[0]
+        ):
+            raise ValueError(
+                "Selected segment endpoints must have shape [M, K, 3]."
+            )
+
+        if (
+            query_xyz.device != seg_a_selected.device
+            or seg_b_selected.device != seg_a_selected.device
+        ):
+            raise ValueError(
+                "All tensors must use the same device."
+            )
+
+        if (
+            query_xyz.dtype != seg_a_selected.dtype
+            or seg_b_selected.dtype != seg_a_selected.dtype
+        ):
+            raise ValueError(
+                "All tensors must use the same dtype."
+            )
+
+        distance_eps = max(float(self.eps), 1e-12)
+
+        ab = seg_b_selected - seg_a_selected
+        aq = query_xyz[:, None, :] - seg_a_selected
+
+        denominator = (
+            ab * ab
+        ).sum(dim=-1).clamp_min(distance_eps)
+
+        t = (
+            (aq * ab).sum(dim=-1) / denominator
+        ).clamp(0.0, 1.0)
+
+        closest = seg_a_selected + t[..., None] * ab
+        delta = query_xyz[:, None, :] - closest
+
+        distance_sq = (delta * delta).sum(dim=-1)
+
+        return torch.sqrt(
+            distance_sq.clamp_min(0.0) + distance_eps
+        )
 
     def _safe_normalize_fiber(self, fiber: torch.Tensor) -> torch.Tensor:
         default = fiber.new_tensor([1.0, 0.0, 0.0]).expand_as(fiber)
@@ -840,33 +1086,112 @@ class ContinuousVoronoiDecoder(nn.Module):
         tau_density_t = elem_centers_xyz.new_tensor(float(tau_density))
         tau_fiber_t = elem_centers_xyz.new_tensor(float(tau_fiber))
         active_band = radius_tensor + 3.0 * tau_density_t
-        max_cdist_values = 16000000
-        chunk_size = max(1, min(int(elem_centers_xyz.shape[0]), max_cdist_values // max(int(seg_a.shape[0]), 1)))
+        max_pair_values = 100_000
+        segment_block_size = max(1, min(int(seg_a.shape[0]), 256))
+        chunk_size = max(1, min(int(elem_centers_xyz.shape[0]), max_pair_values // segment_block_size))
         distance_chunks = []
         fiber_chunks = []
-        nearest_k = min(int(self.nearest_segment_k), int(seg_a.shape[0]))
+        requested_nearest_k = max(1, int(self.nearest_segment_k))
+        nearest_k = min(requested_nearest_k, int(seg_a.shape[0]))
+        debug_tube_memory = False
+        debug_active_queries = 0
         for start in range(0, int(elem_centers_xyz.shape[0]), chunk_size):
             end = min(start + chunk_size, int(elem_centers_xyz.shape[0]))
             query = elem_centers_xyz[start:end]
             active = torch.ones((query.shape[0],), dtype=torch.bool, device=query.device)
             if self.use_spatial_pruning:
-                below = (aabb_min[None, :, :] - active_band) - query[:, None, :]
-                above = query[:, None, :] - (aabb_max[None, :, :] + active_band)
-                outside_delta = torch.clamp(torch.maximum(below, above), min=0.0)
-                aabb_dist = torch.linalg.vector_norm(outside_delta, dim=-1)
-                active = (aabb_dist <= self.eps).any(dim=1)
+                with torch.no_grad():
+                    query_search = query.detach()
+                    aabb_min_search = aabb_min.detach()
+                    aabb_max_search = aabb_max.detach()
+                    active_band_search = active_band.detach()
+                    active = torch.zeros((query.shape[0],), dtype=torch.bool, device=query.device)
+                    for seg_start in range(0, int(seg_a.shape[0]), segment_block_size):
+                        seg_end = min(seg_start + segment_block_size, int(seg_a.shape[0]))
+                        below = (aabb_min_search[None, seg_start:seg_end, :] - active_band_search) - query_search[:, None, :]
+                        above = query_search[:, None, :] - (aabb_max_search[None, seg_start:seg_end, :] + active_band_search)
+                        outside_delta = torch.clamp(torch.maximum(below, above), min=0.0)
+                        aabb_dist = torch.linalg.vector_norm(outside_delta, dim=-1)
+                        active = active | (aabb_dist <= self.eps).any(dim=1)
+                        del below, above, outside_delta, aabb_dist
             chunk_distance = elem_centers_xyz.new_full((query.shape[0],), float('inf'))
             chunk_fiber = fallback[start:end].clone()
             if bool(active.any()):
                 active_query = query[active]
-                distances = self.point_to_segments_distance(active_query, seg_a, seg_b)
-                nearest_distances, nearest_ids = torch.topk(distances, k=nearest_k, dim=1, largest=False)
+                num_active = int(active_query.shape[0])
+                debug_active_queries += num_active
+
+                with torch.no_grad():
+                    search_query = active_query.detach()
+                    search_seg_a = seg_a.detach()
+                    search_seg_b = seg_b.detach()
+                    search_nearest_distances = active_query.new_full(
+                        (num_active, nearest_k),
+                        float('inf'),
+                    )
+                    nearest_ids = torch.zeros(
+                        (num_active, nearest_k),
+                        dtype=torch.long,
+                        device=active_query.device,
+                    )
+
+                    for seg_start in range(0, int(search_seg_a.shape[0]), segment_block_size):
+                        seg_end = min(seg_start + segment_block_size, int(search_seg_a.shape[0]))
+                        block_search_distances = self.point_to_segments_distance(
+                            search_query,
+                            search_seg_a[seg_start:seg_end],
+                            search_seg_b[seg_start:seg_end],
+                        )
+                        block_k = min(nearest_k, int(block_search_distances.shape[1]))
+                        block_values, block_ids = torch.topk(
+                            block_search_distances,
+                            k=block_k,
+                            dim=1,
+                            largest=False,
+                        )
+                        block_ids = block_ids + seg_start
+                        merged_values = torch.cat((search_nearest_distances, block_values), dim=1)
+                        merged_ids = torch.cat((nearest_ids, block_ids), dim=1)
+                        search_nearest_distances, merge_order = torch.topk(
+                            merged_values,
+                            k=nearest_k,
+                            dim=1,
+                            largest=False,
+                        )
+                        nearest_ids = torch.gather(merged_ids, dim=1, index=merge_order)
+                        del block_search_distances, block_values, block_ids
+                        del merged_values, merged_ids, merge_order
+
+                selected_seg_a = seg_a[nearest_ids]
+                selected_seg_b = seg_b[nearest_ids]
+                nearest_distances = self.point_to_selected_segments_distance(
+                    query_xyz=active_query,
+                    seg_a_selected=selected_seg_a,
+                    seg_b_selected=selected_seg_b,
+                )
                 chunk_distance[active] = nearest_distances[:, 0]
                 fiber_weights = torch.softmax(-nearest_distances / tau_fiber_t, dim=1)
                 nearest_tangents = seg_tangents[nearest_ids]
                 chunk_fiber[active] = (fiber_weights.unsqueeze(-1) * nearest_tangents).sum(dim=1)
             distance_chunks.append(chunk_distance)
             fiber_chunks.append(chunk_fiber)
+        if debug_tube_memory:
+            allocated = reserved = None
+            if torch.cuda.is_available() and elem_centers_xyz.device.type == 'cuda':
+                allocated = torch.cuda.memory_allocated(elem_centers_xyz.device)
+                reserved = torch.cuda.memory_reserved(elem_centers_xyz.device)
+            print(
+                "soft_tube_density_and_fiber_to_elements debug: "
+                f"queries={int(elem_centers_xyz.shape[0])}, "
+                f"active_queries={debug_active_queries}, "
+                f"segments={int(seg_a.shape[0])}, "
+                f"nearest_k={nearest_k}, "
+                f"query_chunk_size={chunk_size}, "
+                f"segment_block_size={segment_block_size}, "
+                f"estimated_search_pair_count={chunk_size * segment_block_size}, "
+                f"gpu_allocated={allocated}, "
+                f"gpu_reserved={reserved}"
+            )
         d_soft = torch.cat(distance_chunks, dim=0)
         occupancy = torch.where(
             torch.isfinite(d_soft),
@@ -1736,6 +2061,194 @@ class ContinuousVoronoiDecoder(nn.Module):
         edge_index = torch.as_tensor(edges_list, dtype=torch.long, device=device).reshape(-1, 2)
         return (edge_index, torch.full((edge_index.shape[0],), 4, dtype=torch.long, device=device), boundary_data)
 
+    def assign_shell_edge_seed_pairs(
+        self,
+        nodes_uv: torch.Tensor,
+        seeds_uv: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_type: torch.Tensor,
+        edge_seed_pairs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Assign each shell edge to its adjacent fixed-topology cell."""
+        if edge_index.numel() == 0 or seeds_uv.shape[0] == 0:
+            return edge_seed_pairs
+
+        assigned_pairs = edge_seed_pairs.clone()
+        shell_ids = torch.nonzero(edge_type == 4, as_tuple=False).flatten()
+        if shell_ids.numel() == 0:
+            return assigned_pairs
+
+        edge_index_cpu = edge_index.detach().cpu()
+        edge_type_cpu = edge_type.detach().cpu()
+        pairs_cpu = edge_seed_pairs.detach().cpu()
+        incident_candidates: dict[int, set[int]] = {}
+        incident_pairs: dict[int, list[tuple[int, int]]] = {}
+        for edge_id, (a_tensor, b_tensor) in enumerate(edge_index_cpu.tolist()):
+            if int(edge_type_cpu[edge_id].item()) == 4:
+                continue
+            pair = pairs_cpu[edge_id].tolist()
+            valid_seeds = {
+                int(seed_id)
+                for seed_id in pair
+                if 0 <= int(seed_id) < int(seeds_uv.shape[0])
+            }
+            if not valid_seeds:
+                continue
+            incident_candidates.setdefault(int(a_tensor), set()).update(valid_seeds)
+            incident_candidates.setdefault(int(b_tensor), set()).update(valid_seeds)
+            pair_tuple = (int(pair[0]), int(pair[1]))
+            incident_pairs.setdefault(int(a_tensor), []).append(pair_tuple)
+            incident_pairs.setdefault(int(b_tensor), []).append(pair_tuple)
+
+        all_seed_ids = list(range(int(seeds_uv.shape[0])))
+        nodes_for_choice = nodes_uv.detach()
+        seeds_for_choice = seeds_uv.detach()
+
+        def choose_owner_from_pair(
+            pair: tuple[int, int],
+            midpoint: torch.Tensor,
+        ) -> int | None:
+            seed_a, seed_b = pair
+            if 0 <= seed_a < int(seeds_uv.shape[0]) and seed_b < 0:
+                return seed_a
+            if 0 <= seed_b < int(seeds_uv.shape[0]) and seed_a < 0:
+                return seed_b
+            if not (
+                0 <= seed_a < int(seeds_uv.shape[0])
+                and 0 <= seed_b < int(seeds_uv.shape[0])
+            ):
+                return None
+            point_a = seeds_for_choice[seed_a]
+            point_b = seeds_for_choice[seed_b]
+            dist_a = ((midpoint - point_a) * (midpoint - point_a)).sum()
+            dist_b = ((midpoint - point_b) * (midpoint - point_b)).sum()
+            return seed_a if bool((dist_a <= dist_b).detach().cpu().item()) else seed_b
+
+        for shell_id_tensor in shell_ids:
+            shell_id = int(shell_id_tensor.detach().cpu().item())
+            node_a = int(edge_index_cpu[shell_id, 0].item())
+            node_b = int(edge_index_cpu[shell_id, 1].item())
+            candidates_a = incident_candidates.get(node_a, set())
+            candidates_b = incident_candidates.get(node_b, set())
+            candidates = candidates_a | candidates_b
+            if not candidates:
+                candidates = set(all_seed_ids)
+            if not candidates:
+                continue
+            midpoint = 0.5 * (nodes_for_choice[node_a] + nodes_for_choice[node_b])
+            owner: int | None = None
+            common = sorted(candidates_a & candidates_b)
+            if common:
+                owner = common[0]
+            if owner is None:
+                for pair in incident_pairs.get(node_a, []) + incident_pairs.get(node_b, []):
+                    owner = choose_owner_from_pair(pair, midpoint)
+                    if owner is not None and owner in candidates:
+                        break
+                    owner = None
+            if owner is None:
+                owner = sorted(candidates)[0]
+            assigned_pairs[shell_id, 0] = int(owner)
+            assigned_pairs[shell_id, 1] = -1
+
+        return assigned_pairs
+
+    def build_cell_boundary_metadata(
+        self,
+        edge_index: torch.Tensor,
+        edge_seed_pairs: torch.Tensor,
+        edge_type: torch.Tensor,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor]:
+        """Build fixed topological edge order for each seed cell."""
+        device = edge_index.device
+        if edge_index.numel() == 0 or edge_seed_pairs.numel() == 0:
+            return ([], [], torch.empty((0,), dtype=torch.long, device=device))
+
+        geometry_types = {0, 1, 3, 4}
+        edge_index_cpu = edge_index.detach().cpu()
+        pairs_cpu = edge_seed_pairs.detach().cpu()
+        edge_type_cpu = edge_type.detach().cpu()
+
+        cell_ids = sorted(
+            {
+                int(seed_id)
+                for pair in pairs_cpu.tolist()
+                for seed_id in pair
+                if int(seed_id) >= 0
+            }
+        )
+        boundary_indices: list[torch.Tensor] = []
+        boundary_directions: list[torch.Tensor] = []
+        boundary_seed_ids: list[int] = []
+
+        for cell_id in cell_ids:
+            cell_edge_ids = [
+                edge_id
+                for edge_id, pair in enumerate(pairs_cpu.tolist())
+                if (
+                    int(edge_type_cpu[edge_id].item()) in geometry_types
+                    and cell_id in (int(pair[0]), int(pair[1]))
+                )
+            ]
+            if not cell_edge_ids:
+                continue
+
+            adjacency: dict[int, list[tuple[int, int, int]]] = {}
+            for edge_id in cell_edge_ids:
+                a = int(edge_index_cpu[edge_id, 0].item())
+                b = int(edge_index_cpu[edge_id, 1].item())
+                adjacency.setdefault(a, []).append((edge_id, b, 1))
+                adjacency.setdefault(b, []).append((edge_id, a, -1))
+
+            starts = sorted(
+                adjacency,
+                key=lambda node_id: (len(adjacency[node_id]) != 1, node_id),
+            )
+            unused = set(cell_edge_ids)
+            ordered_edges: list[int] = []
+            ordered_dirs: list[int] = []
+
+            while unused:
+                current = next(
+                    (
+                        node_id
+                        for node_id in starts
+                        if any(edge_id in unused for edge_id, _, _ in adjacency[node_id])
+                    ),
+                    None,
+                )
+                if current is None:
+                    break
+
+                while True:
+                    choices = [
+                        item
+                        for item in adjacency.get(current, [])
+                        if item[0] in unused
+                    ]
+                    if not choices:
+                        break
+                    edge_id, other, direction = choices[0]
+                    unused.remove(edge_id)
+                    ordered_edges.append(edge_id)
+                    ordered_dirs.append(direction)
+                    current = other
+
+            if ordered_edges:
+                boundary_seed_ids.append(cell_id)
+                boundary_indices.append(
+                    torch.as_tensor(ordered_edges, dtype=torch.long, device=device)
+                )
+                boundary_directions.append(
+                    torch.as_tensor(ordered_dirs, dtype=torch.long, device=device)
+                )
+
+        return (
+            boundary_indices,
+            boundary_directions,
+            torch.as_tensor(boundary_seed_ids, dtype=torch.long, device=device),
+        )
+
     def differentiable_vertices_from_triples(self, seeds_uv: torch.Tensor, triples: torch.Tensor, u_periodic: bool=False, v_periodic: bool=False) -> torch.Tensor:
         """
                 Recompute SciPy-selected vertices using differentiable PyTorch circumcenter.
@@ -1819,13 +2332,29 @@ class ContinuousVoronoiDecoder(nn.Module):
         edge_type = torch.cat((topo['edge_type'], loop_edge_type), dim=0)
         loop_seed_pairs = torch.full((loop_edges.shape[0], 2), -1, dtype=torch.long, device=seeds_uv.device)
         edge_seed_pairs = torch.cat((topo['edge_seed_pairs'], loop_seed_pairs), dim=0)
+        edge_seed_pairs = self.assign_shell_edge_seed_pairs(
+            nodes_uv=vertices_uv,
+            seeds_uv=seeds_uv,
+            edge_index=edges,
+            edge_type=edge_type,
+            edge_seed_pairs=edge_seed_pairs,
+        )
+        (
+            cell_boundary_edge_indices,
+            cell_boundary_edge_directions,
+            cell_boundary_seed_ids,
+        ) = self.build_cell_boundary_metadata(
+            edge_index=edges,
+            edge_seed_pairs=edge_seed_pairs,
+            edge_type=edge_type,
+        )
         diagnostics = dict(topo['diagnostics'])
         diagnostics.update({'num_final_nodes': int(vertices_uv.shape[0]), 'num_final_edges': int(edges.shape[0])})
         topo['diagnostics'] = diagnostics
         active_interior = topo['vertex_type'] == 0
         num_interior = int(active_interior.sum().item())
         num_boundary = int((topo['vertex_type'] == 1).sum().item())
-        graph = {'nodes_uv': vertices_uv, 'node_type': topo['vertex_type'], 'edge_index': edges, 'edge_seed_pair': edge_seed_pairs, 'edge_type': edge_type, 'boundary_source_type': topo['boundary_source_type'], 'boundary_source_name': [{0: 'interior', 5: 'domain_boundary_intersection', 6: 'domain_shell_node'}.get(int(value), 'unknown') for value in topo['boundary_source_type'].detach().cpu().tolist()], 'diagnostics': topo['diagnostics'], 'num_interior_nodes': num_interior, 'num_boundary_nodes': num_boundary}
+        graph = {'nodes_uv': vertices_uv, 'node_type': topo['vertex_type'], 'edge_index': edges, 'edge_seed_pair': edge_seed_pairs, 'edge_type': edge_type, 'cell_boundary_edge_indices': cell_boundary_edge_indices, 'cell_boundary_edge_directions': cell_boundary_edge_directions, 'cell_boundary_seed_ids': cell_boundary_seed_ids, 'boundary_source_type': topo['boundary_source_type'], 'boundary_source_name': [{0: 'interior', 5: 'domain_boundary_intersection', 6: 'domain_shell_node'}.get(int(value), 'unknown') for value in topo['boundary_source_type'].detach().cpu().tolist()], 'diagnostics': topo['diagnostics'], 'num_interior_nodes': num_interior, 'num_boundary_nodes': num_boundary}
         for key in ('node_trim_curve_piece', 'node_trim_curve_segment', 'node_trim_curve_fraction', 'node_trim_segment_uv'):
             if key in topo:
                 graph[key] = topo[key]
@@ -1844,6 +2373,15 @@ class ContinuousVoronoiDecoder(nn.Module):
             if bool(valid_pair_mask.any().detach().cpu().item()):
                 original_pairs[valid_pair_mask] = seed_active_ids[local_pairs[valid_pair_mask]]
             graph['edge_seed_pair_original'] = original_pairs
+        local_cell_ids = graph.get('cell_boundary_seed_ids')
+        if isinstance(local_cell_ids, torch.Tensor):
+            valid_cell_mask = local_cell_ids >= 0
+            original_cell_ids = torch.full_like(local_cell_ids, -1)
+            if bool(valid_cell_mask.any().detach().cpu().item()):
+                original_cell_ids[valid_cell_mask] = seed_active_ids[
+                    local_cell_ids[valid_cell_mask]
+                ]
+            graph['cell_boundary_seed_ids_original'] = original_cell_ids
         local_triples_for_original = topo['vertex_seed_triples']
         valid_triple_mask = local_triples_for_original >= 0
         vertex_seed_triples_original = torch.full_like(local_triples_for_original, -1)

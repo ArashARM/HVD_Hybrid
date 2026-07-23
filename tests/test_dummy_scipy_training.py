@@ -7,6 +7,7 @@ from Decoder_CLasses.ContinuousVoronoiDecoder import ContinuousVoronoiDecoder
 import Training.MainTrain as main_train
 from Training.MainTrain import (
     NN_Trainer,
+    RunningNorm,
     TrainingConfig,
     build_edge_type_mask,
     build_shared_curve_geometry,
@@ -40,6 +41,15 @@ def test_training_config_normalizes_single_item_numeric_tuples() -> None:
     cfg = TrainingConfig(cell_angle_eps=(1e-7,))
 
     assert cfg.cell_angle_eps == 1e-7
+
+
+def test_running_norm_does_not_amplify_small_losses() -> None:
+    norm = RunningNorm(momentum=0.5)
+
+    assert norm.update(0.0) == 1.0
+    assert norm.update(1e-4) == 1.0
+    assert norm.update(float("nan")) == 1.0
+    assert norm.update(10.0) > 1.0
 
 
 def test_resolve_edge_types_in_losses_modes() -> None:
@@ -355,6 +365,140 @@ def test_cell_edge_uniformity_excludes_shell_edges_even_in_all_mode() -> None:
     loss = trainer.cell_edge_uniformity_loss(build_shared_curve_geometry(decoder_out))
 
     assert torch.allclose(loss, edge_curves_xyz.new_zeros(()))
+
+
+def test_cell_edge_uniformity_can_include_shell_edges_in_length_loss() -> None:
+    trainer = NN_Trainer.__new__(NN_Trainer)
+    trainer.cfg = TrainingConfig(
+        Edge_in_losses="all",
+        lam_cell_angle_uniform=0.0,
+        lam_cell_radial_uniform=0.0,
+        include_shell_in_length_loss=True,
+    )
+    edge_curves_xyz = torch.tensor(
+        [
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [50.0, 0.0, 0.0]],
+        ],
+        dtype=torch.double,
+        requires_grad=True,
+    )
+    decoder_out = {
+        "edge_curves_xyz": edge_curves_xyz,
+        "graph": {
+            "edge_type": torch.tensor([0, 1, 4], dtype=torch.long),
+            "edge_seed_pair": torch.tensor([[0, 1], [0, 2], [0, -1]], dtype=torch.long),
+        },
+    }
+
+    loss = trainer.cell_edge_uniformity_loss(build_shared_curve_geometry(decoder_out))
+
+    assert loss > edge_curves_xyz.new_zeros(())
+
+
+def test_cell_radial_loss_is_stable_across_shell_sample_counts() -> None:
+    trainer = NN_Trainer.__new__(NN_Trainer)
+    trainer.cfg = TrainingConfig(
+        lam_cell_edge_uniform=0.0,
+        lam_cell_angle_uniform=0.0,
+        lam_cell_radial_uniform=1.0,
+    )
+
+    def line(a: tuple[float, float], b: tuple[float, float], n: int) -> torch.Tensor:
+        t = torch.linspace(0.0, 1.0, n, dtype=torch.float64).unsqueeze(-1)
+        start = torch.tensor([a[0], a[1], 0.0], dtype=torch.float64)
+        end = torch.tensor([b[0], b[1], 0.0], dtype=torch.float64)
+        return (1.0 - t) * start + t * end
+
+    losses = []
+    for sample_count in (8, 16, 32):
+        edge_curves_xyz = torch.stack(
+            (
+                line((0.0, 0.0), (2.0, 0.0), sample_count),
+                line((2.0, 0.0), (2.0, 1.0), sample_count),
+                line((2.0, 1.0), (0.0, 1.0), sample_count),
+                line((0.0, 1.0), (0.0, 0.0), sample_count),
+            ),
+            dim=0,
+        ).requires_grad_(True)
+        decoder_out = {
+            "edge_curves_xyz": edge_curves_xyz,
+            "graph": {
+                "edge_type": torch.tensor([4, 1, 1, 1], dtype=torch.long),
+                "edge_seed_pair": torch.tensor([[0, -1], [0, -1], [0, -1], [0, -1]], dtype=torch.long),
+                "cell_boundary_edge_indices": [torch.tensor([0, 1, 2, 3], dtype=torch.long)],
+                "cell_boundary_edge_directions": [torch.tensor([1, 1, 1, 1], dtype=torch.long)],
+                "cell_boundary_seed_ids": torch.tensor([0], dtype=torch.long),
+            },
+        }
+        losses.append(
+            trainer.cell_edge_uniformity_loss(build_shared_curve_geometry(decoder_out)).detach()
+        )
+
+    assert torch.allclose(losses[0], losses[1], rtol=5e-2, atol=5e-3)
+    assert torch.allclose(losses[1], losses[2], rtol=5e-2, atol=5e-3)
+
+
+def test_interior_shell_samples_are_not_angle_corners() -> None:
+    trainer = NN_Trainer.__new__(NN_Trainer)
+    trainer.cfg = TrainingConfig(
+        lam_cell_edge_uniform=0.0,
+        lam_cell_angle_uniform=1.0,
+        lam_cell_radial_uniform=0.0,
+    )
+
+    def fixture(shell_mid_y: float) -> dict:
+        shell = torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [0.25, 0.0, 0.0],
+                [0.50, shell_mid_y, 0.0],
+                [0.75, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+            ],
+            dtype=torch.float64,
+        )
+        right = torch.tensor(
+            [
+                [1.0, 0.0, 0.0],
+                [0.5, 1.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ],
+            dtype=torch.float64,
+        )
+        left = torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [0.5, 1.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+            ],
+            dtype=torch.float64,
+        )
+        edge_curves_xyz = torch.stack((shell, right, left), dim=0).requires_grad_(True)
+        return {
+            "edge_curves_xyz": edge_curves_xyz,
+            "graph": {
+                "edge_type": torch.tensor([4, 1, 1], dtype=torch.long),
+                "edge_seed_pair": torch.tensor([[0, -1], [0, -1], [0, -1]], dtype=torch.long),
+                "cell_boundary_edge_indices": [torch.tensor([0, 1, 2], dtype=torch.long)],
+                "cell_boundary_edge_directions": [torch.tensor([1, 1, 1], dtype=torch.long)],
+                "cell_boundary_seed_ids": torch.tensor([0], dtype=torch.long),
+            },
+        }
+
+    loss_a = trainer.cell_edge_uniformity_loss(
+        build_shared_curve_geometry(fixture(0.6))
+    )
+    loss_b = trainer.cell_edge_uniformity_loss(
+        build_shared_curve_geometry(fixture(-0.6))
+    )
+
+    assert torch.allclose(loss_a, loss_b, rtol=1e-10, atol=1e-10)
 
 
 def test_compute_all_edge_curve_lengths_gradcheck() -> None:
@@ -762,6 +906,73 @@ def test_square_boundary_edge_sampling_uses_boundary_support() -> None:
             | torch.isclose(curve[:, 1], torch.ones_like(curve[:, 1]), atol=1e-5)
         )
         assert on_boundary.all()
+
+
+def test_cad_boundary_edge_sampling_retains_endpoint_gradients() -> None:
+    decoder = make_decoder(return_xyz=False)
+    dtype = torch.float64
+    graph = {
+        "boundary_curve_uv": torch.tensor(
+            [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]],
+            dtype=dtype,
+        ),
+        "boundary_curve_offsets": torch.tensor([0, 2, 3, 4, 5], dtype=torch.long),
+        "boundary_curve_loop_id": torch.zeros((4,), dtype=torch.long),
+    }
+    p0 = torch.tensor([0.0, 0.2], dtype=dtype, requires_grad=True)
+    p1 = torch.tensor([0.7, 0.0], dtype=dtype, requires_grad=True)
+
+    curve = decoder.sample_cad_boundary_edge_uv(p0, p1, graph=graph, n_samples=17)
+
+    assert curve is not None
+    assert curve.requires_grad
+    assert torch.isfinite(curve).all()
+    curve.square().sum().backward()
+    assert p0.grad is not None
+    assert p1.grad is not None
+    assert torch.isfinite(p0.grad).all()
+    assert torch.isfinite(p1.grad).all()
+
+
+def test_cad_boundary_edge_sampling_matches_endpoint_finite_difference() -> None:
+    decoder = make_decoder(return_xyz=False)
+    dtype = torch.float64
+    graph = {
+        "boundary_curve_uv": torch.tensor(
+            [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]],
+            dtype=dtype,
+        ),
+        "boundary_curve_offsets": torch.tensor([0, 2, 3, 4, 5], dtype=torch.long),
+        "boundary_curve_loop_id": torch.zeros((4,), dtype=torch.long),
+    }
+
+    p0 = torch.tensor([0.0, 0.25], dtype=dtype, requires_grad=True)
+    p1 = torch.tensor([0.75, 0.0], dtype=dtype, requires_grad=True)
+    curve = decoder.sample_cad_boundary_edge_uv(p0, p1, graph=graph, n_samples=19)
+    assert curve is not None
+    objective = (curve[:, 0].square() + 0.25 * curve[:, 1].square()).sum()
+    objective.backward()
+    autograd_value = p0.grad[1].detach()
+
+    delta = torch.tensor(1e-6, dtype=dtype)
+
+    def eval_at(value: torch.Tensor) -> torch.Tensor:
+        point = torch.stack((p0.detach()[0], value))
+        sampled = decoder.sample_cad_boundary_edge_uv(
+            point,
+            p1.detach(),
+            graph=graph,
+            n_samples=19,
+        )
+        assert sampled is not None
+        return (sampled[:, 0].square() + 0.25 * sampled[:, 1].square()).sum()
+
+    finite_difference = (
+        eval_at(p0.detach()[1] + delta)
+        - eval_at(p0.detach()[1] - delta)
+    ) / (2.0 * delta)
+
+    assert torch.allclose(autograd_value, finite_difference, rtol=5e-4, atol=5e-5)
 
 
 def test_graph_edge_curve_sampling_dispatches_only_shell_edges_to_boundary_support() -> None:

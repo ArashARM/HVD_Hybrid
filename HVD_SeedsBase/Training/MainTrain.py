@@ -109,6 +109,12 @@ CELL_GEOMETRY_EDGE_TYPES = (
     EDGE_INTERIOR_VORONOI,
     EDGE_CLIPPED_ONE_SIDE,
     EDGE_CLIPPED_TWO_SIDE,
+    EDGE_DOMAIN_SHELL,
+)
+CELL_LENGTH_EDGE_TYPES = (
+    EDGE_INTERIOR_VORONOI,
+    EDGE_CLIPPED_ONE_SIDE,
+    EDGE_CLIPPED_TWO_SIDE,
 )
 
 
@@ -192,6 +198,9 @@ class SharedCurveGeometry:
     finite_edge_mask: torch.Tensor
     edge_type: torch.Tensor
     edge_seed_pair: torch.Tensor | None
+    cell_boundary_edge_indices: list[torch.Tensor] | None = None
+    cell_boundary_edge_directions: list[torch.Tensor] | None = None
+    cell_boundary_seed_ids: torch.Tensor | None = None
 
 
 def build_shared_curve_geometry(
@@ -216,6 +225,16 @@ def build_shared_curve_geometry(
             "edge_seed_pair_original",
             graph.get("edge_seed_pair", None),
         )
+        cell_boundary_edge_indices = graph.get("cell_boundary_edge_indices", None)
+        cell_boundary_edge_directions = graph.get("cell_boundary_edge_directions", None)
+        cell_boundary_seed_ids = graph.get(
+            "cell_boundary_seed_ids_original",
+            graph.get("cell_boundary_seed_ids", None),
+        )
+    else:
+        cell_boundary_edge_indices = None
+        cell_boundary_edge_directions = None
+        cell_boundary_seed_ids = None
 
     if edge_type is None:
         if require_edge_type:
@@ -265,6 +284,9 @@ def build_shared_curve_geometry(
         finite_edge_mask=finite_edge_mask,
         edge_type=edge_type,
         edge_seed_pair=edge_seed_pair,
+        cell_boundary_edge_indices=cell_boundary_edge_indices,
+        cell_boundary_edge_directions=cell_boundary_edge_directions,
+        cell_boundary_seed_ids=cell_boundary_seed_ids,
     )
 
 
@@ -382,6 +404,7 @@ class TrainingConfig:
     lam_cell_edge_uniform: float = 1.0
     lam_cell_angle_uniform: float = 1.0
     lam_cell_radial_uniform: float = 0.5
+    include_shell_in_length_loss: bool = False
 
     comp_normalize_by: float | None = 1e10
     normalize_losses: bool = True
@@ -818,22 +841,31 @@ def apply_density_postprocess_to_output(
 
 
 class RunningNorm:
-    def __init__(self, momentum: float = 0.99, eps: float = 1e-12):
+    def __init__(
+        self,
+        momentum: float = 0.99,
+        eps: float = 1e-12,
+        min_scale: float = 1.0,
+    ):
         self.val = None
         self.momentum = momentum
         self.eps = eps
+        self.min_scale = min_scale
 
     def update(self, x: float) -> float:
         x = abs(float(x))
         if not math.isfinite(x):
-            return max(self.val if self.val is not None else 1.0, 1e-8)
+            return max(self.val if self.val is not None else self.min_scale, self.min_scale)
+
+        if x <= self.min_scale:
+            return max(self.val if self.val is not None else self.min_scale, self.min_scale)
 
         x = x + self.eps
         if self.val is None:
             self.val = x
         else:
             self.val = self.momentum * self.val + (1.0 - self.momentum) * x
-        return max(self.val, 1e-8)
+        return max(self.val, self.min_scale)
 
 
 def _cpu_detached_tree(value):
@@ -1892,12 +1924,10 @@ class NN_Trainer:
         finite_curves = torch.isfinite(curves).all(dim=(1, 2))
         finite_lengths = curve_geometry.finite_edge_mask
 
-        selected_loss_types = resolve_edge_types_in_losses(cfg.Edge_in_losses)
-        cell_length_types = tuple(
-            edge_type_value
-            for edge_type_value in selected_loss_types
-            if edge_type_value in CELL_GEOMETRY_EDGE_TYPES
-        )
+        if bool(getattr(cfg, "include_shell_in_length_loss", False)):
+            cell_length_types = CELL_GEOMETRY_EDGE_TYPES
+        else:
+            cell_length_types = CELL_LENGTH_EDGE_TYPES
         loss_edge_type_mask = build_edge_type_mask(
             edge_type,
             cell_length_types,
@@ -1908,8 +1938,8 @@ class NN_Trainer:
         )
 
         # Edges associated with at least one valid seed cell. Cell polygon
-        # reconstruction uses all valid Voronoi-derived edges (0, 1, 3),
-        # while the scalar length component uses Edge_in_losses.
+        # reconstruction uses all valid geometry edges (0, 1, 3, 4), while
+        # the scalar length component uses CELL_LENGTH_EDGE_TYPES by default.
         base_cell_mask = (
             finite_curves
             & finite_lengths
@@ -2005,7 +2035,12 @@ class NN_Trainer:
 
             return vertices.index_select(0, order)
 
-        def polygon_angle_loss(vertices):
+        def safe_normalize(x):
+            return x / torch.sqrt(
+                (x * x).sum(dim=-1, keepdim=True) + angle_eps
+            )
+
+        def polygon_angle_loss(vertices, true_corner_mask=None):
             if vertices is None or vertices.shape[0] < 3:
                 return None
 
@@ -2015,8 +2050,8 @@ class NN_Trainer:
             vector_a = previous - vertices
             vector_b = following - vertices
 
-            norm_a = torch.linalg.vector_norm(vector_a, dim=1)
-            norm_b = torch.linalg.vector_norm(vector_b, dim=1)
+            norm_a = torch.sqrt((vector_a * vector_a).sum(dim=1) + angle_eps)
+            norm_b = torch.sqrt((vector_b * vector_b).sum(dim=1) + angle_eps)
 
             valid = (
                 torch.isfinite(norm_a)
@@ -2024,32 +2059,49 @@ class NN_Trainer:
                 & (norm_a > angle_eps)
                 & (norm_b > angle_eps)
             )
+            if true_corner_mask is not None:
+                true_corner_mask = true_corner_mask.to(
+                    device=vertices.device,
+                    dtype=torch.bool,
+                )
+                if true_corner_mask.shape[0] == valid.shape[0]:
+                    valid = valid & true_corner_mask
 
             if int(valid.detach().sum().item()) < 3:
                 return None
 
             cosine = (
-                vector_a[valid] * vector_b[valid]
-            ).sum(dim=1) / (
-                norm_a[valid] * norm_b[valid]
-            ).clamp_min(angle_eps)
+                safe_normalize(vector_a[valid])
+                * safe_normalize(vector_b[valid])
+            ).sum(dim=1).clamp(-1.0 + 1e-6, 1.0 - 1e-6)
 
-            angles = torch.acos(
-                cosine.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
-            )
-
-            mean_angle = angles.mean().clamp_min(angle_eps)
+            mean_cosine = cosine.mean()
+            scale = mean_cosine.abs().clamp_min(angle_eps)
 
             return (
-                angles.var(unbiased=False)
-                / mean_angle.square()
+                cosine.var(unbiased=False)
+                / scale.square()
             )
 
-        def polygon_radial_loss(vertices):
+        def polygon_radial_loss(vertices, vertex_weights=None):
             if vertices is None or vertices.shape[0] < 3:
                 return None
 
-            center = vertices.mean(dim=0)
+            if vertex_weights is not None:
+                vertex_weights = vertex_weights.to(
+                    device=vertices.device,
+                    dtype=vertices.dtype,
+                ).reshape(-1)
+                if vertex_weights.shape[0] != vertices.shape[0]:
+                    vertex_weights = None
+
+            if vertex_weights is None:
+                center = vertices.mean(dim=0)
+            else:
+                weight_sum = vertex_weights.sum().clamp_min(eps)
+                center = (
+                    vertex_weights.unsqueeze(-1) * vertices
+                ).sum(dim=0) / weight_sum
 
             radial = torch.linalg.vector_norm(
                 vertices - center,
@@ -2065,12 +2117,120 @@ class NN_Trainer:
                 return None
 
             radial = radial[valid]
-            mean_radial = radial.mean().clamp_min(eps)
+            if vertex_weights is None:
+                weights = torch.ones_like(radial)
+            else:
+                weights = vertex_weights[valid].clamp_min(0.0)
+            weight_sum = weights.sum().clamp_min(eps)
+            mean_radial = (
+                weights * radial
+            ).sum().div(weight_sum).clamp_min(eps)
 
             return (
-                radial.var(unbiased=False)
+                (
+                    weights
+                    * (radial - mean_radial).square()
+                ).sum()
+                / weight_sum
                 / mean_radial.square()
             )
+
+        def ordered_cell_boundary(cell_id: int):
+            indices_by_cell = curve_geometry.cell_boundary_edge_indices
+            directions_by_cell = curve_geometry.cell_boundary_edge_directions
+            seed_ids = curve_geometry.cell_boundary_seed_ids
+            num_shell_samples = 8
+            if (
+                indices_by_cell is None
+                or directions_by_cell is None
+                or seed_ids is None
+            ):
+                return None, None, None
+
+            seed_ids = torch.as_tensor(
+                seed_ids,
+                dtype=torch.long,
+                device=curves.device,
+            ).reshape(-1)
+            matches = torch.nonzero(seed_ids == cell_id, as_tuple=False).flatten()
+            if matches.numel() == 0:
+                return None, None, None
+
+            boundary_id = int(matches[0].detach().item())
+            edge_indices = indices_by_cell[boundary_id].to(
+                device=curves.device,
+                dtype=torch.long,
+            )
+            edge_directions = directions_by_cell[boundary_id].to(
+                device=curves.device,
+                dtype=torch.long,
+            )
+            if edge_indices.numel() == 0:
+                return None, None, None
+
+            parts = []
+            corner_masks = []
+
+            def fixed_shell_samples(edge_points):
+                if edge_points.shape[0] == num_shell_samples:
+                    return edge_points
+                if edge_points.shape[0] < 2:
+                    return edge_points
+                t = torch.linspace(
+                    0.0,
+                    1.0,
+                    num_shell_samples,
+                    dtype=edge_points.dtype,
+                    device=edge_points.device,
+                )
+                scaled = t * float(edge_points.shape[0] - 1)
+                left = torch.floor(scaled).to(dtype=torch.long)
+                right = torch.clamp(left + 1, max=edge_points.shape[0] - 1)
+                alpha = (scaled - left.to(dtype=edge_points.dtype)).unsqueeze(-1)
+                return (
+                    (1.0 - alpha) * edge_points.index_select(0, left)
+                    + alpha * edge_points.index_select(0, right)
+                )
+
+            for local_index in range(int(edge_indices.numel())):
+                edge_index_value = int(edge_indices[local_index].detach().item())
+                if edge_index_value < 0 or edge_index_value >= curves.shape[0]:
+                    continue
+                edge_points = curves[edge_index_value]
+                if edge_points.shape[0] < 2:
+                    continue
+                if int(edge_directions[local_index].detach().item()) < 0:
+                    edge_points = edge_points.flip(0)
+                if int(edge_type[edge_index_value].detach().item()) == EDGE_DOMAIN_SHELL:
+                    edge_points = fixed_shell_samples(edge_points)
+                edge_points = edge_points[:-1]
+                if edge_points.shape[0] == 0:
+                    continue
+                is_corner = torch.zeros(
+                    edge_points.shape[0],
+                    dtype=torch.bool,
+                    device=curves.device,
+                )
+                is_corner[0] = True
+                parts.append(edge_points)
+                corner_masks.append(is_corner)
+
+            if not parts:
+                return None, None, None
+
+            boundary_points = torch.cat(parts, dim=0)
+            true_corners = torch.cat(corner_masks, dim=0)
+            next_points = torch.roll(boundary_points, shifts=-1, dims=0)
+            segment_lengths = torch.linalg.vector_norm(
+                next_points - boundary_points,
+                dim=-1,
+            )
+            vertex_weights = 0.5 * (
+                segment_lengths
+                + torch.roll(segment_lengths, shifts=1, dims=0)
+            )
+
+            return boundary_points, true_corners, vertex_weights
 
         cell_ids = torch.unique(pairs[base_cell_mask])
         cell_ids = cell_ids[cell_ids >= 0]
@@ -2114,10 +2274,49 @@ class NN_Trainer:
                 has_component = True
 
             # Reconstruct the complete cell polygon using all valid cell edges,
-            # not only the selected equal-length edge types.
-            cell_curves = curves[belongs_geometry]
+            # not only the selected equal-length edge types. Prefer the
+            # topology-provided order so shell samples stay on the cell
+            # boundary without differentiable hard sorting.
+            ordered_boundary_result = ordered_cell_boundary(cell_id)
+            ordered_boundary, true_corner_mask, radial_weights = (
+                ordered_boundary_result
+                if ordered_boundary_result[0] is not None
+                else (None, None, None)
+            )
 
-            if cell_curves.shape[0] > 0:
+            if ordered_boundary is not None and ordered_boundary.shape[0] >= 3:
+                if lam_angle != 0.0:
+                    angle_loss = polygon_angle_loss(
+                        ordered_boundary,
+                        true_corner_mask,
+                    )
+
+                    if angle_loss is not None:
+                        cell_loss = (
+                            cell_loss
+                            + lam_angle * angle_loss
+                        )
+                        has_component = True
+
+                if lam_radial != 0.0:
+                    radial_loss = polygon_radial_loss(
+                        ordered_boundary,
+                        radial_weights,
+                    )
+
+                    if radial_loss is not None:
+                        cell_loss = (
+                            cell_loss
+                            + lam_radial * radial_loss
+                        )
+                        has_component = True
+
+            else:
+                cell_curves = curves[belongs_geometry]
+
+                if cell_curves.shape[0] == 0:
+                    continue
+
                 endpoints = torch.cat(
                     (
                         cell_curves[:, 0, :],
@@ -6466,9 +6665,21 @@ class NN_Trainer:
             timelapse_output_folder = getattr(cfg, "timelapse_output_folder", None)
             if timelapse_output_folder:
                 timelapse_output_folder = os.path.normpath(str(timelapse_output_folder))
-                os.makedirs(timelapse_output_folder, exist_ok=True)
+
+                base_folder = timelapse_output_folder
+                counter = 1
+
+                while os.path.exists(timelapse_output_folder):
+                    timelapse_output_folder = f"{base_folder}{counter}"
+                    counter += 1
+
+                os.makedirs(timelapse_output_folder)
+
                 frame_out_dir = os.path.join(timelapse_output_folder, "timelapse_frames")
-                video_path = os.path.join(timelapse_output_folder, case_name + "_timelapse.avi")
+                video_path = os.path.join(
+                    timelapse_output_folder,
+                    case_name + "_timelapse.avi"
+                )
             else:
                 frame_out_dir = "timelapse_frames"
                 video_path = case_name + "_timelapse.avi"
@@ -7124,6 +7335,8 @@ class NN_Trainer:
                 loss_comp = fem_out["compliance_loss"]
                 comp_val = fem_out["comp"]
                 fem_is_valid = bool(fem_out["fem_valid"])
+                if(cfg.lam_fem != 0.0 and not cfg.generate_decoder_density_fiber):
+                    fem_is_valid = "-"
                 fem_failure_reason = fem_out["failure_reason"]
                 fem_density_field = fem_out.get("density_field", None)
                 fem_stress_field = fem_out.get("stress_field", None)
@@ -7766,13 +7979,13 @@ class NN_Trainer:
                             f"L_total={row['L_total']:.4e} | "
                             f"L_vol={row['loss_vol']:.3e} "
                             f"L_fem={row['loss_fem']:.3e} "
+                            f"L_dwcvt={row['loss_density_weighted_cvt']:.3e} "
+                            f"L_curve={row['loss_curve_length']:.3e} "
+                            f"L_cell_edge={row['loss_cell_edge_uniform']:.3e} "
                             f"L_rep={row['loss_rep']:.3e} "
                             f"L_bnd={row['loss_bnd']:.3e} "
-                            f"L_dwcvt={row['loss_density_weighted_cvt']:.3e} "
-                            f"L_seed_active={row['loss_seed_active']:.3e} "
-                            f"L_curve={row['loss_curve_length']:.3e} "
-                            f"L(min/max/mean/ratio)={row['curve_length_min']:.3e}/{row['curve_length_max']:.3e}/{row['curve_length_mean']:.3e}/{row['curve_length_ratio']:.2f} "
-                            f"L_cell_edge={row['loss_cell_edge_uniform']:.3e} |"
+                            f"L_seed_active={row['loss_seed_active']:.3e} |"
+                            f"L(min/max/mean/ratio)={row['curve_length_min']:.3e}/{row['curve_length_max']:.3e}/{row['curve_length_mean']:.3e}/{row['curve_length_ratio']:.2f} |"
                             f"VolFrac={row['VolFrac']:.3f} "
                             f"(/{cfg.target_volfrac:.3f}) "
                             f"os={row['seed_offset_scale']:.2e} "
@@ -7782,7 +7995,7 @@ class NN_Trainer:
                             f"rho(min/mean/max)={rho_min:.3f}/{rho_mean:.3f}/{rho_max:.3f} "
                             f"Δrho={drho:.2e} Δseed={dseed:.2e} "
                             f"dmin={min_seed_dist:.2e} grad_mean={g_mean:.2e} | "
-                                                        f"Filter Δrho mean={row['filter_delta_mean']:.2e} "
+                            f"Filter Δrho mean={row['filter_delta_mean']:.2e} "
                             f"Filter Δrho max={row['filter_delta_max']:.2e} "
                             f"Projection Δrho mean={row['projection_delta_mean']:.2e} "
                             f"Projection Δrho max={row['projection_delta_max']:.2e} | "
@@ -7791,7 +8004,6 @@ class NN_Trainer:
                             f"rho_final_mean={row['rho_final_mean']:.3f} | "
                             f"fem={fem_status} | "
                             f"best={best_score:.4e}@{best_step} | "
-                            f"best_hard={best_hard_score:.4e}@{best_hard_step}"
                         )
 
                     rep_value = float(row["loss_rep"])

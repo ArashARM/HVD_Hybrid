@@ -1,2 +1,13 @@
-Case_Studies/
+# Python
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Training outputs
 runs/
+Case_Studies/
+
+# Archives
+*.zip

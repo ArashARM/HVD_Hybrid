@@ -108,6 +108,23 @@ class TimelapseRecorder:
         return metrics
 
     @staticmethod
+    def _strip_lambda_parentheses(text):
+        return re.sub(r"\s*\(lam=[^)]+\)", "", str(text or "")).strip()
+
+    @staticmethod
+    def _stage_palette(stage):
+        try:
+            stage = int(stage)
+        except (TypeError, ValueError):
+            stage = 0
+        palettes = {
+            1: ("#2563eb", "#1d4ed8"),
+            2: ("#d97706", "#b45309"),
+            3: ("#7c3aed", "#6d28d9"),
+        }
+        return palettes.get(stage, ("#2563eb", "#1d4ed8"))
+
+    @staticmethod
     def _format_metric_label(key):
         label_map = {
             "iter": "Iteration",
@@ -240,14 +257,17 @@ class TimelapseRecorder:
         summary_title=None,
         results_title=None,
         results_text="",
+        stage=None,
     ):
-        keys = list(loss_dict.keys())
-        vals = [float(loss_dict[k]) for k in keys]
+        raw_keys = list(loss_dict.keys())
+        keys = raw_keys
+        vals = [float(loss_dict[k]) for k in raw_keys]
         fig_bg = "#eef7ef" if highlight_best else "#f7f7f5"
         card_bg = "#f6fff7" if highlight_best else "#ffffff"
         card_edge = "#16a34a" if highlight_best else "#d1d5db"
-        bar_color = "#16a34a" if highlight_best else "#2563eb"
-        edge_color = "#15803d" if highlight_best else "#1d4ed8"
+        bar_color, edge_color = self._stage_palette(stage)
+        if highlight_best:
+            bar_color, edge_color = "#16a34a", "#15803d"
         header_bg = "#14532d" if highlight_best else None
         header_fg = "#f0fdf4" if highlight_best else "#111827"
         summary_title = (
@@ -275,31 +295,31 @@ class TimelapseRecorder:
             gs = fig.add_gridspec(
                 2,
                 1,
-                height_ratios=[1.8, 1.0],
-                left=0.16,
-                right=0.96,
-                top=0.94,
-                bottom=0.07,
-                hspace=0.22,
+                height_ratios=[1.35, 1.15],
+                left=0.19,
+                right=0.95,
+                top=0.91,
+                bottom=0.08,
+                hspace=0.26,
             )
             ax_results = None
             ax = fig.add_subplot(gs[0, 0])
             ax_text = fig.add_subplot(gs[1, 0])
 
         y = np.arange(len(keys))
-        ax.barh(y, vals, color=bar_color, edgecolor=edge_color, alpha=0.88, height=0.62)
-        ax.set_yticks(y, labels=keys, fontsize=12)
+        ax.barh(y, vals, color=bar_color, edgecolor=edge_color, alpha=0.88, height=0.56)
+        ax.set_yticks(y, labels=keys, fontsize=9 if len(keys) > 7 else 10)
         ax.invert_yaxis()
         ax.set_title(
             chart_title if chart_title is not None else ("Tuned Parameters" if highlight_best else "Optimization Losses"),
-            fontsize=18,
-            pad=12,
+            fontsize=14 if len(keys) > 7 else 15,
+            pad=8,
             weight="bold",
         )
         ax.set_facecolor(card_bg)
         ax.grid(axis="x", linestyle="--", linewidth=0.8, alpha=0.35)
         ax.set_axisbelow(True)
-        ax.tick_params(axis="x", labelsize=11)
+        ax.tick_params(axis="x", labelsize=9)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
 
@@ -314,7 +334,7 @@ class TimelapseRecorder:
                 self._format_display_value(v),
                 va="center",
                 ha="left",
-                fontsize=11,
+                fontsize=9,
                 color="#0f172a",
                 weight="semibold",
             )
@@ -446,6 +466,7 @@ class TimelapseRecorder:
         prefix_step_in_summary=True,
         results_title=None,
         results_text="",
+        stage=None,
     ):
         if cad_img is None:
             raise ValueError("cad_img is None")
@@ -472,6 +493,7 @@ class TimelapseRecorder:
             summary_title=summary_title,
             results_title=results_title,
             results_text=results_text,
+            stage=stage,
         )
 
         h_right, w_right = chart_img.shape[:2]
