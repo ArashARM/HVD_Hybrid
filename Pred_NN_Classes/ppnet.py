@@ -4,24 +4,20 @@ import torch.nn as nn
 from .seed_identity import SeedIdentityEmbedding
 from .seed_refiner import SeedRefiner
 from .utils import check_finite
-from .width_predictor import WidthPredictor
 
 
 class PPNet(nn.Module):
     """
     PPNet predicts only the parameters used by the current centerline decoder.
 
-    It refines seed UV locations and exposes one trainable global raw strut
-    width expanded to the legacy ``w_raw`` matrix shape.
+    It refines seed UV locations. Strut thickness is fixed by the decoder and
+    is not represented by trainable network parameters.
     """
 
     def __init__(
         self,
         n_seeds,
         hidden=256,
-        freeze_w=False,
-        w_const=0.25,
-        w_head_bias_init=0.0,
         eps_uv=1e-4,
         max_delta_logit=0.30,
         max_step_uv=0.08,
@@ -36,8 +32,6 @@ class PPNet(nn.Module):
         super().__init__()
 
         self.n_seeds = n_seeds
-        self.freeze_w = freeze_w
-        self.w_const = w_const
 
         self.eps_uv = eps_uv
         self.max_delta_logit = max_delta_logit
@@ -68,13 +62,6 @@ class PPNet(nn.Module):
             self.seed_free_offset_raw = nn.Parameter(torch.zeros(self.n_seeds, 2))
         else:
             self.seed_free_offset_raw = None
-        self.width_predictor = WidthPredictor(
-            hidden=hidden,
-            freeze_w=self.freeze_w,
-            w_const=self.w_const,
-            w_head_bias_init=w_head_bias_init,
-            enable_checks=self.enable_checks,
-        )
 
     # Compatibility properties for existing training code.
     @property
@@ -92,11 +79,6 @@ class PPNet(nn.Module):
     @property
     def independent_seed_offsets(self):
         return self.seed_free_offset_raw
-
-    @property
-    def w_head(self):
-        # The trainer still groups width parameters through this legacy name.
-        return self.width_predictor
 
     @property
     def h_head(self):
@@ -181,11 +163,6 @@ class PPNet(nn.Module):
         )
         seeds_uv = self._apply_independent_seed_offsets(seeds_uv)
 
-        self.width_predictor.freeze_w = self.freeze_w
-        self.width_predictor.w_const = self.w_const
-        w_raw = self.width_predictor(h, n_seeds, z)
-
         return {
             "seeds_raw": seeds_uv,
-            "w_raw": w_raw,
         }

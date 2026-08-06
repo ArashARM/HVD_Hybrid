@@ -259,7 +259,8 @@ class TrainingLoopTester:
                 self._set_config_value(state.config, "use_rolling_seed_anchors", False)
             self._set_config_value(state.config, "normalize_losses", False)
             if disable_scheduler:
-                self._set_config_value(state.config, "scheduler_milestones", ())
+                self._set_config_value(state.config, "stage1_scheduler_milestones", ())
+                self._set_config_value(state.config, "stage2_scheduler_milestones", ())
             params = self._trainable_parameters(state.model, state.decoder)
             opt = self._named_optimizer(optimizer_name, params, learning_rate)
             previous_adj = None
@@ -348,7 +349,7 @@ class TrainingLoopTester:
                     "curve_loss": loss_value,
                     "total_loss": loss_value,
                     **curve_metrics,
-                    "minimum_seed_distance": self._minimum_seed_distance(seeds_current),
+                    "minimum_control_point_distance": self._minimum_control_point_distance(seeds_current),
                     "seed_displacement_from_initial": (
                         self._total_norm([seeds_current.detach() - initial_seeds.to(seeds_current.device)])
                         if initial_seeds is not None
@@ -713,7 +714,7 @@ class TrainingLoopTester:
                                 "adjacency_signature": adj,
                                 "edge_count": int(topo.get("edges").shape[0]) if isinstance(topo, dict) and topo.get("edges") is not None else 0,
                                 "edge_type_counts": self._value_counts(edge_type),
-                                "minimum_seed_distance": self._minimum_seed_distance(seeds),
+                                "minimum_control_point_distance": self._minimum_control_point_distance(seeds),
                                 "loss": self._scalar(loss),
                             }
                         )
@@ -1159,7 +1160,7 @@ class TrainingLoopTester:
         return float((af * bf).sum().div(denom).cpu().item())
 
     @staticmethod
-    def _minimum_seed_distance(seeds: torch.Tensor) -> float:
+    def _minimum_control_point_distance(seeds: torch.Tensor) -> float:
         seeds = seeds.detach().to(dtype=torch.float64)
         if seeds.ndim < 2 or seeds.shape[0] < 2:
             return float("inf")

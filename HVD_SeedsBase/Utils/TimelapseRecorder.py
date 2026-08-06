@@ -108,6 +108,35 @@ class TimelapseRecorder:
         return metrics
 
     @staticmethod
+    def _deduplicate_summary_metrics(metrics):
+        deduped = []
+        seen = set()
+        for key, value in metrics:
+            normalized = str(key).strip().lower().replace(" ", "_")
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append((key, value))
+        return deduped
+
+    @staticmethod
+    def _strip_lambda_parentheses(text):
+        return re.sub(r"\s*\(lam=[^)]+\)", "", str(text or "")).strip()
+
+    @staticmethod
+    def _stage_palette(stage):
+        try:
+            stage = int(stage)
+        except (TypeError, ValueError):
+            stage = 0
+        palettes = {
+            1: ("#2563eb", "#1d4ed8"),
+            2: ("#d97706", "#b45309"),
+            3: ("#7c3aed", "#6d28d9"),
+        }
+        return palettes.get(stage, ("#2563eb", "#1d4ed8"))
+
+    @staticmethod
     def _format_metric_label(key):
         label_map = {
             "iter": "Iteration",
@@ -116,9 +145,18 @@ class TimelapseRecorder:
             "L_FEM_norm": "L FEM Norm",
             "disp_norm": "Disp. Norm",
             "stress_norm": "Stress Norm",
+            "stress_max": "Max Stress",
+            "disp_max": "Max Disp.",
+            "disp_field_max": "Max Field Disp.",
+            "Max_Stress": "Max Stress",
+            "Max_Displacement": "Max Disp.",
+            "Max_Displacement_Field": "Max Field Disp.",
             "compliance_reduction": "Com. Red. ",
             "compliance_reduction_pct": "Com. Red.",
             "active_units": "Active Units",
+            "Tot_Len": "Tot Len",
+            "Min_cell_Ar": "Min Cell Ar",
+            "Min_Eg_Len": "Min Edge Len",
             "W": "Mean Width",
             "bw": "Bw",
             "compute_time": "Com. Time",
@@ -240,14 +278,17 @@ class TimelapseRecorder:
         summary_title=None,
         results_title=None,
         results_text="",
+        stage=None,
     ):
-        keys = list(loss_dict.keys())
-        vals = [float(loss_dict[k]) for k in keys]
+        raw_keys = list(loss_dict.keys())
+        keys = raw_keys
+        vals = [float(loss_dict[k]) for k in raw_keys]
         fig_bg = "#eef7ef" if highlight_best else "#f7f7f5"
         card_bg = "#f6fff7" if highlight_best else "#ffffff"
         card_edge = "#16a34a" if highlight_best else "#d1d5db"
-        bar_color = "#16a34a" if highlight_best else "#2563eb"
-        edge_color = "#15803d" if highlight_best else "#1d4ed8"
+        bar_color, edge_color = self._stage_palette(stage)
+        if highlight_best:
+            bar_color, edge_color = "#16a34a", "#15803d"
         header_bg = "#14532d" if highlight_best else None
         header_fg = "#f0fdf4" if highlight_best else "#111827"
         summary_title = (
@@ -275,31 +316,31 @@ class TimelapseRecorder:
             gs = fig.add_gridspec(
                 2,
                 1,
-                height_ratios=[1.8, 1.0],
-                left=0.16,
-                right=0.96,
-                top=0.94,
-                bottom=0.07,
-                hspace=0.22,
+                height_ratios=[1.35, 1.15],
+                left=0.19,
+                right=0.95,
+                top=0.91,
+                bottom=0.08,
+                hspace=0.26,
             )
             ax_results = None
             ax = fig.add_subplot(gs[0, 0])
             ax_text = fig.add_subplot(gs[1, 0])
 
         y = np.arange(len(keys))
-        ax.barh(y, vals, color=bar_color, edgecolor=edge_color, alpha=0.88, height=0.62)
-        ax.set_yticks(y, labels=keys, fontsize=12)
+        ax.barh(y, vals, color=bar_color, edgecolor=edge_color, alpha=0.88, height=0.50)
+        ax.set_yticks(y, labels=keys, fontsize=9 if len(keys) > 7 else 10)
         ax.invert_yaxis()
         ax.set_title(
             chart_title if chart_title is not None else ("Tuned Parameters" if highlight_best else "Optimization Losses"),
-            fontsize=18,
-            pad=12,
+            fontsize=14 if len(keys) > 7 else 15,
+            pad=8,
             weight="bold",
         )
         ax.set_facecolor(card_bg)
         ax.grid(axis="x", linestyle="--", linewidth=0.8, alpha=0.35)
         ax.set_axisbelow(True)
-        ax.tick_params(axis="x", labelsize=11)
+        ax.tick_params(axis="x", labelsize=9)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
 
@@ -314,7 +355,7 @@ class TimelapseRecorder:
                 self._format_display_value(v),
                 va="center",
                 ha="left",
-                fontsize=11,
+                fontsize=9,
                 color="#0f172a",
                 weight="semibold",
             )
@@ -323,12 +364,13 @@ class TimelapseRecorder:
         metrics = self._parse_summary_metrics(title_text)
         if highlight_best and results_text:
             metrics = self._parse_summary_metrics(results_text) + metrics
+        metrics = self._deduplicate_summary_metrics(metrics)
 
         ax_text.text(
             0.0,
             1.0,
             "Best Result Summary" if highlight_best else summary_title,
-            fontsize=18 if highlight_best else 16,
+            fontsize=17 if highlight_best else 16,
             weight="bold",
             va="top",
             ha="left",
@@ -373,7 +415,7 @@ class TimelapseRecorder:
                         left_x,
                         y + 0.022,
                         label,
-                        fontsize=7.4,
+                        fontsize=8.0,
                         weight="bold" if highlight_best else "semibold",
                         va="center",
                         ha="left",
@@ -397,7 +439,7 @@ class TimelapseRecorder:
                         left_x,
                         y,
                         label,
-                        fontsize=12 if highlight_best else 11,
+                        fontsize=11 if highlight_best else 10,
                         weight="bold" if highlight_best else "semibold",
                         va="center",
                         ha="left",
@@ -408,7 +450,7 @@ class TimelapseRecorder:
                         right_x,
                         y,
                         value,
-                        fontsize=12 if highlight_best else 11,
+                        fontsize=11 if highlight_best else 10,
                         va="center",
                         ha="left",
                         color="#111827",
@@ -446,6 +488,7 @@ class TimelapseRecorder:
         prefix_step_in_summary=True,
         results_title=None,
         results_text="",
+        stage=None,
     ):
         if cad_img is None:
             raise ValueError("cad_img is None")
@@ -472,6 +515,7 @@ class TimelapseRecorder:
             summary_title=summary_title,
             results_title=results_title,
             results_text=results_text,
+            stage=stage,
         )
 
         h_right, w_right = chart_img.shape[:2]
@@ -532,7 +576,7 @@ class TimelapseRecorder:
         self.frame_paths.append(frame_path)
         return frame_path
 
-    def build_video(self, delete_frames=True, hold_last_seconds=0.0):
+    def build_video(self, delete_frames=False, hold_last_seconds=0.0):
         if not self.frame_paths:
             raise RuntimeError("No frames recorded.")
 

@@ -16,10 +16,10 @@ except ImportError:
 class Loss_rep:
     def __call__(
         self,
-        seeds: torch.Tensor,
+        seed_positions: torch.Tensor,
+        target_dist: float,
         seed_active_weights: torch.Tensor | None = None,
-        sigma: float = 0.08,
-        min_dist: float | None = None,
+        transition: float | None = None,
         activity_floor: float = 0.02,
         activity_power: float = 1.0,
         recovery_floor: float = 0.05,
@@ -27,36 +27,27 @@ class Loss_rep:
         duplicate_recovery_strength: float = 1.0,
         eps: float = 1e-12,
     ) -> torch.Tensor:
-        num_seeds = seeds.shape[0]
+        num_seeds = seed_positions.shape[0]
 
         if num_seeds < 2:
-            return seeds.new_zeros(())
+            return seed_positions.new_zeros(())
 
-        distances = torch.cdist(seeds, seeds)
+        distances = torch.cdist(seed_positions, seed_positions)
 
         pair_mask = torch.triu(
             torch.ones(
                 (num_seeds, num_seeds),
                 dtype=torch.bool,
-                device=seeds.device,
+                device=seed_positions.device,
             ),
             diagonal=1,
         )
 
-        if min_dist is not None and min_dist > 0.0:
-            target = seeds.new_tensor(min_dist)
-
-            pair_penalty = (
-                torch.relu(target - distances).square()
-                / target.square().clamp_min(eps)
-            )
-        else:
-            sigma_tensor = seeds.new_tensor(sigma)
-
-            pair_penalty = torch.exp(
-                -distances.square()
-                / sigma_tensor.square().clamp_min(eps)
-            )
+        target = seed_positions.new_tensor(max(float(target_dist), 0.0)).clamp_min(eps)
+        transition_t = seed_positions.new_tensor(
+            0.1 * float(target_dist) if transition is None else float(transition)
+        ).clamp_min(eps)
+        pair_penalty = torch.nn.functional.softplus((target - distances) / transition_t).square()
 
         pair_penalty = pair_penalty[pair_mask]
 
@@ -66,7 +57,7 @@ class Loss_rep:
         weights = prepare_seed_activity_weights(
             seed_active_weights,
             num_seeds=num_seeds,
-            reference=seeds,
+            reference=seed_positions,
             floor=activity_floor,
             power=activity_power,
             eps=eps,
@@ -74,7 +65,7 @@ class Loss_rep:
         recovery = prepare_seed_recovery_weights(
             seed_active_weights,
             num_seeds=num_seeds,
-            reference=seeds,
+            reference=seed_positions,
             floor=recovery_floor,
             power=recovery_power,
         )

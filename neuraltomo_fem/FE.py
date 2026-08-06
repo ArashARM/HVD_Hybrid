@@ -28,9 +28,9 @@ class FE:
 
 
         if type(problem.materialProperty) is dict:
-            self.H8 = H8_anisotropic_K(device, **problem.materialProperty)
+            self.H8 = H8_anisotropic_K(device, element_size=self.mesh.elemSize, **problem.materialProperty)
         else:
-            self.H8 = H8_anisotropic_K(device, **problem.materialProperty.__dict__)
+            self.H8 = H8_anisotropic_K(device, element_size=self.mesh.elemSize, **problem.materialProperty.__dict__)
 
     # This function precomputes the indices for assembling the global stiffness matrix K from the element stiffness matrices. 
     # It also prepares the force vector f for the free degrees of freedom. 
@@ -70,16 +70,16 @@ class FE:
         self.f = torch.tensor(self.mesh.f[keep_index, 0], dtype=torch.float32, device=device)
 
 
-    def solve_c_new(self, phi, theta, density, penal=3, isotropic=False):
+    def solve_c_new(self, phi, theta, stiffness_factor, penal=1.0, isotropic=False):
         # self.u = torch.zeros((self.mesh.ndof, 1), device=density.device)
         if isotropic:
             ## isotropic
-            E = self.mesh.Emax * (1e-3 + density) ** self.mesh.penal
+            E = self.mesh.Emax * stiffness_factor
             KE = torch.tensor(self.mesh.KE, dtype=torch.float32, device=density.device)
             sK = torch.einsum('i,ijk->ijk', E, KE).flatten()
         else:
             ## anisotropic
-            sK = self.H8.angle2Ke(phi, theta, density, penal).flatten()
+            sK = self.H8.angle2Ke(phi, theta, stiffness_factor, penal).flatten()
 
         d = sK[self.valid_mask]
 
@@ -87,18 +87,18 @@ class FE:
         c = sk2c(d, (self.new_row_indices, self.new_col_indices), f, self.f, self.Ksize)
         return c
 
-    def solve_stress_new(self, phi, theta, density, penal=3, isotropic=False):
-        self.u = torch.zeros((self.mesh.ndof, 1), dtype=torch.float32, device=density.device)
+    def solve_stress_new(self, phi, theta, stiffness_factor, penal=1.0, isotropic=False):
+        self.u = torch.zeros((self.mesh.ndof, 1), dtype=torch.float32, device=stiffness_factor.device)
         if isotropic:
             ## isotropic
-            E = self.mesh.Emax * ((1e-3 + density)*10) ** self.mesh.penal
-            KE = torch.tensor(self.mesh.KE, dtype=torch.float32, device=density.device)
+            E = self.mesh.Emax * stiffness_factor
+            KE = torch.tensor(self.mesh.KE, dtype=torch.float32, device=stiffness_factor.device)
             sK = torch.einsum('i,ijk->ijk', E, KE).flatten()
-            B = torch.tensor(self.mesh.B.T, dtype=torch.float32, device=density.device).T
-            C = torch.tensor(self.mesh.C, dtype=torch.float32, device=density.device).expand(self.mesh.numElems,-1,-1)
+            B = torch.tensor(self.mesh.B.T, dtype=torch.float32, device=stiffness_factor.device).T
+            C = torch.tensor(self.mesh.C, dtype=torch.float32, device=stiffness_factor.device).expand(self.mesh.numElems,-1,-1)
         else:
             ## anisotropic
-            sK = self.H8.angle2Ke(phi, theta, density, penal).flatten()
+            sK = self.H8.angle2Ke(phi, theta, stiffness_factor, penal).flatten()
 
             B = self.H8.NodeB
             C = self.H8.temp_C
@@ -110,14 +110,13 @@ class FE:
         d = sK[self.valid_mask]
 
         f = self.mesh.f[self.mesh.free, 0]
-        f_times = 1000
-        u = sk2u(d, (self.new_row_indices, self.new_col_indices), f * f_times, self.f * f_times, self.Ksize)
+        u = sk2u(d, (self.new_row_indices, self.new_col_indices), f, self.f, self.Ksize)
         self.u[self.mesh.free, 0] = u
         c = (self.f*u).sum()
         uElem = self.u[self.mesh.edofMat].reshape(self.mesh.numElems, self.mesh.numDOFPerElem)
         uElemNodes = uElem.reshape(self.mesh.numElems, 8, 3)
         disp_mag_elem = torch.linalg.norm(uElemNodes, dim=2).mean(dim=1)
-        force_vec = torch.as_tensor(self.mesh.f[:, 0], dtype=torch.float32, device=density.device).reshape(self.mesh.numNodes, 3)
+        force_vec = torch.as_tensor(self.mesh.f[:, 0], dtype=torch.float32, device=stiffness_factor.device).reshape(self.mesh.numNodes, 3)
         uNodes = self.u.reshape(self.mesh.numNodes, 3)
         force_norm = torch.linalg.norm(force_vec, dim=1)
         loaded_node_mask = force_norm > 1e-12
@@ -125,16 +124,16 @@ class FE:
             loaded_force_dir = force_vec[loaded_node_mask] / force_norm[loaded_node_mask, None]
             loaded_disp_load_dir = torch.abs(torch.sum(uNodes[loaded_node_mask] * loaded_force_dir, dim=1))
         else:
-            loaded_disp_load_dir = torch.empty(0, dtype=torch.float32, device=density.device)
+            loaded_disp_load_dir = torch.empty(0, dtype=torch.float32, device=stiffness_factor.device)
         load_dir = force_vec.sum(dim=0)
         load_dir_norm = torch.linalg.norm(load_dir)
         if load_dir_norm <= 1e-12:
-            load_dir = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=density.device)
+            load_dir = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=stiffness_factor.device)
         else:
             load_dir = load_dir / load_dir_norm
         disp_load_dir_elem = torch.abs(torch.einsum('eij,j->ei', uElemNodes, load_dir)).mean(dim=1)
         sigmaElem = torch.einsum('bij,jk,bk -> bi', C, B, uElem)
-        sigma_for_vm = torch.nan_to_num(sigmaElem, nan=0.0, posinf=0.0, neginf=0.0)
+        sigma_for_vm = sigmaElem
         sxx, syy, szz = sigma_for_vm[:, 0], sigma_for_vm[:, 1], sigma_for_vm[:, 2]
         syz, sxz, sxy = sigma_for_vm[:, 3], sigma_for_vm[:, 4], sigma_for_vm[:, 5]
         stress_vm = torch.sqrt(
@@ -183,7 +182,7 @@ class FE:
 
     def solve(self, density):
         self.u=np.zeros((self.mesh.ndof,1))
-        E = self.mesh.material['E']*(1.0e-3+density)**self.mesh.material['penal']
+        E = self.mesh.material['E'] * density
         sK = np.einsum('i,ijk->ijk',E, self.mesh.KE).flatten()
 
         K = coo_matrix((sK,(self.mesh.iK,self.mesh.jK)),shape=(self.mesh.ndof,self.mesh.ndof)).tocsc()

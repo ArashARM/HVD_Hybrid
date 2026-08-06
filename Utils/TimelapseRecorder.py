@@ -108,6 +108,18 @@ class TimelapseRecorder:
         return metrics
 
     @staticmethod
+    def _deduplicate_summary_metrics(metrics):
+        deduped = []
+        seen = set()
+        for key, value in metrics:
+            normalized = str(key).strip().lower().replace(" ", "_")
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append((key, value))
+        return deduped
+
+    @staticmethod
     def _strip_lambda_parentheses(text):
         return re.sub(r"\s*\(lam=[^)]+\)", "", str(text or "")).strip()
 
@@ -133,9 +145,18 @@ class TimelapseRecorder:
             "L_FEM_norm": "L FEM Norm",
             "disp_norm": "Disp. Norm",
             "stress_norm": "Stress Norm",
+            "stress_max": "Max Stress",
+            "disp_max": "Max Disp.",
+            "disp_field_max": "Max Field Disp.",
+            "Max_Stress": "Max Stress",
+            "Max_Displacement": "Max Disp.",
+            "Max_Displacement_Field": "Max Field Disp.",
             "compliance_reduction": "Com. Red. ",
             "compliance_reduction_pct": "Com. Red.",
             "active_units": "Active Units",
+            "Tot_Len": "Tot Len",
+            "Min_cell_Ar": "Min Cell Ar",
+            "Min_Eg_Len": "Min Edge Len",
             "W": "Mean Width",
             "bw": "Bw",
             "compute_time": "Com. Time",
@@ -307,7 +328,7 @@ class TimelapseRecorder:
             ax_text = fig.add_subplot(gs[1, 0])
 
         y = np.arange(len(keys))
-        ax.barh(y, vals, color=bar_color, edgecolor=edge_color, alpha=0.88, height=0.56)
+        ax.barh(y, vals, color=bar_color, edgecolor=edge_color, alpha=0.88, height=0.50)
         ax.set_yticks(y, labels=keys, fontsize=9 if len(keys) > 7 else 10)
         ax.invert_yaxis()
         ax.set_title(
@@ -343,12 +364,13 @@ class TimelapseRecorder:
         metrics = self._parse_summary_metrics(title_text)
         if highlight_best and results_text:
             metrics = self._parse_summary_metrics(results_text) + metrics
+        metrics = self._deduplicate_summary_metrics(metrics)
 
         ax_text.text(
             0.0,
             1.0,
             "Best Result Summary" if highlight_best else summary_title,
-            fontsize=18 if highlight_best else 16,
+            fontsize=17 if highlight_best else 16,
             weight="bold",
             va="top",
             ha="left",
@@ -393,7 +415,7 @@ class TimelapseRecorder:
                         left_x,
                         y + 0.022,
                         label,
-                        fontsize=7.4,
+                        fontsize=8.0,
                         weight="bold" if highlight_best else "semibold",
                         va="center",
                         ha="left",
@@ -417,7 +439,7 @@ class TimelapseRecorder:
                         left_x,
                         y,
                         label,
-                        fontsize=12 if highlight_best else 11,
+                        fontsize=11 if highlight_best else 10,
                         weight="bold" if highlight_best else "semibold",
                         va="center",
                         ha="left",
@@ -428,7 +450,7 @@ class TimelapseRecorder:
                         right_x,
                         y,
                         value,
-                        fontsize=12 if highlight_best else 11,
+                        fontsize=11 if highlight_best else 10,
                         va="center",
                         ha="left",
                         color="#111827",
@@ -554,7 +576,7 @@ class TimelapseRecorder:
         self.frame_paths.append(frame_path)
         return frame_path
 
-    def build_video(self, delete_frames=True, hold_last_seconds=0.0):
+    def build_video(self, delete_frames=False, hold_last_seconds=0.0):
         if not self.frame_paths:
             raise RuntimeError("No frames recorded.")
 

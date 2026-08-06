@@ -1,19 +1,61 @@
 import math
+import warnings
 
 import numpy as np
 import torch
+
+def _unit_checked_material(kwargs):
+    length_unit = kwargs.get("length_unit", "mm")
+    force_unit = kwargs.get("force_unit", "N")
+    stress_unit = kwargs.get("stress_unit", "MPa")
+    if (length_unit, force_unit, stress_unit) != ("mm", "N", "MPa"):
+        raise ValueError(
+            "FEM material units must be length='mm', force='N', stress='MPa'. "
+            f"Got {(length_unit, force_unit, stress_unit)}."
+        )
 
 class H8_isotropic_K:
     pass
 
 class H8_anisotropic_K:
     def __init__(self, device=torch.device('cuda'), **kwargs):
+        _unit_checked_material(kwargs)
         # for const number
         _sqrt_3_5 = math.sqrt(3 / 5)
-        _E_f = 1 if 'Ef' not in kwargs else kwargs['Ef']
-        _E_t = 1 if 'Et' not in kwargs else kwargs['Et']
-        _nu_f = 0.3 if 'nuf' not in kwargs else kwargs['nuf']
-        _nu_t = 0.3 if 'nut' not in kwargs else kwargs['nut']
+        if any(k in kwargs for k in ("Ef", "Et", "nuf", "nut")):
+            warnings.warn(
+                "Legacy material keys Ef/Et/nuf/nut are mapped to explicit "
+                "orthotropic CCF fields. Prefer material_E1/E2/E3, "
+                "material_nu12/nu23/nu13, and material_G12/G23/G13.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        _E_f = kwargs.get('material_E1', kwargs.get('material_E_longitudinal', kwargs.get('Ef', None)))
+        _E_t = kwargs.get('material_E2', kwargs.get('material_E_transverse', kwargs.get('Et', None)))
+        _E_3 = kwargs.get('material_E3', _E_t)
+        _nu_f = kwargs.get('material_nu12', kwargs.get('material_nu_longitudinal', kwargs.get('nuf', 0.3)))
+        _nu_t = kwargs.get('material_nu23', kwargs.get('material_nu_transverse', kwargs.get('nut', 0.3)))
+        _nu_13 = kwargs.get('material_nu13', _nu_f)
+        _G_12 = kwargs.get('material_G12', kwargs.get('material_shear_modulus', kwargs.get('Gf', None)))
+        _G_23 = kwargs.get('material_G23', None)
+        _G_13 = kwargs.get('material_G13', _G_12)
+        if _E_f is None or _E_t is None or _E_3 is None:
+            raise ValueError(
+                "Anisotropic FEM requires material_E1, material_E2, and "
+                "material_E3, in MPa."
+            )
+        if any(k in kwargs for k in ("Ef", "Et", "nuf", "nut")):
+            if _G_12 is None:
+                _G_12 = float(_E_f) / (2.0 * (1.0 + float(_nu_f)))
+            if _G_13 is None:
+                _G_13 = _G_12
+            if _G_23 is None:
+                _G_23 = float(_E_t) / (2.0 * (1.0 + float(_nu_t)))
+        if _G_12 is None or _G_13 is None or _G_23 is None:
+            raise ValueError(
+                "CCF orthotropic shear moduli must be explicit: "
+                "material_G12, material_G23, and material_G13."
+            )
 
         if 'P' not in kwargs:
             self.P = torch.tensor([[ 0.00126103,  0.00017645, -0.00143748,  0.        ,  0.        , 0.        ],
@@ -35,16 +77,44 @@ class H8_anisotropic_K:
         self.nuf = _nu_f
         self.nut = _nu_t
 
-        _G_t = _E_t / (2 * (1 + _nu_t))
-        _G_f = _E_f / (2 * (1 + _nu_f))
+        element_size = kwargs.get("element_size", (1.0, 1.0, 1.0))
+        if len(element_size) != 3:
+            raise ValueError(f"element_size must have three entries, got {element_size}")
+        self.element_size = tuple(float(v) for v in element_size)
+        if any((not math.isfinite(v) or v <= 0.0) for v in self.element_size):
+            raise ValueError(f"element_size entries must be positive finite, got {self.element_size}")
 
-        C = np.array([[1 / _E_f, -_nu_f / _E_f, -_nu_f / _E_f, 0, 0, 0],
-                      [-_nu_f / _E_f, 1 / _E_t, -_nu_t / _E_t, 0, 0, 0],
-                      [-_nu_f / _E_f, -_nu_t / _E_t, 1 / _E_t, 0, 0, 0],
-                      [0, 0, 0, 1 / _G_t, 0, 0],
-                      [0, 0, 0, 0, 1 / _G_f, 0],
-                      [0, 0, 0, 0, 0, 1 / _G_f]])
+        E1, E2, E3 = float(_E_f), float(_E_t), float(_E_3)
+        nu12, nu23, nu13 = float(_nu_f), float(_nu_t), float(_nu_13)
+        G12, G23, G13 = float(_G_12), float(_G_23), float(_G_13)
+        for name, value in {
+            "material_E1": E1,
+            "material_E2": E2,
+            "material_E3": E3,
+            "material_G12": G12,
+            "material_G23": G23,
+            "material_G13": G13,
+        }.items():
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be positive finite, got {value}.")
+        nu21 = nu12 * E2 / E1
+        nu31 = nu13 * E3 / E1
+        nu32 = nu23 * E3 / E2
+        C = np.array([[1 / E1, -nu21 / E2, -nu31 / E3, 0, 0, 0],
+                      [-nu12 / E1, 1 / E2, -nu32 / E3, 0, 0, 0],
+                      [-nu13 / E1, -nu23 / E2, 1 / E3, 0, 0, 0],
+                      [0, 0, 0, 1 / G23, 0, 0],
+                      [0, 0, 0, 0, 1 / G13, 0],
+                      [0, 0, 0, 0, 0, 1 / G12]])
+        if not np.all(np.isfinite(C)) or not np.allclose(C, C.T, rtol=1e-5, atol=1e-8):
+            raise ValueError("Orthotropic compliance matrix is non-finite or not symmetric.")
         self.C_inv_np = np.linalg.inv(C)
+        if (
+            not np.all(np.isfinite(self.C_inv_np))
+            or not np.allclose(self.C_inv_np, self.C_inv_np.T, rtol=1e-5, atol=1e-5)
+            or np.linalg.eigvalsh(self.C_inv_np).min() <= 0.0
+        ):
+            raise ValueError("Orthotropic constitutive matrix is not mechanically admissible.")
         self.C_inv = torch.tensor(self.C_inv_np, dtype=torch.float32, device=device)
 
         # 3 - point Gauss integration
@@ -66,15 +136,40 @@ class H8_anisotropic_K:
 
         # B = np.einsum('i,ijk->ijk', all_intergration_weight, self.matrixB(all_intergration_points))
         # [x,y,z,zy,zx,yx]
-        self.B = torch.tensor(self.matrixB(all_intergration_points), dtype=torch.float32, device=device)
-        self.NodeB = torch.tensor([
-        [-0.25,     0,     0,  0.25,     0,     0,  0.25,     0,     0, -0.25,     0,     0, -0.25,     0,     0,  0.25,     0,     0, 0.25,    0,    0, -0.25,     0,     0],
-        [    0, -0.25,     0,     0, -0.25,     0,     0,  0.25,     0,     0,  0.25,     0,     0, -0.25,     0,     0, -0.25,     0,    0, 0.25,    0,     0,  0.25,     0],
-        [    0,     0, -0.25,     0,     0, -0.25,     0,     0, -0.25,     0,     0, -0.25,     0,     0,  0.25,     0,     0,  0.25,    0,    0, 0.25,     0,     0,  0.25],
-        [    0, -0.25, -0.25,     0, -0.25, -0.25,     0, -0.25,  0.25,     0, -0.25,  0.25,     0,  0.25, -0.25,     0,  0.25, -0.25,    0, 0.25, 0.25,     0,  0.25,  0.25],
-        [-0.25,     0, -0.25, -0.25,     0,  0.25, -0.25,     0,  0.25, -0.25,     0, -0.25,  0.25,     0, -0.25,  0.25,     0,  0.25, 0.25,    0, 0.25,  0.25,     0, -0.25],
-        [-0.25, -0.25,     0, -0.25,  0.25,     0,  0.25,  0.25,     0,  0.25, -0.25,     0, -0.25, -0.25,     0, -0.25,  0.25,     0, 0.25, 0.25,    0,  0.25, -0.25,     0]],
-        dtype=torch.float32, device=device)
+        self.B = self.physical_B(all_intergration_points, device=device)
+        self.NodeB = self.physical_B(np.array([[0.0, 0.0, 0.0]]), device=device)[0]
+
+    def physical_B(self, xyz, device=None):
+        device = self.C_inv.device if device is None else device
+        pts = torch.as_tensor(xyz, dtype=torch.float32, device=device).reshape(-1, 3)
+        xi, eta, zeta = pts[:, 0], pts[:, 1], pts[:, 2]
+        signs = torch.tensor(
+            [[-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
+             [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]],
+            dtype=torch.float32,
+            device=device,
+        )
+        sx, sy, sz = signs[:, 0], signs[:, 1], signs[:, 2]
+        dN_dxi = 0.125 * sx[None, :] * (1.0 + sy[None, :] * (2.0 * eta[:, None])) * (1.0 + sz[None, :] * (2.0 * zeta[:, None])) * 2.0
+        dN_deta = 0.125 * sy[None, :] * (1.0 + sx[None, :] * (2.0 * xi[:, None])) * (1.0 + sz[None, :] * (2.0 * zeta[:, None])) * 2.0
+        dN_dzeta = 0.125 * sz[None, :] * (1.0 + sx[None, :] * (2.0 * xi[:, None])) * (1.0 + sy[None, :] * (2.0 * eta[:, None])) * 2.0
+        hx, hy, hz = self.element_size
+        dN_dx = dN_dxi / hx
+        dN_dy = dN_deta / hy
+        dN_dz = dN_dzeta / hz
+        B = torch.zeros((pts.shape[0], 6, 24), dtype=torch.float32, device=device)
+        for a in range(8):
+            c = 3 * a
+            B[:, 0, c + 0] = dN_dx[:, a]
+            B[:, 1, c + 1] = dN_dy[:, a]
+            B[:, 2, c + 2] = dN_dz[:, a]
+            B[:, 3, c + 1] = dN_dz[:, a]
+            B[:, 3, c + 2] = dN_dy[:, a]
+            B[:, 4, c + 0] = dN_dz[:, a]
+            B[:, 4, c + 2] = dN_dx[:, a]
+            B[:, 5, c + 0] = dN_dy[:, a]
+            B[:, 5, c + 1] = dN_dx[:, a]
+        return B
 
     def matrixB(self, xyz):
         # [x,y,z,zy,zx,yx]
@@ -107,7 +202,7 @@ class H8_anisotropic_K:
              (x + 0.5) * (z + 0.5), (y + 0.5) * (z + 0.5), o, (0.5 - x) * (z + 0.5), -(y + 0.5) * (z + 0.5), o)
         return np.stack(b, -1).reshape((xyz.shape[0], 6, 24))
 
-    def angle2Ke(self, phi, theta, density, density_penal=3):
+    def angle2Ke(self, phi, theta, stiffness_factor, density_penal=1.0):
         cosT, sinT = torch.cos(theta), torch.sin(theta)
         cosT2, sinT2 = cosT * cosT, sinT * sinT
 
@@ -138,9 +233,11 @@ class H8_anisotropic_K:
         weight = self.int_weight
         # BT = B.transpose(1, 2)
 
-        BT_C_B = torch.einsum('d,dji,bjk,dkl->bil', weight, B, C, B)
-        # dK = weight * BT.expand(batch_size, -1, -1) * C * B.expand(batch_size, -1, -1)
-        dK = torch.einsum('i,ijk->ijk', (1e-3 + density) ** density_penal, BT_C_B)
+        detJ = self.element_size[0] * self.element_size[1] * self.element_size[2]
+        BT_C_B = torch.einsum('d,dji,bjk,dkl->bil', weight * detJ, B, C, B)
+        # `stiffness_factor` already contains the SIMP penalization
+        # and the minimum stiffness ratio. Do not apply either again.
+        dK = torch.einsum('i,ijk->ijk', stiffness_factor, BT_C_B)
         self.temp_C = C_new
         self.T = R
         return dK
@@ -149,6 +246,11 @@ class H8_anisotropic_K:
 # via rotation Matrix
 class H8_anisotropic_K_R:
     def __init__(self, device=torch.device('cuda'), **kwargs):
+        raise RuntimeError(
+            "H8_anisotropic_K_R is deprecated. Use H8_anisotropic_K, which "
+            "uses explicit orthotropic CCF shear moduli, physical B-matrix "
+            "scaling, and direct stiffness_factor assembly."
+        )
         # for const number
         _sqrt_3_5 = math.sqrt(3 / 5)
         s, t, r = 0.5, 0.5, 0.5
@@ -221,7 +323,7 @@ class H8_anisotropic_K_R:
              (x + 0.5) * (z + 0.5), (y + 0.5) * (z + 0.5), o, (0.5 - x) * (z + 0.5), -(y + 0.5) * (z + 0.5), o)
         return np.stack(b, -1).reshape((xyz.shape[0], 6, 24))
 
-    def angle2KeExt(self, vol_ratio, rotationMatrix, density, density_penal=3):
+    def angle2KeExt(self, vol_ratio, rotationMatrix, stiffness_factor, density_penal=1.0):
         EF = vol_ratio * self.Ef + (1 - vol_ratio) * self.Et
         ET = 1. / (vol_ratio / self.Ef + (1 - vol_ratio) / self.Et)
         _nu_f, _nu_t = self.nuf, self.nut
@@ -251,7 +353,9 @@ class H8_anisotropic_K_R:
 
         weight, B = self.int_weight, self.B
         BT_C_B = torch.einsum('d,dji,bjk,dkl->bil', weight, B, RC, B)
-        dK = torch.einsum('i,ijk->ijk', (1e-3 + density) ** density_penal, BT_C_B)
+        # `stiffness_factor` already contains the SIMP penalization
+        # and the minimum stiffness ratio. Do not apply either again.
+        dK = torch.einsum('i,ijk->ijk', stiffness_factor, BT_C_B)
         return dK
 
 if __name__ == '__main__':

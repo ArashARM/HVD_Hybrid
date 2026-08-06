@@ -34,6 +34,7 @@ class ThickenShell(problemBase):
         load_surface_side="max",
         fixed_side="min",
         force_side=None,
+        load_direction_side=None,
     ):
         super().__init__()
         self.name = self.problemName
@@ -53,6 +54,7 @@ class ThickenShell(problemBase):
         self.load_surface_side = str(load_surface_side).lower()
         self.fixed_side = str(fixed_side).lower()
         self.force_side = None if force_side is None else str(force_side).lower()
+        self.load_direction_side = None if load_direction_side is None else str(load_direction_side).lower()
 
         self.grid_geom = None
         self.elem_centers = None
@@ -117,13 +119,11 @@ class ThickenShell(problemBase):
         self.elem_sample_count = self.count_surface_samples_per_element()
 
 
-        # Create a simple binary density field based on voxel occupancy.
-        # Occupied voxels (shell) get density ≈ 1, empty voxels get a small void density rho_min.
-        # This is only an initialization useful for debugging / visualization.
+        # Physical material-density placeholder used for debugging / visualization.
+        # It is binary shell occupancy, not a stiffness interpolation factor.
         # The actual density and fiber fields used in the FEM solve will later come
         # from the neural decoder and can be assigned via assign_decoder_fields().
-        rho_min = 1e-3
-        self.elem_density = rho_min + (1.0 - rho_min) * self.elem_occupancy.reshape(-1).astype(np.float32)
+        self.elem_density = self.elem_occupancy.reshape(-1).astype(np.float32)
 
 
         self.apply_load_case_boundary_conditions()
@@ -132,10 +132,13 @@ class ThickenShell(problemBase):
         """
         Dispatch boundary-condition construction by load-case category.
 
-        Current implemented case:
+        Current implemented cases:
         - tensile_compression: fixed slab on the negative side of BC_dir and
           loaded slab on the positive side of BC_dir. The sign of
           Load_magnitude decides tension/compression.
+        - fixed_side_loading: fixed slab on fixed_side of BC_dir and loaded
+          slab on the opposite side. load_dir chooses the force axis and
+          load_direction_side, when provided, chooses positive/negative force.
         """
         if self.load_case in ("tensile_compression", "tensile", "compression"):
             self.apply_tensile_compression_boundary_conditions()
@@ -149,9 +152,20 @@ class ThickenShell(problemBase):
             self.apply_torsion_boundary_conditions()
             return
 
+        if self.load_case in (
+            "fixed_side_loading",
+            "fixed_side_load",
+            "side_loading",
+            "side_load",
+            "fixed_opposite_loading",
+        ):
+            self.apply_fixed_side_loading_boundary_conditions()
+            return
+
         raise ValueError(
             f"Unsupported load_case: {self.load_case}. "
-            "Currently supported: tensile_compression, three_point_bending, torsion"
+            "Currently supported: tensile_compression, three_point_bending, torsion, "
+            "fixed_side_loading"
         )
 
     def _axis_bounds_keys(self, axis):
@@ -270,6 +284,15 @@ class ThickenShell(problemBase):
             return "min"
         raise ValueError(f"Unsupported side: {side}. Expected 'min' or 'max'.")
 
+    @staticmethod
+    def _direction_side_sign(side):
+        side = str(side).lower()
+        if side == "max":
+            return 1.0
+        if side == "min":
+            return -1.0
+        raise ValueError(f"Unsupported load_direction_side: {side}. Expected 'min' or 'max'.")
+
     def apply_tensile_compression_boundary_conditions(self):
         tol = 0.5* self.voxel_size
         shell_nodes = self.occupied_node_ids()
@@ -361,6 +384,46 @@ class ThickenShell(problemBase):
             total_torque=self.Load_magnitude,
         )
 
+    def apply_fixed_side_loading_boundary_conditions(self):
+        self._axis_bounds_keys(self.BC_dir)
+        fixed_side = self.fixed_side
+        force_side = self.force_side if self.force_side is not None else self._opposite_side(fixed_side)
+        if force_side == fixed_side:
+            raise ValueError(
+                "force_side must be opposite to fixed_side for load_case='fixed_side_loading'"
+            )
+
+        force_direction = self.load_dir if self.load_dir is not None else self.BC_dir
+        self._axis_bounds_keys(force_direction)
+
+        force_value = self.Load_magnitude
+        if self.load_direction_side is not None:
+            force_value = abs(force_value) * self._direction_side_sign(self.load_direction_side)
+
+        tol = 0.5 * self.voxel_size
+        shell_nodes = self.occupied_node_ids()
+
+        fixed_nodes = self.select_shell_axis_slab_nodes(shell_nodes, self.BC_dir, fixed_side, tol)
+        force_nodes = self.select_shell_axis_slab_nodes(shell_nodes, self.BC_dir, force_side, tol)
+
+        if fixed_nodes.size == 0:
+            raise ValueError(
+                f"No fixed shell nodes selected for load_case={self.load_case}, "
+                f"BC_dir={self.BC_dir}, fixed_side={fixed_side}"
+            )
+        if force_nodes.size == 0:
+            raise ValueError(
+                f"No force shell nodes selected for load_case={self.load_case}, "
+                f"BC_dir={self.BC_dir}, force_side={force_side}"
+            )
+
+        self.set_boundary_conditions_from_regions(
+            fixed_nodes=fixed_nodes,
+            force_nodes=force_nodes,
+            force_direction=force_direction,
+            force_value=force_value,
+        )
+
     def shellSettings(self):
         mesh, grid_geom, elem_centers, node_coords = self.build_voxel_grid_for_shell(
             self.brep_bbox,
@@ -373,23 +436,46 @@ class ThickenShell(problemBase):
         self.elem_centers = elem_centers
         self.node_coords = node_coords
 
-        # matProp = {
-        #     'E': 1.0,
-        #     'nu': 0.3,
-        #     'Ef': 1.0,
-        #     'Et': 1.0,
-        #     'nuf': 0.3,
-        #     'nut': 0.3,
-        #     'penal': 3
-        # }
+        # FEM unit convention:
+        # length = millimetres (mm), force = newtons (N),
+        # stress/Young's modulus = N/mm^2 = MPa, displacement = mm.
+        # Replace these example CCF values with experimentally calibrated
+        # anisotropic material data before interpreting feasibility.
+        material_E_longitudinal = float(getattr(self, "material_E_longitudinal", 70000.0))
+        material_E_transverse = float(getattr(self, "material_E_transverse", 7000.0))
+        material_nu_longitudinal = float(getattr(self, "material_nu_longitudinal", 0.30))
+        material_nu_transverse = float(getattr(self, "material_nu_transverse", 0.30))
+        material_G12 = float(getattr(self, "material_G12", 4500.0))
+        material_G23 = float(getattr(self, "material_G23", 2600.0))
+        material_G13 = float(getattr(self, "material_G13", material_G12))
+        material_yield_strength = float(getattr(self, "material_yield_strength", 200.0))
         matProp = {
-            'E': 1.0,
-            'nu': 0.3,
-            'Ef': 10.0,
-            'Et': 1.0,
-            'nuf': 0.25,
-            'nut': 0.3,
-            'penal': 3
+            'length_unit': 'mm',
+            'force_unit': 'N',
+            'stress_unit': 'MPa',
+            'material_E1': material_E_longitudinal,
+            'material_E2': material_E_transverse,
+            'material_E3': material_E_transverse,
+            'material_nu12': material_nu_longitudinal,
+            'material_nu23': material_nu_transverse,
+            'material_nu13': material_nu_longitudinal,
+            'material_G12': material_G12,
+            'material_G23': material_G23,
+            'material_G13': material_G13,
+            'material_E_longitudinal': material_E_longitudinal,
+            'material_E_transverse': material_E_transverse,
+            'material_nu_longitudinal': material_nu_longitudinal,
+            'material_nu_transverse': material_nu_transverse,
+            'material_shear_modulus': material_G12,
+            'material_yield_strength': material_yield_strength,
+            'E': material_E_transverse,
+            'nu': material_nu_transverse,
+            'Ef': material_E_longitudinal,
+            'Et': material_E_transverse,
+            'nuf': material_nu_longitudinal,
+            'nut': material_nu_transverse,
+            'Gf': material_G12,
+            'penal': 3,
         }
 
         ndof = 3 * (mesh['nelx'] + 1) * (mesh['nely'] + 1) * (mesh['nelz'] + 1)
@@ -753,7 +839,7 @@ class ThickenShell(problemBase):
 
         return core_elem_idx
     
-    def assign_surface_fields_to_voxels(self, rho_surface, fiber_surface, rho_void=1e-3):
+    def assign_surface_fields_to_voxels(self, rho_surface, fiber_surface, rho_void=0.0):
         rho_surface = self.to_numpy(rho_surface).reshape(-1)
         fiber_surface = self.to_numpy(fiber_surface).reshape(-1, 3)
 
@@ -820,7 +906,7 @@ class ThickenShell(problemBase):
         theta = np.arccos(np.clip(az, -1.0, 1.0)).astype(np.float32)
 
         return phi, theta
-    def assign_decoder_fields(self, rho_surface, fiber_surface, rho_void=1e-3):
+    def assign_decoder_fields(self, rho_surface, fiber_surface, rho_void=0.0):
         elem_density, elem_fiber = self.assign_surface_fields_to_voxels(
             rho_surface=rho_surface,
             fiber_surface=fiber_surface,
@@ -1273,7 +1359,7 @@ class ThickenShell(problemBase):
             print("target approx volume (sum(face_areas)*thickness):", target_vol)
             if target_vol > 0:
                 print("volume ratio voxel/target:", vox_vol / target_vol)
-    def build_fem_fields_from_decoder(self, rho_surface, fiber_surface, rho_void=1e-3):
+    def build_fem_fields_from_decoder(self, rho_surface, fiber_surface, rho_void=0.0):
         elem_density, elem_phi, elem_theta = self.assign_decoder_fields(
             rho_surface=rho_surface,
             fiber_surface=fiber_surface,
@@ -1289,7 +1375,7 @@ class ThickenShell(problemBase):
             'mesh': self.mesh,
             'materialProperty': self.materialProperty,
         }
-    def build_fem_fields_from_decoder_torch(self, rho_surface, fiber_surface, rho_void=1e-3):
+    def build_fem_fields_from_decoder_torch(self, rho_surface, fiber_surface, rho_void=0.0):
         device = rho_surface.device
 
         sample_idx = torch.as_tensor(self.elem_sample_idx.reshape(-1), device=device, dtype=torch.long)
@@ -1303,7 +1389,7 @@ class ThickenShell(problemBase):
 
         num_elems = sample_idx.numel()
 
-        density = torch.full((num_elems,), rho_void, dtype=rho_surface.dtype, device=device)
+        density = torch.zeros((num_elems,), dtype=rho_surface.dtype, device=device)
         fiber = torch.zeros((num_elems, 3), dtype=fiber_surface.dtype, device=device)
         fiber[:, 0] = 1.0
 
@@ -1321,7 +1407,7 @@ class ThickenShell(problemBase):
 
         has_samples = counts > 0
 
-        core_density = torch.full((num_elems,), rho_void, dtype=rho_surface.dtype, device=device)
+        core_density = torch.zeros((num_elems,), dtype=rho_surface.dtype, device=device)
         core_fiber = torch.zeros((num_elems, 3), dtype=fiber_surface.dtype, device=device)
         core_fiber[:, 0] = 1.0
         core_density[has_samples] = rho_sum[has_samples] / counts[has_samples]
@@ -1353,6 +1439,7 @@ class ThickenShell(problemBase):
 
         return {
             "density": density,
+            "shell_occupancy": occ.to(dtype=rho_surface.dtype),
             "phi": phi,
             "theta": theta,
             "fixed": self.boundaryCondition["fixed"],

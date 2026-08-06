@@ -14,11 +14,9 @@ def main():
 
     expected_keys = {
         "seeds_raw",
-        "w_raw",
     }
     assert set(out.keys()) == expected_keys
     assert out["seeds_raw"].shape == (5, 2)
-    assert out["w_raw"].shape == (5, 5)
     print("from HDVClassnNet import PPNet works")
     print("out keys:", sorted(out.keys()))
 

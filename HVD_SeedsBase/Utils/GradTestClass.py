@@ -979,7 +979,7 @@ class TopologyChangeMonitor:
                     "current_signature": signature,
                     "edge_count": self._edge_count(topology),
                     "edge_type_counts": self._edge_type_counts(topology),
-                    "minimum_seed_distance": self._minimum_seed_distance(seeds_uv),
+                    "minimum_control_point_distance": self._minimum_control_point_distance(seeds_uv),
                 }
             )
             self.previous_signature = signature
@@ -1038,7 +1038,7 @@ class TopologyChangeMonitor:
         return {int(k): int(v) for k, v in Counter(int(x) for x in values).items()}
 
     @staticmethod
-    def _minimum_seed_distance(seeds_uv: torch.Tensor) -> float:
+    def _minimum_control_point_distance(seeds_uv: torch.Tensor) -> float:
         seeds = seeds_uv.detach()
         if seeds.shape[0] < 2:
             return float("inf")

@@ -81,7 +81,7 @@ class ContinuousVoronoiDecoder(nn.Module):
     reconstructs those finite clipped segments differentiably.
     """
 
-    def __init__(self,Cad_domain: any, face_mesh: torch.Tensor, eps: float=1e-08, solve_reg: float=1e-06, tau_voronoi: float=0.01, tau_box: float=0.01, tau_trim: float=0.01, use_trim_activity: bool=True,vertex_boundary_margin: float=0.02, edge_trim_samples: int=32, edge_trim_reduction: str='softmin', edge_trim_reduce_tau: float=0.05, use_edge_trim_gate: bool=True, n_seeds: int | None=None, w_min: float=0.02, w_max_ratio: float=0.5, raw_temp: float=1.0, beta: float=0.02, centerline_softmin_tau: float=0.02, centerline_beta: float | None=None, tube_curve_samples: int=64, tube_lift_tau: float=0.02, tube_lift_max_values: int=4000000, tube_distance_tau: float | None=None, tube_density_tau: float | None=None, tube_fiber_tau: float | None=None, rho_min: float=0.0, face_u_periodic: Any=False, face_v_periodic: Any=False, nearest_segment_k: int=4, use_segment_distance: bool=True, use_spatial_pruning: bool=True, min_tube_spacing: float=1e-3, tube_target_spacing_ratio: float=0.75, use_seed_activation: bool=True, duplicate_merge_sigma: float=1e-4, duplicate_effect_temp_ratio: float=0.25, seed_domain_mask_threshold: float=0.5, min_active_seeds: int=3, **unused_kwargs: Any):
+    def __init__(self,Cad_domain: any, face_mesh: torch.Tensor, eps: float=1e-08, solve_reg: float=1e-06, tau_voronoi: float=0.01, tau_box: float=0.01, tau_trim: float=0.01, use_trim_activity: bool=True,vertex_boundary_margin: float=0.02, edge_trim_samples: int=32, edge_trim_reduction: str='softmin', edge_trim_reduce_tau: float=0.05, use_edge_trim_gate: bool=True, n_seeds: int | None=None, strut_thickness: float=0.25, beta: float=0.02, centerline_softmin_tau: float=0.02, centerline_beta: float | None=None, tube_curve_samples: int=64, tube_lift_tau: float=0.02, tube_lift_max_values: int=4000000, tube_distance_tau: float | None=None, tube_density_tau: float | None=None, tube_fiber_tau: float | None=None, rho_min: float=0.0, face_u_periodic: Any=False, face_v_periodic: Any=False, nearest_segment_k: int=4, use_segment_distance: bool=True, use_spatial_pruning: bool=True, min_tube_spacing: float=1e-3, tube_target_spacing_ratio: float=0.75, use_seed_activation: bool=True, duplicate_effect_temp_ratio: float=0.25, seed_domain_mask_threshold: float=0.5, min_active_seeds: int=3, **unused_kwargs: Any):
         super().__init__()
         self.Cad_domain = Cad_domain
         self.face_mesh = face_mesh
@@ -97,9 +97,7 @@ class ContinuousVoronoiDecoder(nn.Module):
         self.edge_trim_reduce_tau = float(edge_trim_reduce_tau)
         self.use_edge_trim_gate = bool(use_edge_trim_gate)
         self.n_seeds = None if n_seeds is None else int(n_seeds)
-        self.w_min = float(w_min)
-        self.w_max_ratio = float(w_max_ratio)
-        self.raw_temp = float(raw_temp)
+        self.strut_thickness = float(strut_thickness)
         self.beta = float(beta)
         self.centerline_softmin_tau = float(centerline_softmin_tau)
         self.centerline_beta = self.beta if centerline_beta is None else float(centerline_beta)
@@ -118,7 +116,6 @@ class ContinuousVoronoiDecoder(nn.Module):
         self.min_tube_spacing = float(min_tube_spacing)
         self.tube_target_spacing_ratio = float(tube_target_spacing_ratio)
         self.use_seed_activation = bool(use_seed_activation)
-        self.duplicate_merge_sigma = float(duplicate_merge_sigma)
         self.duplicate_effect_temp_ratio = float(duplicate_effect_temp_ratio)
         self.seed_domain_mask_threshold = float(seed_domain_mask_threshold)
         self.min_active_seeds = int(min_active_seeds)
@@ -194,6 +191,7 @@ class ContinuousVoronoiDecoder(nn.Module):
     def _seed_activation_state(
         self,
         seeds: torch.Tensor,
+        seed_xyz: torch.Tensor | None = None,
         seed_domain_sdf: torch.Tensor | Callable[[torch.Tensor], torch.Tensor] | None = None,
         seed_domain_mask: torch.Tensor | Callable[[torch.Tensor], torch.Tensor] | None = None,
         seed_domain_mask_threshold: float | None = None,
@@ -212,6 +210,13 @@ class ContinuousVoronoiDecoder(nn.Module):
             raise ValueError(f'seeds must have shape [S, 2], got {tuple(seeds.shape)}.')
         if not seeds.is_floating_point():
             raise TypeError('seeds must be a floating point tensor.')
+        if seed_xyz is not None:
+            if seed_xyz.ndim != 2 or seed_xyz.shape != (seeds.shape[0], 3):
+                raise ValueError(
+                    "seed_xyz must have shape [S, 3] matching seeds, "
+                    f"got {tuple(seed_xyz.shape)} for seeds {tuple(seeds.shape)}."
+                )
+            seed_xyz = seed_xyz.to(device=seeds.device, dtype=seeds.dtype)
         s = seeds.shape[0]
         device = seeds.device
         dtype = seeds.dtype
@@ -225,7 +230,7 @@ class ContinuousVoronoiDecoder(nn.Module):
                 "duplicate_activity_weight": torch.empty((0,), dtype=dtype, device=device),
             }
 
-        radius = torch.as_tensor(self.duplicate_merge_sigma, dtype=dtype, device=device)
+        radius = torch.as_tensor(1.5 * max(float(self.strut_thickness), 0.0), dtype=dtype, device=device)
         temp = (radius * float(self.duplicate_effect_temp_ratio)).clamp_min(self.eps)
         u = seeds[:, 0]
         v = seeds[:, 1]
@@ -259,13 +264,13 @@ class ContinuousVoronoiDecoder(nn.Module):
             if not bool(keep[local_i].detach().cpu().item()):
                 continue
             i = candidate_ids[local_i]
-            pi = seeds[i]
+            pi = seed_xyz[i] if seed_xyz is not None else seeds[i]
             for local_j in range(local_i + 1, candidate_ids.shape[0]):
                 if not bool(keep[local_j].detach().cpu().item()):
                     continue
                 j = candidate_ids[local_j]
-                pj = seeds[j]
-                if u_periodic or v_periodic:
+                pj = seed_xyz[j] if seed_xyz is not None else seeds[j]
+                if seed_xyz is None and (u_periodic or v_periodic):
                     d = self.periodic_distance(pi, pj, u_periodic=u_periodic, v_periodic=v_periodic)
                 else:
                     d = torch.linalg.vector_norm(pi - pj)
@@ -278,19 +283,22 @@ class ContinuousVoronoiDecoder(nn.Module):
 
         duplicate_weight = torch.ones((s,), dtype=dtype, device=device)
         if s > 1:
-            diff = self.periodic_difference(
-                seeds[:, None, :],
-                seeds[None, :, :],
-                u_periodic=u_periodic,
-                v_periodic=v_periodic,
-            )
+            if seed_xyz is not None:
+                diff = seed_xyz[:, None, :] - seed_xyz[None, :, :]
+            else:
+                diff = self.periodic_difference(
+                    seeds[:, None, :],
+                    seeds[None, :, :],
+                    u_periodic=u_periodic,
+                    v_periodic=v_periodic,
+                )
             dist = torch.sqrt((diff * diff).sum(dim=-1) + self.eps)
             soft_close = torch.sigmoid((radius - dist) / temp)
             soft_close = soft_close.masked_fill(torch.eye(s, dtype=torch.bool, device=device), 0.0)
             candidate_pair = duplicate_candidate_mask[:, None] & duplicate_candidate_mask[None, :]
             lower_priority = torch.tril(torch.ones((s, s), dtype=torch.bool, device=device), diagonal=-1)
             suppress_mass = (soft_close * (candidate_pair & lower_priority).to(dtype)).sum(dim=1)
-            duplicate_weight = torch.exp(-suppress_mass)
+            duplicate_weight = torch.exp(-12.0 * suppress_mass)
 
         activity_weight = box_weight * domain_weight * duplicate_weight
         return {
@@ -620,6 +628,12 @@ class ContinuousVoronoiDecoder(nn.Module):
             raise ValueError('Torch CAD evaluator must return XYZ with shape [E*n_samples, 3].')
         return xyz.reshape(curves_uv.shape[0], curves_uv.shape[1], 3)
 
+    def seed_xyz_from_uv(self, cad_domain: Any, seeds_uv: torch.Tensor) -> torch.Tensor:
+        return self.sample_smooth_edge_curves_xyz(
+            cad_domain,
+            seeds_uv.reshape(-1, 1, 2),
+        ).reshape(-1, 3)
+
     def adaptive_sample_count_from_curves(
         self,
         curves: torch.Tensor,
@@ -716,28 +730,8 @@ class ContinuousVoronoiDecoder(nn.Module):
         xyz = torch.cat(xyz_chunks, dim=0) if xyz_chunks else support_xyz.new_empty((0, 3))
         return xyz.reshape(*original_shape, 3)
 
-    def width(self, w_raw: torch.Tensor, seeds: torch.Tensor | None=None, **_: Any) -> torch.Tensor:
-        """Map raw width to a non-negative UV radius.
-
-        A raw value of zero means core curves only. Positive raw values grow
-        thickness through a temperature-smoothed positive transform. Minimum
-        printable feature constraints can be applied by training code later.
-        """
-        if w_raw.ndim != 2 or w_raw.shape[0] != w_raw.shape[1]:
-            raise ValueError(f'w_raw must be square [S,S], got {tuple(w_raw.shape)}.')
-        if seeds is not None and (seeds.ndim != 2 or seeds.shape[-1] != 2):
-            raise ValueError('seeds must have shape [S, 2].')
-        if w_raw.shape[0] > 1:
-            pair_mask = torch.triu(torch.ones_like(w_raw, dtype=torch.bool), diagonal=1)
-            width_raw_global = w_raw[pair_mask].mean()
-        else:
-            width_raw_global = w_raw.mean()
-        temp = w_raw.new_tensor(max(float(self.raw_temp), self.eps))
-        zero = width_raw_global.new_tensor(0.0)
-        soft_zero = width_raw_global.new_tensor(np.log(2.0))
-        positive_width = temp * (F.softplus(width_raw_global / temp) - soft_zero)
-        w_geo = torch.where(width_raw_global > 0.0, positive_width, zero)
-        return w_geo.expand_as(w_raw)
+    def centerline_radius(self, reference: torch.Tensor) -> torch.Tensor:
+        return reference.new_tensor(0.5 * max(float(self.strut_thickness), 0.0))
 
     def _local_uv_to_xyz_scale(self, Xu: torch.Tensor | None, Xv: torch.Tensor | None, ref_xyz: torch.Tensor) -> torch.Tensor:
         if Xu is None or Xv is None:
@@ -838,23 +832,160 @@ class ContinuousVoronoiDecoder(nn.Module):
         aabb_max = torch.maximum(seg_a, seg_b)
         return (seg_a, seg_b, tangents, aabb_min, aabb_max)
 
-    def point_to_segments_distance(self, query_xyz: torch.Tensor, seg_a: torch.Tensor, seg_b: torch.Tensor) -> torch.Tensor:
-        """Return point-to-segment distances for every query/segment pair."""
+    def point_to_segments_distance(
+        self,
+        query_xyz: torch.Tensor,
+        seg_a: torch.Tensor,
+        seg_b: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Calculate distances from every query point to every segment.
+
+        Parameters
+        ----------
+        query_xyz:
+            Tensor with shape [M, 3].
+        seg_a:
+            Segment start points with shape [G, 3].
+        seg_b:
+            Segment end points with shape [G, 3].
+
+        Returns
+        -------
+        torch.Tensor
+            Distance matrix with shape [M, G].
+
+        Notes
+        -----
+        This implementation avoids constructing [M, G, 3] tensors.
+        It is intended mainly for nearest-segment searching, normally
+        under torch.no_grad().
+        """
         if query_xyz.ndim != 2 or query_xyz.shape[-1] != 3:
-            raise ValueError('query_xyz must have shape [M, 3].')
-        if seg_a.ndim != 2 or seg_a.shape[-1] != 3 or seg_b.shape != seg_a.shape:
-            raise ValueError('seg_a and seg_b must have shape [G, 3].')
+            raise ValueError("query_xyz must have shape [M, 3].")
+
+        if (
+            seg_a.ndim != 2
+            or seg_a.shape[-1] != 3
+            or seg_b.shape != seg_a.shape
+        ):
+            raise ValueError("seg_a and seg_b must have shape [G, 3].")
+
         if query_xyz.device != seg_a.device or seg_b.device != seg_a.device:
-            raise ValueError('query_xyz, seg_a, and seg_b must share a device.')
+            raise ValueError(
+                "query_xyz, seg_a, and seg_b must use the same device."
+            )
+
         if query_xyz.dtype != seg_a.dtype or seg_b.dtype != seg_a.dtype:
-            raise ValueError('query_xyz, seg_a, and seg_b must share a dtype.')
+            raise ValueError(
+                "query_xyz, seg_a, and seg_b must use the same dtype."
+            )
+
+        distance_eps = max(float(self.eps), 1e-12)
+
         ab = seg_b - seg_a
-        aq = query_xyz[:, None, :] - seg_a[None, :, :]
-        denom = (ab * ab).sum(dim=-1).clamp_min(self.eps)
-        t = (aq * ab[None, :, :]).sum(dim=-1) / denom[None, :]
-        t = t.clamp(0.0, 1.0)
-        closest = seg_a[None, :, :] + t[..., None] * ab[None, :, :]
-        return torch.linalg.vector_norm(query_xyz[:, None, :] - closest, dim=-1)
+        ab_sq = (ab * ab).sum(dim=-1).clamp_min(distance_eps)
+
+        projection = (
+            query_xyz @ ab.transpose(0, 1)
+            - (seg_a * ab).sum(dim=-1)[None, :]
+        )
+
+        t = (projection / ab_sq[None, :]).clamp(0.0, 1.0)
+
+        q_sq = (query_xyz * query_xyz).sum(
+            dim=-1,
+            keepdim=True,
+        )
+        a_sq = (seg_a * seg_a).sum(dim=-1)[None, :]
+        q_dot_a = query_xyz @ seg_a.transpose(0, 1)
+
+        qa_sq = q_sq + a_sq - 2.0 * q_dot_a
+
+        distance_sq = (
+            qa_sq
+            - 2.0 * t * projection
+            + t.square() * ab_sq[None, :]
+        )
+
+        return torch.sqrt(
+            distance_sq.clamp_min(0.0) + distance_eps
+        )
+
+    def point_to_selected_segments_distance(
+        self,
+        query_xyz: torch.Tensor,
+        seg_a_selected: torch.Tensor,
+        seg_b_selected: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Calculate differentiable distances from each query point to
+        a small set of selected segments.
+
+        Parameters
+        ----------
+        query_xyz:
+            Query points with shape [M, 3].
+        seg_a_selected:
+            Selected segment start points with shape [M, K, 3].
+        seg_b_selected:
+            Selected segment end points with shape [M, K, 3].
+
+        Returns
+        -------
+        torch.Tensor
+            Distances with shape [M, K].
+        """
+        if query_xyz.ndim != 2 or query_xyz.shape[-1] != 3:
+            raise ValueError("query_xyz must have shape [M, 3].")
+
+        if (
+            seg_a_selected.ndim != 3
+            or seg_a_selected.shape[-1] != 3
+            or seg_b_selected.shape != seg_a_selected.shape
+            or seg_a_selected.shape[0] != query_xyz.shape[0]
+        ):
+            raise ValueError(
+                "Selected segment endpoints must have shape [M, K, 3]."
+            )
+
+        if (
+            query_xyz.device != seg_a_selected.device
+            or seg_b_selected.device != seg_a_selected.device
+        ):
+            raise ValueError(
+                "All tensors must use the same device."
+            )
+
+        if (
+            query_xyz.dtype != seg_a_selected.dtype
+            or seg_b_selected.dtype != seg_a_selected.dtype
+        ):
+            raise ValueError(
+                "All tensors must use the same dtype."
+            )
+
+        distance_eps = max(float(self.eps), 1e-12)
+
+        ab = seg_b_selected - seg_a_selected
+        aq = query_xyz[:, None, :] - seg_a_selected
+
+        denominator = (
+            ab * ab
+        ).sum(dim=-1).clamp_min(distance_eps)
+
+        t = (
+            (aq * ab).sum(dim=-1) / denominator
+        ).clamp(0.0, 1.0)
+
+        closest = seg_a_selected + t[..., None] * ab
+        delta = query_xyz[:, None, :] - closest
+
+        distance_sq = (delta * delta).sum(dim=-1)
+
+        return torch.sqrt(
+            distance_sq.clamp_min(0.0) + distance_eps
+        )
 
     def _safe_normalize_fiber(self, fiber: torch.Tensor) -> torch.Tensor:
         default = fiber.new_tensor([1.0, 0.0, 0.0]).expand_as(fiber)
@@ -949,33 +1080,112 @@ class ContinuousVoronoiDecoder(nn.Module):
         tau_density_t = elem_centers_xyz.new_tensor(float(tau_density))
         tau_fiber_t = elem_centers_xyz.new_tensor(float(tau_fiber))
         active_band = radius_tensor + 3.0 * tau_density_t
-        max_cdist_values = 16000000
-        chunk_size = max(1, min(int(elem_centers_xyz.shape[0]), max_cdist_values // max(int(seg_a.shape[0]), 1)))
+        max_pair_values = 100_000
+        segment_block_size = max(1, min(int(seg_a.shape[0]), 256))
+        chunk_size = max(1, min(int(elem_centers_xyz.shape[0]), max_pair_values // segment_block_size))
         distance_chunks = []
         fiber_chunks = []
-        nearest_k = min(int(self.nearest_segment_k), int(seg_a.shape[0]))
+        requested_nearest_k = max(1, int(self.nearest_segment_k))
+        nearest_k = min(requested_nearest_k, int(seg_a.shape[0]))
+        debug_tube_memory = False
+        debug_active_queries = 0
         for start in range(0, int(elem_centers_xyz.shape[0]), chunk_size):
             end = min(start + chunk_size, int(elem_centers_xyz.shape[0]))
             query = elem_centers_xyz[start:end]
             active = torch.ones((query.shape[0],), dtype=torch.bool, device=query.device)
             if self.use_spatial_pruning:
-                below = (aabb_min[None, :, :] - active_band) - query[:, None, :]
-                above = query[:, None, :] - (aabb_max[None, :, :] + active_band)
-                outside_delta = torch.clamp(torch.maximum(below, above), min=0.0)
-                aabb_dist = torch.linalg.vector_norm(outside_delta, dim=-1)
-                active = (aabb_dist <= self.eps).any(dim=1)
+                with torch.no_grad():
+                    query_search = query.detach()
+                    aabb_min_search = aabb_min.detach()
+                    aabb_max_search = aabb_max.detach()
+                    active_band_search = active_band.detach()
+                    active = torch.zeros((query.shape[0],), dtype=torch.bool, device=query.device)
+                    for seg_start in range(0, int(seg_a.shape[0]), segment_block_size):
+                        seg_end = min(seg_start + segment_block_size, int(seg_a.shape[0]))
+                        below = (aabb_min_search[None, seg_start:seg_end, :] - active_band_search) - query_search[:, None, :]
+                        above = query_search[:, None, :] - (aabb_max_search[None, seg_start:seg_end, :] + active_band_search)
+                        outside_delta = torch.clamp(torch.maximum(below, above), min=0.0)
+                        aabb_dist = torch.linalg.vector_norm(outside_delta, dim=-1)
+                        active = active | (aabb_dist <= self.eps).any(dim=1)
+                        del below, above, outside_delta, aabb_dist
             chunk_distance = elem_centers_xyz.new_full((query.shape[0],), float('inf'))
             chunk_fiber = fallback[start:end].clone()
             if bool(active.any()):
                 active_query = query[active]
-                distances = self.point_to_segments_distance(active_query, seg_a, seg_b)
-                nearest_distances, nearest_ids = torch.topk(distances, k=nearest_k, dim=1, largest=False)
+                num_active = int(active_query.shape[0])
+                debug_active_queries += num_active
+
+                with torch.no_grad():
+                    search_query = active_query.detach()
+                    search_seg_a = seg_a.detach()
+                    search_seg_b = seg_b.detach()
+                    search_nearest_distances = active_query.new_full(
+                        (num_active, nearest_k),
+                        float('inf'),
+                    )
+                    nearest_ids = torch.zeros(
+                        (num_active, nearest_k),
+                        dtype=torch.long,
+                        device=active_query.device,
+                    )
+
+                    for seg_start in range(0, int(search_seg_a.shape[0]), segment_block_size):
+                        seg_end = min(seg_start + segment_block_size, int(search_seg_a.shape[0]))
+                        block_search_distances = self.point_to_segments_distance(
+                            search_query,
+                            search_seg_a[seg_start:seg_end],
+                            search_seg_b[seg_start:seg_end],
+                        )
+                        block_k = min(nearest_k, int(block_search_distances.shape[1]))
+                        block_values, block_ids = torch.topk(
+                            block_search_distances,
+                            k=block_k,
+                            dim=1,
+                            largest=False,
+                        )
+                        block_ids = block_ids + seg_start
+                        merged_values = torch.cat((search_nearest_distances, block_values), dim=1)
+                        merged_ids = torch.cat((nearest_ids, block_ids), dim=1)
+                        search_nearest_distances, merge_order = torch.topk(
+                            merged_values,
+                            k=nearest_k,
+                            dim=1,
+                            largest=False,
+                        )
+                        nearest_ids = torch.gather(merged_ids, dim=1, index=merge_order)
+                        del block_search_distances, block_values, block_ids
+                        del merged_values, merged_ids, merge_order
+
+                selected_seg_a = seg_a[nearest_ids]
+                selected_seg_b = seg_b[nearest_ids]
+                nearest_distances = self.point_to_selected_segments_distance(
+                    query_xyz=active_query,
+                    seg_a_selected=selected_seg_a,
+                    seg_b_selected=selected_seg_b,
+                )
                 chunk_distance[active] = nearest_distances[:, 0]
                 fiber_weights = torch.softmax(-nearest_distances / tau_fiber_t, dim=1)
                 nearest_tangents = seg_tangents[nearest_ids]
                 chunk_fiber[active] = (fiber_weights.unsqueeze(-1) * nearest_tangents).sum(dim=1)
             distance_chunks.append(chunk_distance)
             fiber_chunks.append(chunk_fiber)
+        if debug_tube_memory:
+            allocated = reserved = None
+            if torch.cuda.is_available() and elem_centers_xyz.device.type == 'cuda':
+                allocated = torch.cuda.memory_allocated(elem_centers_xyz.device)
+                reserved = torch.cuda.memory_reserved(elem_centers_xyz.device)
+            print(
+                "soft_tube_density_and_fiber_to_elements debug: "
+                f"queries={int(elem_centers_xyz.shape[0])}, "
+                f"active_queries={debug_active_queries}, "
+                f"segments={int(seg_a.shape[0])}, "
+                f"nearest_k={nearest_k}, "
+                f"query_chunk_size={chunk_size}, "
+                f"segment_block_size={segment_block_size}, "
+                f"estimated_search_pair_count={chunk_size * segment_block_size}, "
+                f"gpu_allocated={allocated}, "
+                f"gpu_reserved={reserved}"
+            )
         d_soft = torch.cat(distance_chunks, dim=0)
         occupancy = torch.where(
             torch.isfinite(d_soft),
@@ -2078,6 +2288,7 @@ class ContinuousVoronoiDecoder(nn.Module):
         seed_duplicate_activity_weight = torch.ones_like(seed_activity_weight)
 
         if self.use_seed_activation:
+            seed_xyz_for_activation = self.seed_xyz_from_uv(cad_domain, seeds_uv)
             seed_domain_sdf = None
             seed_domain_mask = None
             if self.use_trim_activity:
@@ -2087,6 +2298,7 @@ class ContinuousVoronoiDecoder(nn.Module):
                     seed_domain_mask = lambda points: cad_domain.smooth_inside_activity(points, tau=self.tau_trim)
             seed_activation = self._seed_activation_state(
                 seeds_uv,
+                seed_xyz=seed_xyz_for_activation,
                 seed_domain_sdf=seed_domain_sdf,
                 seed_domain_mask=seed_domain_mask,
                 seed_domain_mask_threshold=self.seed_domain_mask_threshold,
@@ -2229,13 +2441,13 @@ class ContinuousVoronoiDecoder(nn.Module):
     def forward(
         self,
         seeds_uv: torch.Tensor | None=None,
-        w_raw: torch.Tensor | None=None,
         generate_density_fiber : bool=True,
+        **unused_kwargs: Any,
     ) -> dict[str, Any]:
             if seeds_uv is None:
+                seeds_uv = unused_kwargs.pop("seeds_raw", None)
+            if seeds_uv is None:
                 raise ValueError('seeds_raw must be provided.')
-            if w_raw is None:
-                raise ValueError('w_raw must be provided.')
             if self.points_3d is None:
                 raise ValueError('points_3d for mesh must be provided.')
             points_uv = torch.as_tensor(self.points_uv, dtype=seeds_uv.dtype, device=seeds_uv.device)
@@ -2253,10 +2465,8 @@ class ContinuousVoronoiDecoder(nn.Module):
                 v_periodic=use_v_periodic,
             )
             #print(f"scipy+smooth took {perf_counter() - scipy_smooth_start:.6f}s")
-            w_geo = self.width(w_raw, seeds=seeds_uv)
-            width_uv = self._pair_upper_mean(w_geo)
             local_scale = self._local_uv_to_xyz_scale(Xu, Xv, points_3d)
-            radius_3d = (width_uv * local_scale).clamp_min(0.0)
+            radius_3d = self.centerline_radius(points_3d).clamp_min(0.0)
             tau_distance = max(float(self.tube_distance_tau), self.eps) * local_scale.clamp_min(self.eps)
             tau_density = max(float(self.tube_density_tau), self.eps) * local_scale.clamp_min(self.eps)
             tau_fiber = max(float(self.tube_fiber_tau), self.eps) * local_scale.clamp_min(self.eps)
@@ -2265,7 +2475,7 @@ class ContinuousVoronoiDecoder(nn.Module):
             if curves_uv is None:
                 curves_uv = points_uv.new_empty((0, min_tube_samples, 2))
             curves_uv = topo_out.get('edge_curves_uv')
-            seeds_xyz = self.sample_smooth_edge_curves_xyz(cad_domain, seeds_uv.reshape(-1, 1, 2)).reshape(-1, 3)
+            seeds_xyz = self.seed_xyz_from_uv(cad_domain, seeds_uv)
             curves_xyz = topo_out.get('edge_curves_xyz')
 
             if curves_xyz.shape[0] == 0 or not generate_density_fiber:
@@ -2295,7 +2505,7 @@ class ContinuousVoronoiDecoder(nn.Module):
                 'density': field['density'],
                 'fiber3d': field['fiber'],
                 'tube_distance': field['distance'],
-                'w_geo': w_geo,
+                'strut_thickness': points_3d.new_tensor(float(self.strut_thickness)),
                 'centerline_radius': radius_3d,
                 'edge_curves_uv': curves_uv,
                 'edge_curves_xyz': curves_xyz,
