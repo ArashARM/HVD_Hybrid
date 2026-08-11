@@ -84,7 +84,7 @@ def test_infeasible_stage2_monitor_uses_mechanical_violation():
     assert torch.allclose(monitor, torch.tensor(0.25), atol=1e-12)
 
 
-def test_overall_infeasible_stage2_monitor_uses_active_seed_violation():
+def test_overall_infeasible_stage2_monitor_uses_geometric_violation():
     trainer = make_trainer()
 
     monitor = trainer.calculate_stage_monitor(
@@ -112,10 +112,15 @@ def test_stage1_monitor_uses_effective_weighted_normalized_terms():
             "loss_fem_norm": torch.tensor(2.0),
             "loss_l_curve_cell_norm": torch.tensor(5.0),
             "loss_rep_norm": torch.tensor(7.0),
-            "loss_l_seed_norm": torch.tensor(11.0),
+            "loss_seed_spacing": torch.tensor(11.0),
             "L_total": torch.tensor(999.0),
         },
-        {"lam_cvt": 3.0, "lam_l_curve_cell": 0.0, "lam_rep": 1.0, "lam_l_seed": 2.0},
+        {
+            "lam_cvt": 3.0,
+            "lam_l_curve_cell": 0.0,
+            "lam_rep": 1.0,
+            "lam_seed_spacing": 2.0,
+        },
     )
 
     assert torch.allclose(monitor, torch.tensor(68.0))
@@ -157,7 +162,7 @@ def test_legacy_joint_optimization_config_fields_are_gone():
         "lam_fem",
         "lam_cvt",
         "lam_rep",
-        "lam_l_seed",
+        "lam_seed_spacing",
         "lam_total_fiber_length",
         "lam_l_curve_cell",
     }
@@ -180,7 +185,7 @@ def test_stage_configs_include_all_stage_objective_lambdas():
         "lam_fem",
         "lam_cvt",
         "lam_rep",
-        "lam_l_seed",
+        "lam_seed_spacing",
         "lam_total_fiber_length",
         "lam_l_curve_cell",
     }
@@ -259,175 +264,16 @@ def test_removed_eval_terms_are_absent_from_runtime_output_surfaces():
         assert all(token not in text for token in removed_tokens), path
 
 
-def test_active_distance_ignores_overlapping_inactive_seeds():
-    seeds_xyz = torch.tensor(
-        [
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0],
-        ]
-    )
-    active_mask = torch.tensor([True, True, False])
-
-    distance = NN_Trainer.min_pairwise_active_seed_distance([seeds_xyz], [active_mask])
-
-    assert math.isclose(distance, 1.0)
-
-
-def test_active_distance_ignores_inactive_seed_overlapping_active_seed():
-    seeds_xyz = torch.tensor(
-        [
-            [0.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0],
-            [2.0, 0.0, 0.0],
-        ]
-    )
-    active_mask = torch.tensor([True, False, True])
-
-    distance = NN_Trainer.min_pairwise_active_seed_distance([seeds_xyz], [active_mask])
-
-    assert math.isclose(distance, 2.0)
-
-
-def test_active_distance_reports_zero_for_overlapping_active_seeds():
-    seeds_xyz = torch.tensor(
-        [
-            [0.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0],
-            [2.0, 0.0, 0.0],
-        ]
-    )
-    active_mask = torch.tensor([True, True, True])
-
-    distance = NN_Trainer.min_pairwise_active_seed_distance([seeds_xyz], [active_mask])
-
-    assert math.isclose(distance, 0.0)
-
-
-def test_active_distance_returns_minimum_3d_pairwise_distance():
-    seeds_xyz = torch.tensor(
-        [
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 0.1, 0.0],
-            [0.0, 0.0, 2.0],
-        ]
-    )
-    active_mask = torch.tensor([True, True, False, True])
-
-    distance = NN_Trainer.min_pairwise_active_seed_distance([seeds_xyz], [active_mask])
-
-    assert math.isclose(distance, 1.0)
-
-
-def test_active_distance_handles_faces_with_different_active_counts():
-    face_a = torch.tensor([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]])
-    mask_a = torch.tensor([True, True])
-    face_b = torch.tensor(
-        [
-            [0.0, 0.0, 0.0],
-            [0.0, 0.5, 0.0],
-            [0.0, 2.0, 0.0],
-        ]
-    )
-    mask_b = torch.tensor([True, True, False])
-
-    distance = NN_Trainer.min_pairwise_active_seed_distance([face_a, face_b], [mask_a, mask_b])
-
-    assert math.isclose(distance, 0.5)
-
-
-def test_active_distance_skips_faces_with_fewer_than_two_active_seeds():
-    skipped_face = torch.tensor([[0.0, 0.0, 0.0], [0.01, 0.0, 0.0]])
-    skipped_mask = torch.tensor([True, False])
-    valid_face = torch.tensor([[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]])
-    valid_mask = torch.tensor([True, True])
-
-    distance = NN_Trainer.min_pairwise_active_seed_distance(
-        [skipped_face, valid_face],
-        [skipped_mask, valid_mask],
-    )
-
-    assert math.isclose(distance, 3.0)
-
-
-def test_active_distance_returns_zero_when_no_face_has_two_active_seeds():
-    distance = NN_Trainer.min_pairwise_active_seed_distance(
-        [
-            torch.tensor([[0.0, 0.0, 0.0], [0.01, 0.0, 0.0]]),
-            torch.tensor([[2.0, 0.0, 0.0]]),
-        ],
-        [
-            torch.tensor([True, False]),
-            torch.tensor([True]),
-        ],
-    )
-
-    assert math.isclose(distance, 0.0)
-
-
-def test_active_distance_rejects_mismatched_face_lists():
-    try:
-        NN_Trainer.min_pairwise_active_seed_distance(
-            [torch.zeros(2, 3)],
-            [],
-        )
-    except ValueError as exc:
-        assert "same length" in str(exc)
-    else:
-        raise AssertionError("mismatched face lists should fail")
-
-
-def test_active_distance_rejects_mask_length_mismatch():
-    try:
-        NN_Trainer.min_pairwise_active_seed_distance(
-            [torch.zeros(2, 3)],
-            [torch.tensor([True])],
-        )
-    except ValueError as exc:
-        assert "mask length" in str(exc)
-    else:
-        raise AssertionError("mask length mismatch should fail")
-
-
-def test_active_distance_config_field_replaces_old_anchor_guard_name():
-    config_names = {field.name for field in fields(TrainingConfig)}
-    active_name = "anchor_guard_min_active_seed_dist_factor"
-    old_name = "anchor_guard_min_" + "seed_dist_factor"
-
-    assert active_name in config_names
-    assert old_name not in config_names
-    try:
-        TrainingConfig(**{old_name: 1.0})
-    except TypeError:
-        pass
-    else:
-        raise AssertionError("old anchor guard spacing field should not be accepted")
-
-
-def test_active_distance_metric_names_are_used_in_runtime_output_surfaces():
-    old_tokens = [
-        "min_pairwise_" + "seed_distance",
-        "minimum_" + "seed_distance",
-        "min_" + "seed_dist",
-        "dm" + "in=",
-        "anchor_guard_min_" + "seed_dist_factor",
+def test_spacing_metric_names_are_used_in_runtime_output_surfaces():
+    forbidden_tokens = [
+        "min_active_seed_dist",
+        "d_active=",
+        "anchor_guard_min_active_seed_dist_factor",
     ]
-    paths = [
-        Path("Training/MainTrain.py"),
-        Path("Utils/testTraining.py"),
-        Path("Utils/GradTestClass.py"),
-        Path("Main.ipynb"),
-    ]
-
-    for path in paths:
-        text = path.read_text(encoding="utf-8")
-        assert all(token not in text for token in old_tokens), path
-
     main_text = Path("Training/MainTrain.py").read_text(encoding="utf-8")
-    assert "min_active_seed_dist" in main_text
-    assert "d_active=" in main_text
-    assert "anchor_guard_min_active_seed_dist_factor" in main_text
+
+    assert all(token not in main_text for token in forbidden_tokens)
+    assert "min_seed_distance" in main_text
 
 
 def test_clone_pred_list_preserves_fixed_thickness_metadata():
@@ -436,7 +282,6 @@ def test_clone_pred_list_preserves_fixed_thickness_metadata():
         "seeds_raw": torch.zeros(2, 2),
         "centerline_radius": torch.tensor(0.125),
         "strut_thickness": 0.25,
-        "seed_active_mask": torch.tensor([True, False]),
     }
 
     cloned = NN_Trainer._clone_pred_list([pred])
@@ -491,7 +336,7 @@ def test_next_stage_objective_selects_best_incoming_stage2_monitor_from_stored_m
         stage2_lam_l_curve_cell=0.5,
         stage2_lam_rep=0.0,
         stage2_lam_cvt=0.0,
-        stage2_lam_l_seed=0.0,
+        lam_seed_spacing=0.0,
     )
     runtime = StageRuntime(spec=trainer._adaptive_stage_specs()[0])
     runtime.stage_best_raw_checkpoint = {
@@ -572,11 +417,11 @@ def make_stage_runtime(min_steps=1, max_steps=20, patience=3):
     )
 
 
-def controller_row(identifier, *, total_edges=3, active=4):
+def controller_row(identifier, *, total_edges=3, seed_count=4):
     return {
         "topology_identifier": identifier,
         "number_of_total_edges": total_edges,
-        "active_units_total": active,
+        "total_seed_count": seed_count,
     }
 
 

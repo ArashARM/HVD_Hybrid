@@ -25,8 +25,8 @@ def checkpoint_feasibility_key(
     *,
     physical_displacement_ratio: float,
     physical_stress_ratio: float,
-    hard_active_seed_count: float,
-    min_active_seeds: int,
+    physical_feasible: bool | None = None,
+    seed_spacing_feasible: bool,
     design_score: float,
     raw_total_fiber_length: float,
     mechanical_violation: float,
@@ -36,7 +36,6 @@ def checkpoint_feasibility_key(
 ) -> tuple[bool, tuple[float, float, float]]:
     displacement_ratio = float(physical_displacement_ratio)
     stress_ratio = float(physical_stress_ratio)
-    active_count = float(hard_active_seed_count)
     score = float(design_score)
     fiber_length = float(raw_total_fiber_length)
     violation = float(mechanical_violation)
@@ -46,8 +45,6 @@ def checkpoint_feasibility_key(
         displacement_ratio = float("inf")
     if stress_ratio < 0.0:
         stress_ratio = float("inf")
-    if active_count < 0.0:
-        active_count = float("nan")
     if fiber_length < 0.0:
         fiber_length = float("nan")
     if violation < 0.0:
@@ -59,7 +56,6 @@ def checkpoint_feasibility_key(
         math.isfinite(displacement_ratio)
         and math.isfinite(stress_ratio)
     )
-    active_count_is_finite = math.isfinite(active_count)
     score_is_finite = math.isfinite(score)
     fiber_length_is_finite = math.isfinite(fiber_length)
     violation_is_finite = math.isfinite(violation)
@@ -70,17 +66,21 @@ def checkpoint_feasibility_key(
         if ratios_are_finite
         else float("inf")
     )
+    physical_ok = (
+        bool(physical_feasible)
+        if physical_feasible is not None
+        else physical_max_ratio <= 1.0
+    )
     feasible = (
         bool(fem_is_valid)
         and bool(total_loss_is_finite)
         and ratios_are_finite
-        and active_count_is_finite
         and score_is_finite
         and fiber_length_is_finite
         and violation_is_finite
         and step_is_finite
-        and physical_max_ratio <= 1.0
-        and active_count >= int(min_active_seeds)
+        and physical_ok
+        and bool(seed_spacing_feasible)
     )
     if feasible:
         return True, (score, fiber_length, step)

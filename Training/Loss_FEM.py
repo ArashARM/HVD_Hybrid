@@ -218,10 +218,12 @@ class Loss_FEM:
 
         fe_solver = getattr(self.trainer.fem, "fe", None)
         stress_field = getattr(fe_solver, "stress_vm", None)
-        displacement_field = getattr(fe_solver, "displacement_load_dir_elem", None)
+        displacement_field = getattr(fe_solver, "displacement_mag_elem", None)
         if displacement_field is None:
-            displacement_field = getattr(fe_solver, "displacement_mag_elem", None)
-        loaded_boundary_displacement_field = getattr(fe_solver, "displacement_load_dir_loaded_boundary", None)
+            displacement_field = getattr(fe_solver, "displacement_load_dir_elem", None)
+        loaded_boundary_displacement_field = getattr(fe_solver, "displacement_mag_loaded_boundary", None)
+        if loaded_boundary_displacement_field is None:
+            loaded_boundary_displacement_field = getattr(fe_solver, "displacement_load_dir_loaded_boundary", None)
 
         debug.update({
             "fem_solve_scalar_is_finite": self._scalar_tensor_is_finite(solve_scalar),
@@ -239,9 +241,9 @@ class Loss_FEM:
                 loaded_boundary_displacement_field=loaded_boundary_displacement_field,
             )
 
-        displacement_for_loss = loaded_boundary_displacement_field
+        displacement_for_loss = displacement_field
         if not isinstance(displacement_for_loss, torch.Tensor) or displacement_for_loss.numel() == 0:
-            displacement_for_loss = displacement_field
+            displacement_for_loss = loaded_boundary_displacement_field
 
         if not self.tensor_field_is_valid(displacement_for_loss):
             reason = "Displacement field is empty or contains NaN/Inf."

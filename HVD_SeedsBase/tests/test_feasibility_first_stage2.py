@@ -109,24 +109,15 @@ def test_spacing_barrier_increases_when_seeds_approach() -> None:
     assert losses[0] < losses[1] < losses[2]
 
 
-def test_inactive_seed_pairs_have_reduced_influence() -> None:
+def test_spacing_barrier_uses_all_seed_pairs() -> None:
     seeds = torch.tensor(
         [[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]],
         dtype=torch.float64,
     )
 
-    active_loss = seed_spacing_barrier_loss(
-        seeds,
-        safe_distance=1.0,
-        seed_active_weights=torch.tensor([1.0, 1.0], dtype=torch.float64),
-    )
-    inactive_loss = seed_spacing_barrier_loss(
-        seeds,
-        safe_distance=1.0,
-        seed_active_weights=torch.tensor([1.0, 1.0e-6], dtype=torch.float64),
-    )
+    loss = seed_spacing_barrier_loss(seeds, safe_distance=1.0)
 
-    assert inactive_loss.item() < active_loss.item()
+    assert loss.item() > 0.0
 
 
 def test_feasible_stage2_objective_includes_complete_fem_total() -> None:
@@ -136,13 +127,12 @@ def test_feasible_stage2_objective_includes_complete_fem_total() -> None:
         loss_total_fiber_length_stage2_norm=torch.tensor(0.8),
         loss_cvt_normalized=torch.tensor(1.0),
         loss_rep_normalized=torch.tensor(0.0),
-        loss_seed=torch.tensor(0.0),
+        validity_loss=torch.tensor(0.0),
         loss_curve_cell_normalized=torch.tensor(0.0),
         lam_fem_step=10.0,
         lam_total_fiber_length_step=1.0,
         lam_cvt_step=0.03,
         lam_rep_step=0.0,
-        lam_l_seed_step=0.0,
         lam_l_curve_cell_step=0.0,
     )
 
@@ -159,13 +149,12 @@ def test_stage2_training_loss_keeps_fem_total_separate_from_design_score() -> No
         loss_total_fiber_length_stage2_norm=torch.tensor(1.94624),
         loss_cvt_normalized=torch.tensor(0.0),
         loss_rep_normalized=torch.tensor(0.0),
-        loss_seed=torch.tensor(0.0),
+        validity_loss=torch.tensor(0.0),
         loss_curve_cell_normalized=torch.tensor(0.0),
         lam_fem_step=2.0,
         lam_total_fiber_length_step=1.0,
         lam_cvt_step=0.0,
         lam_rep_step=0.0,
-        lam_l_seed_step=0.0,
         lam_l_curve_cell_step=0.0,
     )
 
@@ -185,13 +174,12 @@ def test_feasible_stage2_baseline_gradient_is_preserved() -> None:
         loss_total_fiber_length_stage2_norm=torch.tensor(0.8),
         loss_cvt_normalized=torch.tensor(0.0),
         loss_rep_normalized=torch.tensor(0.0),
-        loss_seed=torch.tensor(0.0),
+        validity_loss=torch.tensor(0.0),
         loss_curve_cell_normalized=torch.tensor(0.0),
         lam_fem_step=10.0,
         lam_total_fiber_length_step=1.0,
         lam_cvt_step=0.0,
         lam_rep_step=0.0,
-        lam_l_seed_step=0.0,
         lam_l_curve_cell_step=0.0,
     )
 
@@ -208,13 +196,12 @@ def test_stage2_objective_matches_design_score_when_complete_fem_total_is_zero()
         loss_total_fiber_length_stage2_norm=torch.tensor(0.8),
         loss_cvt_normalized=torch.tensor(0.0),
         loss_rep_normalized=torch.tensor(0.0),
-        loss_seed=torch.tensor(0.0),
+        validity_loss=torch.tensor(0.0),
         loss_curve_cell_normalized=torch.tensor(0.0),
         lam_fem_step=10.0,
         lam_total_fiber_length_step=1.0,
         lam_cvt_step=0.0,
         lam_rep_step=0.0,
-        lam_l_seed_step=0.0,
         lam_l_curve_cell_step=0.0,
     )
 
@@ -238,13 +225,12 @@ def test_stage2_design_score_increases_monotonically_with_each_design_loss() -> 
             loss_total_fiber_length_stage2_norm=torch.tensor(fiber),
             loss_cvt_normalized=torch.tensor(cvt),
             loss_rep_normalized=torch.tensor(rep),
-            loss_seed=torch.tensor(seed),
+            validity_loss=torch.tensor(seed),
             loss_curve_cell_normalized=torch.tensor(curve_cell),
             lam_fem_step=10.0,
             lam_total_fiber_length_step=2.0,
             lam_cvt_step=3.0,
             lam_rep_step=5.0,
-            lam_l_seed_step=7.0,
             lam_l_curve_cell_step=11.0,
         )
         return float(score.item())
@@ -264,13 +250,12 @@ def test_infeasible_stage2_objective_is_fem_dominated() -> None:
         loss_total_fiber_length_stage2_norm=torch.tensor(0.8),
         loss_cvt_normalized=torch.tensor(0.0),
         loss_rep_normalized=torch.tensor(0.0),
-        loss_seed=torch.tensor(0.0),
+        validity_loss=torch.tensor(0.0),
         loss_curve_cell_normalized=torch.tensor(0.0),
         lam_fem_step=10.0,
         lam_total_fiber_length_step=1.0,
         lam_cvt_step=0.0,
         lam_rep_step=0.0,
-        lam_l_seed_step=0.0,
         lam_l_curve_cell_step=0.0,
     )
 
@@ -288,13 +273,12 @@ def test_stage2_objective_does_not_normalize_fem() -> None:
         loss_total_fiber_length_stage2_norm=torch.tensor(0.0),
         loss_cvt_normalized=torch.tensor(0.0),
         loss_rep_normalized=torch.tensor(0.0),
-        loss_seed=torch.tensor(0.0),
+        validity_loss=torch.tensor(0.0),
         loss_curve_cell_normalized=torch.tensor(0.0),
         lam_fem_step=10.0,
         lam_total_fiber_length_step=0.0,
         lam_cvt_step=0.0,
         lam_rep_step=0.0,
-        lam_l_seed_step=0.0,
         lam_l_curve_cell_step=0.0,
     )
 
@@ -320,9 +304,9 @@ def test_stage2_progress_log_reports_updated_feasible_best_without_generic_best(
         "lam_fem_eff": 2.0,
         "physical_stress_ratio": 0.9,
         "physical_displacement_ratio": 0.8,
-        "hard_active_seed_count": 12,
+        "total_seed_count": 12,
         "physical_feasible": True,
-        "active_seed_feasible": True,
+        "seed_spacing_feasible": True,
         "overall_feasible": True,
         "overall_constraint_violation": 0.0,
         "patience_active": True,
@@ -375,6 +359,15 @@ def test_stage1_placeholder_fem_is_excluded_from_stage2_checkpoint_ranking() -> 
         fem_was_evaluated=False,
         fem_is_valid=True,
         total_loss_is_finite=True,
+        fem_constraints_active=True,
+    )
+    assert NN_Trainer._is_stage2_physical_checkpoint_candidate(
+        stage_id=2,
+        first_physical_stage=2,
+        fem_was_evaluated=False,
+        fem_is_valid=True,
+        total_loss_is_finite=True,
+        fem_constraints_active=False,
     )
     assert NN_Trainer._is_stage2_physical_checkpoint_candidate(
         stage_id=2,
@@ -413,7 +406,8 @@ def test_no_obsolete_raw_fiber_first_checkpoint_ranking_remains() -> None:
     assert "- float(lam_cvt_step) * loss_cvt_normalized" not in combined_source
     assert "- float(lam_rep_step) * loss_rep_normalized" not in combined_source
     assert "- float(lam_l_curve_cell_step) * loss_curve_cell_normalized" not in combined_source
-    assert "- float(lam_l_seed_step) * loss_seed" not in combined_source
+    assert "lam_l_seed_step" not in combined_source
+    assert "loss_seed" not in combined_source
 
 
 def test_best_feasible_key_uses_design_score_before_raw_fiber_length() -> None:
@@ -454,8 +448,7 @@ def test_infeasible_shorter_fiber_cannot_replace_feasible_checkpoint() -> None:
     feasible, feasible_key = checkpoint_feasibility_key(
         physical_displacement_ratio=0.9,
         physical_stress_ratio=0.9,
-        hard_active_seed_count=10,
-        min_active_seeds=5,
+        seed_spacing_feasible=True,
         design_score=7.0,
         raw_total_fiber_length=70.0,
         mechanical_violation=0.0,
@@ -465,8 +458,7 @@ def test_infeasible_shorter_fiber_cannot_replace_feasible_checkpoint() -> None:
     infeasible, _ = checkpoint_feasibility_key(
         physical_displacement_ratio=1.2,
         physical_stress_ratio=0.9,
-        hard_active_seed_count=10,
-        min_active_seeds=5,
+        seed_spacing_feasible=True,
         design_score=6.0,
         raw_total_fiber_length=60.0,
         mechanical_violation=0.2,
@@ -490,7 +482,7 @@ def test_live_best_feasible_metadata_uses_stage_monitor(tmp_path) -> None:
             "loss_total_fiber_length": 12.0,
             "physical_stress_ratio": 0.8,
             "physical_displacement_ratio": 0.7,
-            "hard_active_count": 9,
+            "total_seed_count": 9,
         },
         "pred_list": [],
     }
@@ -523,7 +515,7 @@ def test_stage1_monitor_ignores_stage2_terms() -> None:
     monitor = trainer.calculate_stage_monitor(
         1,
         {
-            "loss_l_seed_norm": torch.tensor(2.0),
+            "loss_seed_spacing": torch.tensor(2.0),
             "loss_cvt_norm": torch.tensor(3.0),
             "loss_rep_norm": torch.tensor(5.0),
             "loss_l_curve_cell_norm": torch.tensor(7.0),
@@ -532,7 +524,7 @@ def test_stage1_monitor_ignores_stage2_terms() -> None:
             "loss_fem": torch.tensor(100.0),
         },
         {
-            "lam_l_seed": 11.0,
+            "lam_seed_spacing": 11.0,
             "lam_cvt": 13.0,
             "lam_rep": 17.0,
             "lam_l_curve_cell": 19.0,

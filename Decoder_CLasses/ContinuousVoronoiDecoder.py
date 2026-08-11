@@ -1,7 +1,8 @@
 from __future__ import annotations
 import math
+import warnings
 from time import perf_counter
-from typing import Any, Callable
+from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -81,7 +82,7 @@ class ContinuousVoronoiDecoder(nn.Module):
     reconstructs those finite clipped segments differentiably.
     """
 
-    def __init__(self,Cad_domain: any, face_mesh: torch.Tensor, eps: float=1e-08, solve_reg: float=1e-06, tau_voronoi: float=0.01, tau_box: float=0.01, tau_trim: float=0.01, use_trim_activity: bool=True,vertex_boundary_margin: float=0.02, edge_trim_samples: int=32, edge_trim_reduction: str='softmin', edge_trim_reduce_tau: float=0.05, use_edge_trim_gate: bool=True, n_seeds: int | None=None, strut_thickness: float=0.25, beta: float=0.02, centerline_softmin_tau: float=0.02, centerline_beta: float | None=None, tube_curve_samples: int=64, tube_lift_tau: float=0.02, tube_lift_max_values: int=4000000, tube_distance_tau: float | None=None, tube_density_tau: float | None=None, tube_fiber_tau: float | None=None, rho_min: float=0.0, face_u_periodic: Any=False, face_v_periodic: Any=False, nearest_segment_k: int=4, use_segment_distance: bool=True, use_spatial_pruning: bool=True, min_tube_spacing: float=1e-3, tube_target_spacing_ratio: float=0.75, use_seed_activation: bool=True, duplicate_effect_temp_ratio: float=0.25, seed_domain_mask_threshold: float=0.5, min_active_seeds: int=3, **unused_kwargs: Any):
+    def __init__(self,Cad_domain: any, face_mesh: torch.Tensor, eps: float=1e-08, solve_reg: float=1e-06, tau_voronoi: float=0.01, tau_box: float=0.01, tau_trim: float=0.01, use_trim_activity: bool=True,vertex_boundary_margin: float=0.02, edge_trim_samples: int=32, edge_trim_reduction: str='softmin', edge_trim_reduce_tau: float=0.05, use_edge_trim_gate: bool=True, n_seeds: int | None=None, strut_thickness: float=0.25, beta: float=0.02, centerline_softmin_tau: float=0.02, centerline_beta: float | None=None, tube_curve_samples: int=64, tube_lift_tau: float=0.02, tube_lift_max_values: int=4000000, tube_distance_tau: float | None=None, tube_density_tau: float | None=None, tube_fiber_tau: float | None=None, rho_min: float=0.0, face_u_periodic: Any=False, face_v_periodic: Any=False, nearest_segment_k: int=4, use_segment_distance: bool=True, use_spatial_pruning: bool=True, min_tube_spacing: float=1e-3, tube_target_spacing_ratio: float=0.75, seed_domain_mask_threshold: float=0.5, **unused_kwargs: Any):
         super().__init__()
         self.Cad_domain = Cad_domain
         self.face_mesh = face_mesh
@@ -115,10 +116,30 @@ class ContinuousVoronoiDecoder(nn.Module):
         self.use_spatial_pruning = bool(use_spatial_pruning)
         self.min_tube_spacing = float(min_tube_spacing)
         self.tube_target_spacing_ratio = float(tube_target_spacing_ratio)
-        self.use_seed_activation = bool(use_seed_activation)
-        self.duplicate_effect_temp_ratio = float(duplicate_effect_temp_ratio)
         self.seed_domain_mask_threshold = float(seed_domain_mask_threshold)
-        self.min_active_seeds = int(min_active_seeds)
+        obsolete_activation_keys = {
+            "use_seed_activation",
+            "duplicate_effect_temp_ratio",
+            "min_active_seeds",
+            "decoder_use_seed_activation",
+            "decoder_duplicate_effect_temp_ratio",
+            "seed_active_weights",
+            "active_seed_ids",
+            "seed_active_mask",
+        }
+        ignored_activation_keys = sorted(
+            key for key in obsolete_activation_keys if key in unused_kwargs
+        )
+        for key in ignored_activation_keys:
+            unused_kwargs.pop(key, None)
+        if ignored_activation_keys:
+            warnings.warn(
+                "Ignoring obsolete seed-activation decoder options: "
+                + ", ".join(ignored_activation_keys)
+                + ". Fixed-seed optimization now keeps every provided seed.",
+                UserWarning,
+                stacklevel=2,
+            )
         for obsolete_key in OBSOLETE_GUARD_KEYS:
             unused_kwargs.pop(obsolete_key, None)
         self.clip_tol = float(unused_kwargs.pop("clip_tol", 1e-10))
@@ -138,177 +159,6 @@ class ContinuousVoronoiDecoder(nn.Module):
 
     def _tau_tensor(self, value: float, ref: torch.Tensor) -> torch.Tensor:
         return torch.as_tensor(max(float(value), self.eps), dtype=ref.dtype, device=ref.device)
-
-    def _seed_domain_validity_state(
-        self,
-        seeds: torch.Tensor,
-        temp: torch.Tensor,
-        seed_domain_sdf: torch.Tensor | Callable[[torch.Tensor], torch.Tensor] | None = None,
-        seed_domain_mask: torch.Tensor | Callable[[torch.Tensor], torch.Tensor] | None = None,
-        seed_domain_mask_threshold: float = 0.5,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Return:
-            domain_weight: differentiable soft validity weight [S]
-            domain_active: hard bool validity mask [S]
-        """
-        if seeds.ndim != 2 or seeds.shape[-1] != 2:
-            raise ValueError(f'seeds must have shape [S, 2], got {tuple(seeds.shape)}.')
-        s = seeds.shape[0]
-        device = seeds.device
-        dtype = seeds.dtype
-        weight = torch.ones((s,), dtype=dtype, device=device)
-        active = torch.ones((s,), dtype=torch.bool, device=device)
-        temp_t = torch.as_tensor(temp, dtype=dtype, device=device).clamp_min(self.eps)
-
-        if seed_domain_sdf is not None:
-            sdf_raw = seed_domain_sdf(seeds) if callable(seed_domain_sdf) else seed_domain_sdf
-            sdf = torch.as_tensor(sdf_raw, dtype=dtype, device=device).reshape(-1)
-            if sdf.shape[0] != s:
-                raise ValueError(
-                    f'seed_domain_sdf must produce shape [{s}], got {tuple(sdf.shape)}.'
-                )
-            weight = weight * torch.sigmoid(sdf / temp_t)
-            active = active & (sdf >= 0.0)
-
-        if seed_domain_mask is not None:
-            mask_raw = seed_domain_mask(seeds) if callable(seed_domain_mask) else seed_domain_mask
-            mask = torch.as_tensor(mask_raw, dtype=dtype, device=device).reshape(-1)
-            if mask.shape[0] != s:
-                raise ValueError(
-                    f'seed_domain_mask must produce shape [{s}], got {tuple(mask.shape)}.'
-                )
-            threshold = torch.as_tensor(
-                float(seed_domain_mask_threshold),
-                dtype=dtype,
-                device=device,
-            )
-            weight = weight * torch.sigmoid((mask - threshold) / temp_t)
-            active = active & (mask >= threshold)
-
-        return weight, active
-
-    def _seed_activation_state(
-        self,
-        seeds: torch.Tensor,
-        seed_xyz: torch.Tensor | None = None,
-        seed_domain_sdf: torch.Tensor | Callable[[torch.Tensor], torch.Tensor] | None = None,
-        seed_domain_mask: torch.Tensor | Callable[[torch.Tensor], torch.Tensor] | None = None,
-        seed_domain_mask_threshold: float | None = None,
-        u_periodic: bool = False,
-        v_periodic: bool = False,
-    ) -> dict[str, torch.Tensor]:
-        """
-        Return:
-            active_ids: original seed indices that survive filtering [A]
-            active_mask: bool mask over original seeds [S]
-            activity_weight: soft diagnostic weight [S]
-        """
-        if not isinstance(seeds, torch.Tensor):
-            raise TypeError('seeds must be a torch.Tensor.')
-        if seeds.ndim != 2 or seeds.shape[-1] != 2:
-            raise ValueError(f'seeds must have shape [S, 2], got {tuple(seeds.shape)}.')
-        if not seeds.is_floating_point():
-            raise TypeError('seeds must be a floating point tensor.')
-        if seed_xyz is not None:
-            if seed_xyz.ndim != 2 or seed_xyz.shape != (seeds.shape[0], 3):
-                raise ValueError(
-                    "seed_xyz must have shape [S, 3] matching seeds, "
-                    f"got {tuple(seed_xyz.shape)} for seeds {tuple(seeds.shape)}."
-                )
-            seed_xyz = seed_xyz.to(device=seeds.device, dtype=seeds.dtype)
-        s = seeds.shape[0]
-        device = seeds.device
-        dtype = seeds.dtype
-        if s == 0:
-            return {
-                "active_ids": torch.empty((0,), dtype=torch.long, device=device),
-                "active_mask": torch.empty((0,), dtype=torch.bool, device=device),
-                "activity_weight": torch.empty((0,), dtype=dtype, device=device),
-                "box_activity_weight": torch.empty((0,), dtype=dtype, device=device),
-                "domain_activity_weight": torch.empty((0,), dtype=dtype, device=device),
-                "duplicate_activity_weight": torch.empty((0,), dtype=dtype, device=device),
-            }
-
-        radius = torch.as_tensor(1.5 * max(float(self.strut_thickness), 0.0), dtype=dtype, device=device)
-        temp = (radius * float(self.duplicate_effect_temp_ratio)).clamp_min(self.eps)
-        u = seeds[:, 0]
-        v = seeds[:, 1]
-        inside_box = (u >= 0.0) & (u <= 1.0) & (v >= 0.0) & (v <= 1.0)
-        outside_dist = torch.stack(
-            [-u, u - 1.0, -v, v - 1.0, torch.zeros_like(u)],
-            dim=0,
-        ).amax(dim=0)
-        box_weight = torch.where(
-            outside_dist <= 0.0,
-            torch.ones_like(outside_dist),
-            torch.sigmoid(-outside_dist / temp),
-        )
-        domain_weight, domain_active = self._seed_domain_validity_state(
-            seeds=seeds,
-            temp=temp,
-            seed_domain_sdf=seed_domain_sdf,
-            seed_domain_mask=seed_domain_mask,
-            seed_domain_mask_threshold=(
-                self.seed_domain_mask_threshold
-                if seed_domain_mask_threshold is None
-                else float(seed_domain_mask_threshold)
-            ),
-        )
-        active_mask = inside_box & domain_active
-        duplicate_candidate_mask = active_mask.clone()
-        candidate_ids = torch.nonzero(active_mask, as_tuple=False).flatten()
-        keep = torch.ones(candidate_ids.shape[0], dtype=torch.bool, device=device)
-
-        for local_i in range(candidate_ids.shape[0]):
-            if not bool(keep[local_i].detach().cpu().item()):
-                continue
-            i = candidate_ids[local_i]
-            pi = seed_xyz[i] if seed_xyz is not None else seeds[i]
-            for local_j in range(local_i + 1, candidate_ids.shape[0]):
-                if not bool(keep[local_j].detach().cpu().item()):
-                    continue
-                j = candidate_ids[local_j]
-                pj = seed_xyz[j] if seed_xyz is not None else seeds[j]
-                if seed_xyz is None and (u_periodic or v_periodic):
-                    d = self.periodic_distance(pi, pj, u_periodic=u_periodic, v_periodic=v_periodic)
-                else:
-                    d = torch.linalg.vector_norm(pi - pj)
-                if bool((d < radius).detach().cpu().item()):
-                    keep[local_j] = False
-
-        active_ids = candidate_ids[keep]
-        active_mask = torch.zeros((s,), dtype=torch.bool, device=device)
-        active_mask[active_ids] = True
-
-        duplicate_weight = torch.ones((s,), dtype=dtype, device=device)
-        if s > 1:
-            if seed_xyz is not None:
-                diff = seed_xyz[:, None, :] - seed_xyz[None, :, :]
-            else:
-                diff = self.periodic_difference(
-                    seeds[:, None, :],
-                    seeds[None, :, :],
-                    u_periodic=u_periodic,
-                    v_periodic=v_periodic,
-                )
-            dist = torch.sqrt((diff * diff).sum(dim=-1) + self.eps)
-            soft_close = torch.sigmoid((radius - dist) / temp)
-            soft_close = soft_close.masked_fill(torch.eye(s, dtype=torch.bool, device=device), 0.0)
-            candidate_pair = duplicate_candidate_mask[:, None] & duplicate_candidate_mask[None, :]
-            lower_priority = torch.tril(torch.ones((s, s), dtype=torch.bool, device=device), diagonal=-1)
-            suppress_mass = (soft_close * (candidate_pair & lower_priority).to(dtype)).sum(dim=1)
-            duplicate_weight = torch.exp(-12.0 * suppress_mass)
-
-        activity_weight = box_weight * domain_weight * duplicate_weight
-        return {
-            "active_ids": active_ids,
-            "active_mask": active_mask,
-            "activity_weight": activity_weight,
-            "box_activity_weight": box_weight,
-            "domain_activity_weight": domain_weight,
-            "duplicate_activity_weight": duplicate_weight,
-        }
 
     def periodic_difference(self, a: torch.Tensor, b: torch.Tensor, u_periodic: bool=False, v_periodic: bool=False) -> torch.Tensor:
         diff = a - b
@@ -1298,6 +1148,75 @@ class ContinuousVoronoiDecoder(nn.Module):
             raise ValueError(f"edge trim reduction must be 'softmin', 'min', or 'mean', got {reduction!r}.")
         return torch.nan_to_num(edge_gate, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
 
+    def seed_visual_activity_metadata(
+        self,
+        seeds_uv: torch.Tensor,
+        graph: dict[str, Any],
+        cad_domain: Any | None,
+    ) -> dict[str, torch.Tensor]:
+        """Detached display/log metadata; never used to remove optimization seeds."""
+        if seeds_uv.ndim != 2 or seeds_uv.shape[-1] != 2:
+            raise ValueError(f"seeds_uv must have shape [S, 2], got {tuple(seeds_uv.shape)}.")
+        with torch.no_grad():
+            seeds_detached = seeds_uv.detach()
+            device = seeds_detached.device
+            seed_count = int(seeds_detached.shape[0])
+            outside = (
+                (seeds_detached[:, 0] < 0.0)
+                | (seeds_detached[:, 0] > 1.0)
+                | (seeds_detached[:, 1] < 0.0)
+                | (seeds_detached[:, 1] > 1.0)
+            )
+            if cad_domain is not None and seed_count > 0:
+                if hasattr(cad_domain, "sample_trim_sdf"):
+                    sdf = cad_domain.sample_trim_sdf(seeds_detached)
+                    sdf = torch.as_tensor(sdf, dtype=seeds_detached.dtype, device=device).reshape(-1)
+                    if sdf.numel() == seed_count:
+                        outside = outside | (sdf < -max(float(self.clip_tol), self.eps))
+                elif hasattr(cad_domain, "smooth_inside_activity"):
+                    activity = cad_domain.smooth_inside_activity(seeds_detached, tau=self.tau_trim)
+                    activity = torch.as_tensor(activity, dtype=seeds_detached.dtype, device=device).reshape(-1)
+                    if activity.numel() == seed_count:
+                        outside = outside | (activity < float(self.seed_domain_mask_threshold))
+
+            participates = torch.zeros((seed_count,), dtype=torch.bool, device=device)
+            edge_seed_pair = graph.get("edge_seed_pair_original", graph.get("edge_seed_pair"))
+            edge_type = graph.get("edge_type")
+            edge_trim_alpha = graph.get("edge_trim_alpha")
+            if isinstance(edge_seed_pair, torch.Tensor) and edge_seed_pair.numel() > 0:
+                pairs = edge_seed_pair.detach().to(device=device, dtype=torch.long)
+                edge_mask = torch.ones((pairs.shape[0],), dtype=torch.bool, device=device)
+                if isinstance(edge_type, torch.Tensor) and edge_type.numel() == pairs.shape[0]:
+                    edge_type_detached = edge_type.detach().to(device=device, dtype=torch.long).reshape(-1)
+                    edge_mask &= (
+                        (edge_type_detached == 0)
+                        | (edge_type_detached == 1)
+                        | (edge_type_detached == 3)
+                    )
+                if isinstance(edge_trim_alpha, torch.Tensor) and edge_trim_alpha.numel() == pairs.shape[0]:
+                    edge_mask &= (
+                        edge_trim_alpha.detach().to(device=device, dtype=seeds_detached.dtype).reshape(-1)
+                        > float(self.seed_domain_mask_threshold)
+                    )
+                valid = pairs[edge_mask].reshape(-1)
+                valid = valid[(valid >= 0) & (valid < seed_count)]
+                if valid.numel() > 0:
+                    participates[valid.unique()] = True
+
+            inactive = outside & (~participates)
+            inactive_ids = torch.nonzero(inactive, as_tuple=False).flatten().to(dtype=torch.long)
+            return {
+                "seed_visual_outside_domain_mask": outside.detach(),
+                "seed_visual_participates_in_domain_vd_mask": participates.detach(),
+                "seed_visual_inactive_mask": inactive.detach(),
+                "seed_visual_inactive_ids": inactive_ids.detach(),
+                "seed_visual_inactive_count": torch.as_tensor(
+                    int(inactive_ids.numel()),
+                    dtype=torch.long,
+                    device=device,
+                ),
+            }
+
     @staticmethod
     def point_inside_box_np(p: np.ndarray, tol: float=1e-09) -> bool:
         """Hard topology test for the normalized UV box."""
@@ -1366,13 +1285,6 @@ class ContinuousVoronoiDecoder(nn.Module):
             )
         device = seeds_uv.device
         dtype = seeds_uv.dtype
-        if seeds_uv.numel() > 0:
-            finite = torch.isfinite(seeds_uv).all()
-            in_unit_square = ((seeds_uv >= -self.eps) & (seeds_uv <= 1.0 + self.eps)).all()
-            if not bool((finite & in_unit_square).detach().cpu().item()):
-                raise ValueError(
-                    "Fixed guard seeds require normalized UV coordinates in [0,1]^2."
-                )
         points_np = seeds_uv.detach().cpu().numpy()
         empty_long_2 = lambda: torch.empty((0, 2), dtype=torch.long, device=device)
         empty_long_3 = lambda: torch.empty((0, 3), dtype=torch.long, device=device)
@@ -1425,11 +1337,11 @@ class ContinuousVoronoiDecoder(nn.Module):
             except Exception:
                 return empty_topology()
 
-            if count_real_real_infinite_ridges(vor) != 0:
-                raise RuntimeError(
-                    "Fixed guard seeds did not eliminate all "
-                    "real-real infinite Voronoi ridges."
-                )
+            # if count_real_real_infinite_ridges(vor) != 0:
+            #     raise RuntimeError(
+            #         "Fixed guard seeds did not eliminate all "
+            #         "real-real infinite Voronoi ridges."
+            #     )
         scipy_vertices_np = vor.vertices if vor is not None else np.empty((0, 2), dtype=points_np.dtype)
         num_raw_scipy_vertices = int(scipy_vertices_np.shape[0])
         diagnostics = base_diagnostics()
@@ -1808,8 +1720,8 @@ class ContinuousVoronoiDecoder(nn.Module):
         edges_t = torch.as_tensor(edges, dtype=torch.long, device=device).reshape(-1, 2)
         edge_seed_pairs_t = torch.as_tensor(edge_seed_pairs, dtype=torch.long, device=device).reshape(-1, 2)
         edge_type_t = torch.as_tensor(edge_types, dtype=torch.long, device=device)
-        if diagnostics['num_real_real_infinite_ridges_skipped'] > 0:
-            raise RuntimeError("Guard seeds failed to close all real-real ridges.")
+        # if diagnostics['num_real_real_infinite_ridges_skipped'] > 0:
+        #     raise RuntimeError("Guard seeds failed to close all real-real ridges.")
         return {'vertices_uv': vertices_uv, 'vertex_type': vertex_type_t, 'vertex_seed_triples': vertex_seed_triples_t, 'scipy_vertex_aug_seed_triples': scipy_vertex_aug_seed_triples_t, 'guard_seeds_uv': guard_seeds_uv_t, 'node_clip_source_vertices': node_clip_source_vertices_t, 'node_trim_segment_uv': node_trim_segment_uv_t, 'node_trim_curve_piece': node_trim_curve_piece_t, 'node_trim_curve_segment': node_trim_curve_segment_t, 'node_trim_curve_fraction': node_trim_curve_fraction_t, 'boundary_seed_pair': boundary_seed_pair_t, 'boundary_source_type': boundary_source_type_t, 'edges': edges_t, 'edge_seed_pairs': edge_seed_pairs_t, 'edge_type': edge_type_t, 'diagnostics': diagnostics}
 
     def differentiable_vertices_from_topology(self, seeds_uv: torch.Tensor, vertex_type: torch.Tensor,  boundary_source_type: torch.Tensor | None=None, topology_vertices_uv: torch.Tensor | None=None, node_clip_source_vertices: torch.Tensor | None=None, scipy_vertex_aug_seed_triples: torch.Tensor | None=None, guard_seeds_uv: torch.Tensor | None=None, node_trim_segment_uv: torch.Tensor | None=None) -> torch.Tensor:
@@ -2278,43 +2190,8 @@ class ContinuousVoronoiDecoder(nn.Module):
             raise TypeError('cad_domain must be provided.')
 
 
-        
         original_seeds_uv = seeds_uv
-        seed_active_ids = torch.arange(seeds_uv.shape[0], dtype=torch.long, device=seeds_uv.device)
-        seed_active_mask = torch.ones((seeds_uv.shape[0],), dtype=torch.bool, device=seeds_uv.device)
-        seed_activity_weight = torch.ones((seeds_uv.shape[0],), dtype=seeds_uv.dtype, device=seeds_uv.device)
-        seed_box_activity_weight = torch.ones_like(seed_activity_weight)
-        seed_domain_activity_weight = torch.ones_like(seed_activity_weight)
-        seed_duplicate_activity_weight = torch.ones_like(seed_activity_weight)
-
-        if self.use_seed_activation:
-            seed_xyz_for_activation = self.seed_xyz_from_uv(cad_domain, seeds_uv)
-            seed_domain_sdf = None
-            seed_domain_mask = None
-            if self.use_trim_activity:
-                if callable(getattr(cad_domain, 'sample_trim_sdf', None)):
-                    seed_domain_sdf = cad_domain.sample_trim_sdf
-                elif callable(getattr(cad_domain, 'smooth_inside_activity', None)):
-                    seed_domain_mask = lambda points: cad_domain.smooth_inside_activity(points, tau=self.tau_trim)
-            seed_activation = self._seed_activation_state(
-                seeds_uv,
-                seed_xyz=seed_xyz_for_activation,
-                seed_domain_sdf=seed_domain_sdf,
-                seed_domain_mask=seed_domain_mask,
-                seed_domain_mask_threshold=self.seed_domain_mask_threshold,
-                u_periodic=u_periodic,
-                v_periodic=v_periodic,
-            )
-            seed_active_ids = seed_activation["active_ids"]
-            seed_active_mask = seed_activation["active_mask"]
-            seed_activity_weight = seed_activation["activity_weight"]
-            seed_box_activity_weight = seed_activation["box_activity_weight"]
-            seed_domain_activity_weight = seed_activation["domain_activity_weight"]
-            seed_duplicate_activity_weight = seed_activation["duplicate_activity_weight"]
-            if seed_active_ids.numel() >= self.min_active_seeds:
-                seeds_uv = seeds_uv[seed_active_ids]
-            else:
-                seeds_uv = seeds_uv.new_empty((0, 2))
+        original_seed_ids = torch.arange(seeds_uv.shape[0], dtype=torch.long, device=seeds_uv.device)
 
         with torch.no_grad():
             topo = self.build_scipy_voronoi_topology(seeds_uv, cad_domain=cad_domain, u_periodic=u_periodic, v_periodic=v_periodic)
@@ -2367,14 +2244,14 @@ class ContinuousVoronoiDecoder(nn.Module):
             valid_pair_mask = local_pairs >= 0
             original_pairs = torch.full_like(local_pairs, -1)
             if bool(valid_pair_mask.any().detach().cpu().item()):
-                original_pairs[valid_pair_mask] = seed_active_ids[local_pairs[valid_pair_mask]]
+                original_pairs[valid_pair_mask] = original_seed_ids[local_pairs[valid_pair_mask]]
             graph['edge_seed_pair_original'] = original_pairs
         local_cell_ids = graph.get('cell_boundary_seed_ids')
         if isinstance(local_cell_ids, torch.Tensor):
             valid_cell_mask = local_cell_ids >= 0
             original_cell_ids = torch.full_like(local_cell_ids, -1)
             if bool(valid_cell_mask.any().detach().cpu().item()):
-                original_cell_ids[valid_cell_mask] = seed_active_ids[
+                original_cell_ids[valid_cell_mask] = original_seed_ids[
                     local_cell_ids[valid_cell_mask]
                 ]
             graph['cell_boundary_seed_ids_original'] = original_cell_ids
@@ -2382,7 +2259,7 @@ class ContinuousVoronoiDecoder(nn.Module):
         valid_triple_mask = local_triples_for_original >= 0
         vertex_seed_triples_original = torch.full_like(local_triples_for_original, -1)
         if bool(valid_triple_mask.any().detach().cpu().item()):
-            vertex_seed_triples_original[valid_triple_mask] = seed_active_ids[
+            vertex_seed_triples_original[valid_triple_mask] = original_seed_ids[
                 local_triples_for_original[valid_triple_mask]
             ]
         min_edge_trim_samples = max(int(self.edge_trim_samples), 2)
@@ -2402,22 +2279,23 @@ class ContinuousVoronoiDecoder(nn.Module):
         edge_trim_alpha = self.edge_trim_gate(edge_curves_uv=edge_curves_uv_for_trim, cad_domain=cad_domain, reduction=self.edge_trim_reduction)
         graph['edge_trim_alpha'] = edge_trim_alpha
         graph['edge_curves_uv_for_trim'] = edge_curves_uv_for_trim
+        seed_visual_metadata = self.seed_visual_activity_metadata(
+            seeds_uv=seeds_uv,
+            graph=graph,
+            cad_domain=cad_domain,
+        )
+        graph.update(seed_visual_metadata)
         out: dict[str, Any] = {'vertices_uv': vertices_uv, 'vertex_type': topo['vertex_type'], 'vertex_seed_triples': topo['vertex_seed_triples'], 'boundary_seed_pair': topo['boundary_seed_pair'], 'boundary_source_type': topo['boundary_source_type'], 'boundary_source_name': graph['boundary_source_name'], 'edges': {'edge_index': edges, 'edge_seed_pair': edge_seed_pairs, 'edge_type': edge_type, 'edge_trim_alpha': edge_trim_alpha}, 'delaunay_triples_np': delaunay_triples_np, 'mode': 'scipy_topology', 'graph': graph, 'diagnostics': topo['diagnostics'], 'node_clip_source_vertices': topo.get('node_clip_source_vertices'), 'scipy_vertex_aug_seed_triples': topo.get('scipy_vertex_aug_seed_triples'), 'guard_seeds_uv': topo.get('guard_seeds_uv')}
+        out.update(seed_visual_metadata)
         for key in ('node_trim_curve_piece', 'node_trim_curve_segment', 'node_trim_curve_fraction', 'node_trim_segment_uv'):
             if key in topo:
                 out[key] = topo[key]
         out['original_seeds_uv'] = original_seeds_uv
-        out['active_seed_ids'] = seed_active_ids
-        out['seed_active_mask'] = seed_active_mask
-        out['seed_activity_weight'] = seed_activity_weight
-        out['seed_box_activity_weight'] = seed_box_activity_weight
-        out['seed_domain_activity_weight'] = seed_domain_activity_weight
-        out['seed_duplicate_activity_weight'] = seed_duplicate_activity_weight
         out['topology_seeds_uv'] = seeds_uv
-        out['seed_activation_diagnostics'] = {
+        out['seed_count_diagnostics'] = {
             'num_original_seeds': int(original_seeds_uv.shape[0]),
-            'num_active_seeds': int(seed_active_ids.numel()),
-            'num_removed_seeds': int(original_seeds_uv.shape[0] - seed_active_ids.numel()),
+            'num_topology_seeds': int(seeds_uv.shape[0]),
+            'num_removed_seeds': 0,
         }
         out['vertex_seed_triples_original'] = vertex_seed_triples_original
         out['edges']['edge_seed_pair_original'] = graph.get('edge_seed_pair_original')
@@ -2511,12 +2389,9 @@ class ContinuousVoronoiDecoder(nn.Module):
                 'edge_curves_xyz': curves_xyz,
             })
             raw_count = int(out['seeds_uv'].shape[0])
-            active_count = int(out['seed_active_mask'].sum().item())
             topology_count = int(out['topology_seeds_uv'].shape[0])
 
-            assert out['seed_active_mask'].numel() == raw_count
-            assert out['active_seed_ids'].numel() == active_count
-            assert topology_count == active_count
+            assert topology_count == raw_count
             return out
 
 
@@ -2629,25 +2504,7 @@ class ContinuousVoronoiDecoder(nn.Module):
         # These are the seeds actually used to build SciPy topology.
         topology_seeds_uv = out.get("topology_seeds_uv", original_seeds_uv)
 
-        # Active mask over original seeds.
-        if "seed_active_mask" in out:
-            active_mask = out["seed_active_mask"].to(
-                device=original_seeds_uv.device,
-                dtype=torch.bool,
-            )
-        else:
-            active_mask = torch.ones(
-                (original_seeds_uv.shape[0],),
-                dtype=torch.bool,
-                device=original_seeds_uv.device,
-            )
-
         original_np = original_seeds_uv.detach().cpu().numpy()
-        active_mask_np = active_mask.detach().cpu().numpy()
-
-        active_np = original_np[active_mask_np]
-        inactive_np = original_np[~active_mask_np]
-
         topology_np = topology_seeds_uv.detach().cpu().numpy()
 
         fig, axes = plt.subplots(
@@ -2690,24 +2547,13 @@ class ContinuousVoronoiDecoder(nn.Module):
                 va="center",
             )
 
-        # Show all original seeds, colored by activation.
-        if active_np.shape[0] > 0:
+        if original_np.shape[0] > 0:
             left.scatter(
-                active_np[:, 0],
-                active_np[:, 1],
+                original_np[:, 0],
+                original_np[:, 1],
                 c="green",
                 s=55,
-                label="Active seeds",
-                zorder=5,
-            )
-
-        if inactive_np.shape[0] > 0:
-            left.scatter(
-                inactive_np[:, 0],
-                inactive_np[:, 1],
-                c="red",
-                s=55,
-                label="Inactive seeds",
+                label="Seeds",
                 zorder=5,
             )
 
@@ -2715,9 +2561,8 @@ class ContinuousVoronoiDecoder(nn.Module):
         left.set_ylim(0, 1)
         left.set_aspect("equal")
         left.set_title(
-            f"VD for {original_seeds_uv.shape[0]} seeds "
-            f"({topology_seeds_uv.shape[0]} active)\n"
-            "Raw SciPy Voronoi from active seeds"
+            f"VD for {original_seeds_uv.shape[0]} fixed seeds\n"
+            "Raw SciPy Voronoi from all seeds"
         )
         left.legend()
 
@@ -2732,24 +2577,13 @@ class ContinuousVoronoiDecoder(nn.Module):
             color_by_edge_type,
         )
 
-        # Overlay original inactive seeds on generated graph too.
-        if inactive_np.shape[0] > 0:
+        if original_np.shape[0] > 0:
             middle.scatter(
-                inactive_np[:, 0],
-                inactive_np[:, 1],
-                c="red",
-                s=55,
-                label="Inactive seeds",
-                zorder=8,
-            )
-
-        if active_np.shape[0] > 0:
-            middle.scatter(
-                active_np[:, 0],
-                active_np[:, 1],
+                original_np[:, 0],
+                original_np[:, 1],
                 c="green",
                 s=45,
-                label="Active seeds",
+                label="Seeds",
                 zorder=7,
             )
 

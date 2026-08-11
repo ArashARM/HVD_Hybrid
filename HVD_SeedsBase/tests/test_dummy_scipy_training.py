@@ -71,12 +71,12 @@ def test_training_config_and_history_surface_have_no_removed_area_fields() -> No
         "lam_total_fiber_length_eff": 0.0,
         "lam_rep_eff": 2.0,
         "lam_l_curve_cell_eff": 0.05,
-        "lam_l_seed_eff": 1.0,
+        "lam_seed_spacing": 1.0,
         "L_total": 0.0,
         "loss_fem_norm": 0.0,
         "loss_cvt_norm": 0.0,
         "loss_rep_norm": 0.0,
-        "loss_l_seed_norm": 0.0,
+        "loss_seed_spacing": 0.0,
         "loss_total_fiber_length_norm": 0.0,
         "loss_l_curve_cell_norm": 0.0,
     }
@@ -588,7 +588,7 @@ class DummyUnitSquareCadDomain:
         return out
 
 
-def test_duplicate_suppression_active_seed_accounting_matches_training_helper() -> None:
+def test_decoder_keeps_all_seed_indices_for_fixed_seed_topology() -> None:
     dtype = torch.float64
     face_mesh = {
         "uv": torch.tensor(
@@ -605,7 +605,6 @@ def test_duplicate_suppression_active_seed_accounting_matches_training_helper() 
     decoder = ContinuousVoronoiDecoder(
         DummyUnitSquareCadDomain(),
         face_mesh,
-        use_seed_activation=True,
         use_trim_activity=False,
         strut_thickness=0.05,
     )
@@ -622,39 +621,31 @@ def test_duplicate_suppression_active_seed_accounting_matches_training_helper() 
     out = decoder(seeds_uv=seeds, generate_density_fiber=False)
 
     raw_count = int(out["seeds_uv"].shape[0])
-    active_count = int(out["seed_active_mask"].sum().item())
+    topology_count = int(out["topology_seeds_uv"].shape[0])
 
     assert raw_count == 5
-    assert active_count < raw_count
-    assert int(out["active_seed_ids"].numel()) == active_count
-    assert int(out["topology_seeds_uv"].shape[0]) == active_count
-
-    counts = NN_Trainer._decoder_seed_activation_counts(out)
-    assert counts["raw"] == raw_count
-    assert counts["active"] == active_count
-    assert counts["topology"] == active_count
-    assert counts["inactive"] == raw_count - active_count
+    assert topology_count == raw_count
+    assert "seed_active_mask" not in out
+    assert "active_seed_ids" not in out
+    assert "seed_activity_weight" not in out
 
 
-def test_prediction_clone_preserves_activation_metadata_for_timelapse() -> None:
+def test_prediction_clone_preserves_fixed_seed_metadata_for_timelapse() -> None:
     pred = {
         "face_id": 0,
         "seeds_raw": torch.zeros((5, 2), dtype=torch.float64),
         "strut_thickness": 0.25,
         "centerline_radius": torch.tensor(0.125, dtype=torch.float64),
         "seeds_uv": torch.zeros((5, 2), dtype=torch.float64),
-        "seed_active_mask": torch.tensor([True, False, True, False, True]),
-        "active_seed_ids": torch.tensor([0, 2, 4], dtype=torch.long),
-        "seed_activity_weight": torch.tensor([1.0, 0.2, 1.0, 0.2, 1.0]),
-        "topology_seeds_uv": torch.zeros((3, 2), dtype=torch.float64),
+        "topology_seeds_uv": torch.zeros((5, 2), dtype=torch.float64),
     }
 
     cached_pred = NN_Trainer._clone_pred_list([pred])[0]
 
-    assert "seed_active_mask" in cached_pred
-    assert "active_seed_ids" in cached_pred
     assert "topology_seeds_uv" in cached_pred
-    assert int(cached_pred["seed_active_mask"].sum().item()) == int(cached_pred["topology_seeds_uv"].shape[0])
+    assert int(cached_pred["seeds_raw"].shape[0]) == int(cached_pred["topology_seeds_uv"].shape[0])
+    assert "seed_active_mask" not in cached_pred
+    assert "active_seed_ids" not in cached_pred
 
 
 class DummyVoronoiSeedTrainer(nn.Module):

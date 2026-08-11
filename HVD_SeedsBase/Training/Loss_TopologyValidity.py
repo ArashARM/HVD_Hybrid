@@ -7,12 +7,11 @@ def seed_spacing_barrier_loss(
     seed_positions: torch.Tensor,
     *,
     safe_distance: float | torch.Tensor,
-    seed_active_weights: torch.Tensor | None = None,
     power: float = 2.0,
     eps: float = 1.0e-12,
 ) -> torch.Tensor:
     """
-    Penalize active seed pairs whose distance is below safe_distance.
+    Penalize seed pairs whose distance is below safe_distance.
 
     The loss is zero for distances greater than or equal to safe_distance.
     """
@@ -44,20 +43,4 @@ def seed_spacing_barrier_loss(
     pair_distances = distances[pair_mask]
     normalized_violation = torch.relu((safe - pair_distances) / safe).pow(float(power))
 
-    if seed_active_weights is None:
-        return normalized_violation.mean()
-
-    activity = seed_active_weights.reshape(-1)
-    if activity.numel() != n_seed:
-        raise ValueError("seed_active_weights must contain one value per seed")
-
-    pair_weights_full = torch.sqrt(
-        activity[:, None].clamp_min(0.0) * activity[None, :].clamp_min(0.0)
-    )
-    pair_weights = pair_weights_full[pair_mask]
-
-    denominator = pair_weights.sum().clamp_min(eps)
-
-    return (
-        pair_weights * normalized_violation
-    ).sum() / denominator
+    return normalized_violation.mean()

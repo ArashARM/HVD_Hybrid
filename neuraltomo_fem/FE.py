@@ -115,16 +115,19 @@ class FE:
         c = (self.f*u).sum()
         uElem = self.u[self.mesh.edofMat].reshape(self.mesh.numElems, self.mesh.numDOFPerElem)
         uElemNodes = uElem.reshape(self.mesh.numElems, 8, 3)
-        disp_mag_elem = torch.linalg.norm(uElemNodes, dim=2).mean(dim=1)
+        disp_mag_elem = torch.linalg.norm(uElemNodes, dim=2).max(dim=1).values
         force_vec = torch.as_tensor(self.mesh.f[:, 0], dtype=torch.float32, device=stiffness_factor.device).reshape(self.mesh.numNodes, 3)
         uNodes = self.u.reshape(self.mesh.numNodes, 3)
+        node_disp_mag = torch.linalg.norm(uNodes, dim=1)
         force_norm = torch.linalg.norm(force_vec, dim=1)
         loaded_node_mask = force_norm > 1e-12
         if torch.any(loaded_node_mask):
             loaded_force_dir = force_vec[loaded_node_mask] / force_norm[loaded_node_mask, None]
             loaded_disp_load_dir = torch.abs(torch.sum(uNodes[loaded_node_mask] * loaded_force_dir, dim=1))
+            loaded_disp_mag = node_disp_mag[loaded_node_mask]
         else:
             loaded_disp_load_dir = torch.empty(0, dtype=torch.float32, device=stiffness_factor.device)
+            loaded_disp_mag = torch.empty(0, dtype=torch.float32, device=stiffness_factor.device)
         load_dir = force_vec.sum(dim=0)
         load_dir_norm = torch.linalg.norm(load_dir)
         if load_dir_norm <= 1e-12:
@@ -144,8 +147,10 @@ class FE:
             )
         )
         self.displacement_mag_elem = disp_mag_elem
+        self.displacement_mag_loaded_boundary = loaded_disp_mag
         self.displacement_load_dir_elem = disp_load_dir_elem
-        self.displacement_load_dir_loaded_boundary = loaded_disp_load_dir
+        self.displacement_load_dir_loaded_boundary = loaded_disp_mag
+        self.displacement_load_dir_loaded_boundary_projection = loaded_disp_load_dir
         self.sigmaElem = sigmaElem
         self.stress_vm = stress_vm
         

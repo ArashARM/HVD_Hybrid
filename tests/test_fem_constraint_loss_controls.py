@@ -22,27 +22,33 @@ class _DummyShellProblem:
 
 
 class _DummyFEM:
-    def __init__(self, stress_scale: float, displacement_scale: float):
+    def __init__(self, stress_scale: float, displacement_scale: float, displacement_mag_scale: float | None = None):
         self.stress_scale = float(stress_scale)
         self.displacement_scale = float(displacement_scale)
+        self.displacement_mag_scale = displacement_mag_scale
         self.fe = SimpleNamespace(
             stress_vm=None,
+            displacement_mag_elem=None,
             displacement_load_dir_elem=None,
+            displacement_mag_loaded_boundary=None,
             displacement_load_dir_loaded_boundary=None,
         )
 
     def __call__(self, stiffness_factor, phi, theta, penal=1.0):
         self.fe.stress_vm = stiffness_factor * self.stress_scale
+        if self.displacement_mag_scale is not None:
+            self.fe.displacement_mag_elem = stiffness_factor * float(self.displacement_mag_scale)
+            self.fe.displacement_mag_loaded_boundary = self.fe.displacement_mag_elem
         self.fe.displacement_load_dir_elem = stiffness_factor * self.displacement_scale
         self.fe.displacement_load_dir_loaded_boundary = self.fe.displacement_load_dir_elem
         return self.fe.stress_vm, self.fe.stress_vm.sum()
 
 
-def _dummy_trainer(stress_scale: float, displacement_scale: float):
+def _dummy_trainer(stress_scale: float, displacement_scale: float, displacement_mag_scale: float | None = None):
     trainer = SimpleNamespace()
     trainer.cfg = SimpleNamespace(fem_training_safety_factor=0.95)
     trainer.shell_problem = _DummyShellProblem()
-    trainer.fem = _DummyFEM(stress_scale, displacement_scale)
+    trainer.fem = _DummyFEM(stress_scale, displacement_scale, displacement_mag_scale)
     trainer.fem_debug_history = []
     trainer.last_fem_debug = None
     trainer._record_invalid_fem_debug = lambda debug, reason, save: None
@@ -105,6 +111,30 @@ def test_fem_loss_rises_sharply_above_limit():
     assert failed_out["physical_stress_ratio"].item() > 1.0
     assert failed_out["violation_fem_loss"].item() > 0.0
     assert failed_out["fem_total"].item() > safe_out["fem_total"].item() * 5.0
+
+
+def test_fem_displacement_constraint_prefers_magnitude_over_load_direction():
+    trainer = _dummy_trainer(
+        stress_scale=0.0,
+        displacement_scale=2.0,
+        displacement_mag_scale=12.0,
+    )
+    loss_fn = Loss_FEM(trainer)
+    rho = torch.ones(4, dtype=torch.float64, requires_grad=True)
+    fiber = torch.ones(4, 3, dtype=torch.float64)
+
+    out = loss_fn.evaluate(
+        rho_surface=rho,
+        fiber_surface=fiber,
+        max_displacement=10.0,
+        yield_strength=10.0,
+        baseline_weight=0.0,
+        stress_density_threshold=None,
+    )
+
+    assert torch.allclose(out["displacement_max"], out["displacement_max"].new_tensor(12.0))
+    assert torch.allclose(out["physical_displacement_ratio"], out["physical_displacement_ratio"].new_tensor(1.2))
+    assert not out["physical_feasible"]
 
 
 def test_constraint_excess_is_zero_inside_limit_and_ratio_based():
@@ -249,8 +279,7 @@ def test_feasible_checkpoint_beats_shorter_failed_checkpoint():
     failed_feasible, failed_key = checkpoint_feasibility_key(
         physical_displacement_ratio=0.8,
         physical_stress_ratio=1.2,
-        hard_active_seed_count=12,
-        min_active_seeds=10,
+            seed_spacing_feasible=True,
         design_score=10.0,
         raw_total_fiber_length=1.0,
         mechanical_violation=0.2,
@@ -260,8 +289,7 @@ def test_feasible_checkpoint_beats_shorter_failed_checkpoint():
     ok_feasible, ok_key = checkpoint_feasibility_key(
         physical_displacement_ratio=0.9,
         physical_stress_ratio=0.9,
-        hard_active_seed_count=12,
-        min_active_seeds=10,
+        seed_spacing_feasible=True,
         design_score=20.0,
         raw_total_fiber_length=2.0,
         mechanical_violation=0.0,
@@ -276,8 +304,7 @@ def test_feasible_checkpoint_beats_shorter_failed_checkpoint():
     shorter_feasible, shorter_key = checkpoint_feasibility_key(
         physical_displacement_ratio=0.95,
         physical_stress_ratio=0.95,
-        hard_active_seed_count=12,
-        min_active_seeds=10,
+        seed_spacing_feasible=True,
         design_score=15.0,
         raw_total_fiber_length=1.5,
         mechanical_violation=0.0,
@@ -502,8 +529,7 @@ def test_nan_physical_ratio_is_infeasible_and_not_ranked_as_nan():
     feasible, key = checkpoint_feasibility_key(
         physical_displacement_ratio=float("nan"),
         physical_stress_ratio=0.5,
-        hard_active_seed_count=12,
-        min_active_seeds=10,
+        seed_spacing_feasible=True,
         design_score=3.0,
         raw_total_fiber_length=3.0,
         mechanical_violation=float("inf"),
@@ -521,8 +547,7 @@ def test_inf_physical_ratio_is_infeasible_with_infinite_violation():
         feasible, key = checkpoint_feasibility_key(
             physical_displacement_ratio=ratio,
             physical_stress_ratio=0.5,
-            hard_active_seed_count=12,
-            min_active_seeds=10,
+        seed_spacing_feasible=True,
             design_score=3.0,
             raw_total_fiber_length=3.0,
             mechanical_violation=float("inf"),
@@ -539,8 +564,7 @@ def test_nonfinite_fiber_length_is_infeasible_and_ranked_as_inf():
         feasible, key = checkpoint_feasibility_key(
             physical_displacement_ratio=0.5,
             physical_stress_ratio=0.5,
-            hard_active_seed_count=12,
-            min_active_seeds=10,
+        seed_spacing_feasible=True,
             design_score=3.0,
             raw_total_fiber_length=length,
             mechanical_violation=0.0,
@@ -552,31 +576,27 @@ def test_nonfinite_fiber_length_is_infeasible_and_ranked_as_inf():
         assert key[1] == float("inf")
 
 
-def test_nonfinite_active_count_is_infeasible_with_infinite_violation():
-    for active_count in (float("nan"), float("inf"), -1.0):
-        feasible, key = checkpoint_feasibility_key(
-            physical_displacement_ratio=0.5,
-            physical_stress_ratio=0.5,
-            hard_active_seed_count=active_count,
-            min_active_seeds=10,
-            design_score=3.0,
-            raw_total_fiber_length=3.0,
-            mechanical_violation=0.0,
-            total_loss_is_finite=True,
-            fem_is_valid=True,
-        )
+def test_spacing_infeasibility_rejects_checkpoint():
+    feasible, key = checkpoint_feasibility_key(
+        physical_displacement_ratio=0.5,
+        physical_stress_ratio=0.5,
+        seed_spacing_feasible=False,
+        design_score=3.0,
+        raw_total_fiber_length=3.0,
+        mechanical_violation=0.25,
+        total_loss_is_finite=True,
+        fem_is_valid=True,
+    )
 
-        assert feasible is False
-        if active_count != float("inf"):
-            assert key[0] == float("inf")
+    assert feasible is False
+    assert key == (0.25, 3.0, 0.0)
 
 
 def test_feasible_ranking_uses_design_score_not_physical_ratio():
     a_feasible, a_key = checkpoint_feasibility_key(
         physical_displacement_ratio=0.99,
         physical_stress_ratio=0.99,
-        hard_active_seed_count=12,
-        min_active_seeds=10,
+        seed_spacing_feasible=True,
         design_score=4.0,
         raw_total_fiber_length=10.0,
         mechanical_violation=0.0,
@@ -586,8 +606,7 @@ def test_feasible_ranking_uses_design_score_not_physical_ratio():
     b_feasible, b_key = checkpoint_feasibility_key(
         physical_displacement_ratio=0.7,
         physical_stress_ratio=0.7,
-        hard_active_seed_count=12,
-        min_active_seeds=10,
+        seed_spacing_feasible=True,
         design_score=5.0,
         raw_total_fiber_length=10.0,
         mechanical_violation=0.0,
@@ -600,6 +619,23 @@ def test_feasible_ranking_uses_design_score_not_physical_ratio():
     assert a_key < b_key
 
 
+def test_physical_feasible_false_rejects_candidate_even_when_ratios_pass():
+    feasible, key = checkpoint_feasibility_key(
+        physical_displacement_ratio=0.5,
+        physical_stress_ratio=0.5,
+        physical_feasible=False,
+        seed_spacing_feasible=True,
+        design_score=3.0,
+        raw_total_fiber_length=10.0,
+        mechanical_violation=0.25,
+        total_loss_is_finite=True,
+        fem_is_valid=True,
+    )
+
+    assert feasible is False
+    assert key == (0.25, 3.0, 0.0)
+
+
 def test_feasible_ranking_uses_design_score_not_fem_training_contribution():
     higher_train_loss = 1.90 + 2.0 * 0.20
     lower_train_loss = 2.00 + 2.0 * 0.01
@@ -608,8 +644,7 @@ def test_feasible_ranking_uses_design_score_not_fem_training_contribution():
     a_feasible, a_key = checkpoint_feasibility_key(
         physical_displacement_ratio=0.8,
         physical_stress_ratio=0.8,
-        hard_active_seed_count=12,
-        min_active_seeds=10,
+        seed_spacing_feasible=True,
         design_score=1.90,
         raw_total_fiber_length=10.0,
         mechanical_violation=0.0,
@@ -620,8 +655,7 @@ def test_feasible_ranking_uses_design_score_not_fem_training_contribution():
     b_feasible, b_key = checkpoint_feasibility_key(
         physical_displacement_ratio=0.8,
         physical_stress_ratio=0.8,
-        hard_active_seed_count=12,
-        min_active_seeds=10,
+        seed_spacing_feasible=True,
         design_score=2.00,
         raw_total_fiber_length=10.0,
         mechanical_violation=0.0,
@@ -639,8 +673,7 @@ def test_feasible_ranking_uses_global_step_as_final_tiebreak():
     earlier_feasible, earlier_key = checkpoint_feasibility_key(
         physical_displacement_ratio=0.7,
         physical_stress_ratio=0.7,
-        hard_active_seed_count=12,
-        min_active_seeds=10,
+        seed_spacing_feasible=True,
         design_score=7.0,
         raw_total_fiber_length=100.0,
         mechanical_violation=0.0,
@@ -651,8 +684,7 @@ def test_feasible_ranking_uses_global_step_as_final_tiebreak():
     later_feasible, later_key = checkpoint_feasibility_key(
         physical_displacement_ratio=0.7,
         physical_stress_ratio=0.7,
-        hard_active_seed_count=12,
-        min_active_seeds=10,
+        seed_spacing_feasible=True,
         design_score=7.0,
         raw_total_fiber_length=100.0,
         mechanical_violation=0.0,
@@ -666,42 +698,20 @@ def test_feasible_ranking_uses_global_step_as_final_tiebreak():
     assert earlier_key < later_key
 
 
-def test_insufficient_active_seeds_enters_infeasible_ranking():
-    active_seed_violation = max(5.0 / max(4.0, 1.0) - 1.0, 0.0)
+def test_spacing_violation_enters_infeasible_ranking():
+    spacing_violation = 0.25
     feasible, key = checkpoint_feasibility_key(
         physical_displacement_ratio=0.7,
         physical_stress_ratio=0.7,
-        hard_active_seed_count=4,
-        min_active_seeds=5,
+        seed_spacing_feasible=False,
         design_score=6.0,
         raw_total_fiber_length=50.0,
-        mechanical_violation=active_seed_violation,
+        mechanical_violation=spacing_violation,
         global_step=10,
         total_loss_is_finite=True,
         fem_is_valid=True,
     )
 
     assert feasible is False
-    assert active_seed_violation > 0.0
+    assert spacing_violation > 0.0
     assert key == (0.25, 6.0, 10.0)
-
-
-def test_fem_feasible_active_count_invalid_is_overall_infeasible():
-    active_seed_violation = max(10.0 / max(8.0, 1.0) - 1.0, 0.0)
-
-    feasible, key = checkpoint_feasibility_key(
-        physical_displacement_ratio=0.8,
-        physical_stress_ratio=0.8,
-        hard_active_seed_count=8,
-        min_active_seeds=10,
-        design_score=1.0,
-        raw_total_fiber_length=12.0,
-        mechanical_violation=active_seed_violation,
-        global_step=20,
-        total_loss_is_finite=True,
-        fem_is_valid=True,
-    )
-
-    assert feasible is False
-    assert active_seed_violation == 0.25
-    assert key == (0.25, 1.0, 20.0)

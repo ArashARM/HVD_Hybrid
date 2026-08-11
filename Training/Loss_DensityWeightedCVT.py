@@ -2,11 +2,6 @@ from __future__ import annotations
 
 import torch
 
-try:
-    from .Loss_ActivityWeights import prepare_seed_activity_weights
-except ImportError:
-    from Loss_ActivityWeights import prepare_seed_activity_weights
-
 
 class LossDensityWeightedCVT:
     def __call__(
@@ -17,12 +12,7 @@ class LossDensityWeightedCVT:
         sample_xyz: torch.Tensor,
         sample_area_weights: torch.Tensor,
         importance: torch.Tensor | None = None,
-        seed_active_weights: torch.Tensor | None = None,
         temperature: float = 0.001,
-        activity_floor: float = 0.02,
-        activity_power: float = 1.0,
-        activity_log_floor: float = 1e-4,
-        activity_temperature: float = 1.0,
         eps: float = 1e-12,
     ) -> torch.Tensor:
         if seeds_uv.ndim != 2 or seeds_uv.shape[-1] != 2:
@@ -115,26 +105,6 @@ class LossDensityWeightedCVT:
         ).clamp_min(eps)
 
         logits = -distance_uv_squared / tau
-
-        if seed_active_weights is not None:
-            g_eff = prepare_seed_activity_weights(
-                seed_active_weights,
-                num_seeds=num_seeds,
-                reference=seeds_uv,
-                floor=activity_floor,
-                power=activity_power,
-                eps=eps,
-            )
-            activity_temperature_t = seeds_uv.new_tensor(
-                activity_temperature,
-            ).clamp_min(eps)
-            activity_log_floor_t = seeds_uv.new_tensor(
-                activity_log_floor,
-            ).clamp_min(eps)
-            activity_prior = torch.log(
-                g_eff.clamp_min(activity_log_floor_t)
-            ) / activity_temperature_t
-            logits = logits + activity_prior[None, :]
 
         ownership = torch.softmax(logits, dim=1)
 
