@@ -113,6 +113,33 @@ def test_fem_loss_rises_sharply_above_limit():
     assert failed_out["fem_total"].item() > safe_out["fem_total"].item() * 5.0
 
 
+def test_fem_safety_margin_is_advisory_below_physical_limit():
+    trainer = _dummy_trainer(stress_scale=8.0, displacement_scale=2.0)
+    trainer.cfg.fem_training_safety_factor = 0.7
+    trainer.cfg.fem_safety_margin_weight = 0.05
+    trainer.cfg.fem_constraint_p_norm = 12.0
+    loss_fn = Loss_FEM(trainer)
+    rho = torch.ones(4, dtype=torch.float64, requires_grad=True)
+    fiber = torch.ones(4, 3, dtype=torch.float64)
+
+    out = loss_fn.evaluate(
+        rho_surface=rho,
+        fiber_surface=fiber,
+        max_displacement=10.0,
+        yield_strength=10.0,
+        baseline_weight=0.0,
+        violation_power=4.0,
+        stress_density_threshold=None,
+    )
+
+    assert out["physical_feasible"]
+    assert out["constraint_violation"].item() == 0.0
+    assert out["stress_margin_loss"].item() > 0.0
+    assert out["stress_violation_loss"].item() == 0.0
+    assert out["violation_fem_loss"].item() > 0.0
+    assert out["violation_fem_loss"].item() < 1.0e-3
+
+
 def test_fem_displacement_constraint_prefers_magnitude_over_load_direction():
     trainer = _dummy_trainer(
         stress_scale=0.0,
@@ -135,6 +162,41 @@ def test_fem_displacement_constraint_prefers_magnitude_over_load_direction():
     assert torch.allclose(out["displacement_max"], out["displacement_max"].new_tensor(12.0))
     assert torch.allclose(out["physical_displacement_ratio"], out["physical_displacement_ratio"].new_tensor(1.2))
     assert not out["physical_feasible"]
+
+
+def test_fem_violation_loss_uses_physical_max_not_diluted_p_norm():
+    trainer = _dummy_trainer(
+        stress_scale=0.0,
+        displacement_scale=0.0,
+        displacement_mag_scale=1.23,
+    )
+    trainer.cfg.fem_training_safety_factor = 0.7
+    trainer.cfg.fem_safety_margin_weight = 0.05
+    trainer.cfg.fem_constraint_p_norm = 12.0
+    loss_fn = Loss_FEM(trainer)
+    rho = torch.zeros(4096, dtype=torch.float64, requires_grad=True)
+    rho.data[0] = 1.0
+    fiber = torch.ones(4096, 3, dtype=torch.float64)
+
+    out = loss_fn.evaluate(
+        rho_surface=rho,
+        fiber_surface=fiber,
+        max_displacement=1.0,
+        yield_strength=400.0,
+        constraint_weight=10000.0,
+        baseline_weight=0.2,
+        violation_power=3.0,
+        stress_density_threshold=None,
+    )
+
+    assert torch.allclose(
+        out["physical_displacement_ratio"],
+        out["physical_displacement_ratio"].new_tensor(1.23),
+    )
+    assert out["displacement_p_norm"].item() < 1.0
+    assert not out["physical_feasible"]
+    assert out["displacement_violation_loss"].item() > 0.0
+    assert out["violation_fem_loss"].item() > 100.0
 
 
 def test_constraint_excess_is_zero_inside_limit_and_ratio_based():

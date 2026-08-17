@@ -64,6 +64,15 @@ class Loss_FEM:
         return loss, excess, ratio
 
     @staticmethod
+    def _soft_p_norm(value: torch.Tensor, p: float, eps: float) -> torch.Tensor:
+        flat = value.reshape(-1).abs()
+        if flat.numel() == 0:
+            raise ValueError("FEM p-norm field must not be empty.")
+        p = max(float(p), float(eps))
+        scale = flat.detach().max().clamp_min(float(eps))
+        return scale * (flat / scale).pow(p).mean().pow(1.0 / p)
+
+    @staticmethod
     def tensor_field_is_valid(field: torch.Tensor | None) -> bool:
         return (
             isinstance(field, torch.Tensor)
@@ -114,6 +123,7 @@ class Loss_FEM:
             "physical_displacement_ratio": nan_scalar,
             "constraint_violation": nan_scalar,
             "training_feasible": False,
+            "safety_margin_satisfied": False,
             "physical_feasible": False,
             "stress_max": nan_scalar,
             "displacement_max": nan_scalar,
@@ -148,21 +158,28 @@ class Loss_FEM:
         else:
             shell_occupancy = torch.ones_like(density_raw)
         fiber_density = density_raw.clamp(0.0, 1.0)
+        active_element_mask = shell_occupancy.reshape(-1) > 0.5
         rho = (shell_occupancy * fiber_density).clamp(0.0, 1.0)
-        stiffness_factor = (
+        stiffness_inside = (
             float(rho_min_ratio)
-            + (1.0 - float(rho_min_ratio)) * rho.pow(float(penal))
+            + (1.0 - float(rho_min_ratio)) * fiber_density.pow(float(penal))
         )
+        stiffness_factor = shell_occupancy * stiffness_inside
 
         phi = fem_fields["phi"].to(device=device, dtype=dtype)
         theta = fem_fields["theta"].to(device=device, dtype=dtype)
 
         fiber_norm = torch.linalg.norm(fiber_surface, dim=1)
-        inside_mask = shell_occupancy.reshape(-1) > 0.5
+        inside_mask = active_element_mask
         outside_mask = ~inside_mask
         mean_inside = rho[inside_mask].mean() if bool(inside_mask.detach().any().item()) else rho.new_zeros(())
         mean_outside = rho[outside_mask].mean() if bool(outside_mask.detach().any().item()) else rho.new_zeros(())
         max_outside = rho[outside_mask].max() if bool(outside_mask.detach().any().item()) else rho.new_zeros(())
+        max_stiffness_outside = (
+            stiffness_factor[outside_mask].max()
+            if bool(outside_mask.detach().any().item())
+            else stiffness_factor.new_zeros(())
+        )
 
         debug = {
             "rho_surface_shape": tuple(rho_surface.shape),
@@ -182,6 +199,9 @@ class Loss_FEM:
             "stiffness_factor_mean": float(stiffness_factor.mean().detach().item()),
             "stiffness_factor_max": float(stiffness_factor.max().detach().item()),
             "occupied_voxels": int(inside_mask.detach().sum().item()),
+            "active_elements": int(inside_mask.detach().sum().item()),
+            "total_elements": int(inside_mask.numel()),
+            "max_stiffness_outside_shell": float(max_stiffness_outside.detach().item()),
             "mean_density_inside_shell": float(mean_inside.detach().item()),
             "mean_density_outside_shell": float(mean_outside.detach().item()),
             "max_density_outside_shell": float(max_outside.detach().item()),
@@ -217,6 +237,7 @@ class Loss_FEM:
             return self._empty_invalid_output(reference=rho, reason=reason)
 
         fe_solver = getattr(self.trainer.fem, "fe", None)
+        fe_mesh = getattr(fe_solver, "mesh", None)
         stress_field = getattr(fe_solver, "stress_vm", None)
         displacement_field = getattr(fe_solver, "displacement_mag_elem", None)
         if displacement_field is None:
@@ -228,6 +249,15 @@ class Loss_FEM:
         debug.update({
             "fem_solve_scalar_is_finite": self._scalar_tensor_is_finite(solve_scalar),
         })
+        if fe_mesh is not None:
+            debug.update({
+                "fem_active_elements": int(getattr(fe_mesh, "active_element_ids", []).__len__()),
+                "fem_total_elements": int(getattr(fe_mesh, "numElems", 0)),
+                "fem_active_nodes": int(getattr(fe_mesh, "active_node_ids", []).__len__()),
+                "fem_total_nodes": int(getattr(fe_mesh, "numNodes", 0)),
+                "fem_active_free_dofs": int(getattr(fe_mesh, "free", []).__len__()),
+                "fem_total_dofs": int(getattr(fe_mesh, "ndof", 0)),
+            })
 
         if not debug["fem_solve_scalar_is_finite"]:
             reason = "Non-finite scalar returned by FEM solve"
@@ -294,7 +324,6 @@ class Loss_FEM:
             debug["stress_eval_density_min"] = float(rho_for_stress.detach().min().item())
             debug["stress_eval_density_max"] = float(rho_for_stress.detach().max().item())
 
-        stress_max_tensor = stress_for_loss.reshape(-1).max()
         if bool((stress_for_loss.reshape(-1) < -eps).any().detach().item()):
             reason = "Equivalent stress field contains negative values."
             self._record_invalid(debug, reason, save_debug_history)
@@ -306,10 +335,15 @@ class Loss_FEM:
                 displacement_field=displacement_field,
                 loaded_boundary_displacement_field=loaded_boundary_displacement_field,
             )
+        stress_max_tensor = stress_for_loss.reshape(-1).max()
         displacement_max_tensor = displacement_for_loss.reshape(-1).abs().max()
+        p_norm = float(getattr(self.trainer.cfg, "fem_constraint_p_norm", 12.0))
+        stress_p_norm_tensor = self._soft_p_norm(stress_for_loss, p=p_norm, eps=eps)
+        displacement_p_norm_tensor = self._soft_p_norm(displacement_for_loss, p=p_norm, eps=eps)
         safety_factor = float(getattr(self.trainer.cfg, "fem_training_safety_factor", 0.95))
         training_yield_strength = None if yield_strength is None else safety_factor * float(yield_strength)
         training_max_displacement = None if max_displacement is None else safety_factor * float(max_displacement)
+        margin_weight = float(getattr(self.trainer.cfg, "fem_safety_margin_weight", 0.05))
         zero = rho.reshape(-1)[0] * 0.0
         physical_stress_ratio = (
             stress_max_tensor / stress_max_tensor.new_tensor(max(float(yield_strength), float(eps)))
@@ -320,27 +354,44 @@ class Loss_FEM:
             if max_displacement is not None else displacement_max_tensor * 0.0
         )
         training_stress_ratio = (
-            stress_max_tensor / stress_max_tensor.new_tensor(max(float(training_yield_strength), float(eps)))
-            if training_yield_strength is not None else stress_max_tensor * 0.0
+            stress_p_norm_tensor / stress_p_norm_tensor.new_tensor(max(float(training_yield_strength), float(eps)))
+            if training_yield_strength is not None else stress_p_norm_tensor * 0.0
         )
         training_displacement_ratio = (
-            displacement_max_tensor / displacement_max_tensor.new_tensor(max(float(training_max_displacement), float(eps)))
-            if training_max_displacement is not None else displacement_max_tensor * 0.0
+            displacement_p_norm_tensor / displacement_p_norm_tensor.new_tensor(max(float(training_max_displacement), float(eps)))
+            if training_max_displacement is not None else displacement_p_norm_tensor * 0.0
+        )
+        loss_stress_ratio = (
+            stress_p_norm_tensor / stress_p_norm_tensor.new_tensor(max(float(yield_strength), float(eps)))
+            if yield_strength is not None else stress_p_norm_tensor * 0.0
+        )
+        loss_displacement_ratio = (
+            displacement_p_norm_tensor / displacement_p_norm_tensor.new_tensor(max(float(max_displacement), float(eps)))
+            if max_displacement is not None else displacement_p_norm_tensor * 0.0
         )
         stress_excess = torch.relu(physical_stress_ratio - 1.0)
         displacement_excess = torch.relu(physical_displacement_ratio - 1.0)
-        #stress_constraint_loss = stress_excess.pow(float(violation_power))
-        #displacement_constraint_loss = displacement_excess.pow(float(violation_power))
-        stress_constraint_loss = stress_excess
-        displacement_constraint_loss = displacement_excess
+        training_stress_excess = torch.relu(loss_stress_ratio - float(safety_factor))
+        training_displacement_excess = torch.relu(loss_displacement_ratio - float(safety_factor))
+        loss_stress_excess = torch.relu(loss_stress_ratio - 1.0)
+        loss_displacement_excess = torch.relu(loss_displacement_ratio - 1.0)
+        stress_margin_loss = margin_weight * training_stress_excess.pow(float(violation_power))
+        displacement_margin_loss = margin_weight * training_displacement_excess.pow(float(violation_power))
+        # Hard violations should follow the same max-based physical ratios used
+        # for feasibility/logging, so isolated overstressed or over-displaced
+        # elements are penalized strongly instead of being diluted by p-norms.
+        stress_violation_loss = stress_excess.pow(float(violation_power))
+        displacement_violation_loss = displacement_excess.pow(float(violation_power))
+        stress_constraint_loss = stress_margin_loss + stress_violation_loss
+        displacement_constraint_loss = displacement_margin_loss + displacement_violation_loss
         baseline_fem_loss = float(baseline_weight) * (
-            physical_stress_ratio.pow(1.0)
-            + physical_displacement_ratio.pow(1.0)
+            loss_stress_ratio.pow(1.0)
+            + loss_displacement_ratio.pow(1.0)
         )
         violation_fem_loss = float(constraint_weight) * (stress_constraint_loss + displacement_constraint_loss)
         constraint_total = baseline_fem_loss + violation_fem_loss
         constraint_violation = torch.maximum(stress_excess, displacement_excess)
-        training_feasible = bool(
+        safety_margin_satisfied = bool(
             (training_stress_ratio <= 1.0).detach().item()
             and (training_displacement_ratio <= 1.0).detach().item()
         )
@@ -348,20 +399,33 @@ class Loss_FEM:
             (physical_stress_ratio <= 1.0).detach().item()
             and (physical_displacement_ratio <= 1.0).detach().item()
         )
+        training_feasible = physical_feasible
 
         debug.update({
             "stress_max": float(stress_max_tensor.detach().item()),
             "displacement_max": float(displacement_max_tensor.detach().item()),
+            "stress_p_norm": float(stress_p_norm_tensor.detach().item()),
+            "displacement_p_norm": float(displacement_p_norm_tensor.detach().item()),
+            "fem_constraint_p_norm": float(p_norm),
+            "fem_safety_margin_weight": float(margin_weight),
             "physical_stress_limit": None if yield_strength is None else float(yield_strength),
             "physical_displacement_limit": None if max_displacement is None else float(max_displacement),
             "training_stress_limit": None if training_yield_strength is None else float(training_yield_strength),
             "training_displacement_limit": None if training_max_displacement is None else float(training_max_displacement),
             "stress_constraint_loss_value": float(stress_constraint_loss.detach().item()),
             "displacement_constraint_loss_value": float(displacement_constraint_loss.detach().item()),
+            "stress_margin_loss_value": float(stress_margin_loss.detach().item()),
+            "displacement_margin_loss_value": float(displacement_margin_loss.detach().item()),
+            "stress_violation_loss_value": float(stress_violation_loss.detach().item()),
+            "displacement_violation_loss_value": float(displacement_violation_loss.detach().item()),
             "baseline_fem_loss_value": float(baseline_fem_loss.detach().item()),
             "violation_fem_loss_value": float(violation_fem_loss.detach().item()),
             "stress_constraint_excess_value": float(stress_excess.detach().item()),
             "displacement_constraint_excess_value": float(displacement_excess.detach().item()),
+            "training_stress_excess_value": float(training_stress_excess.detach().item()),
+            "training_displacement_excess_value": float(training_displacement_excess.detach().item()),
+            "loss_stress_ratio_value": float(loss_stress_ratio.detach().item()),
+            "loss_displacement_ratio_value": float(loss_displacement_ratio.detach().item()),
             "stress_ratio_value": float(physical_stress_ratio.detach().item()),
             "displacement_ratio_value": float(physical_displacement_ratio.detach().item()),
             "training_stress_ratio_value": float(training_stress_ratio.detach().item()),
@@ -369,6 +433,7 @@ class Loss_FEM:
             "physical_stress_ratio_value": float(physical_stress_ratio.detach().item()),
             "physical_displacement_ratio_value": float(physical_displacement_ratio.detach().item()),
             "training_feasible": training_feasible,
+            "safety_margin_satisfied": safety_margin_satisfied,
             "physical_feasible": physical_feasible,
             "constraint_violation_value": float(constraint_violation.detach().item()),
             "fem_total_is_finite": self._scalar_tensor_is_finite(constraint_total),
@@ -398,6 +463,14 @@ class Loss_FEM:
             "violation_fem_loss": violation_fem_loss,
             "stress_constraint_excess": stress_excess,
             "displacement_constraint_excess": displacement_excess,
+            "stress_margin_loss": stress_margin_loss,
+            "displacement_margin_loss": displacement_margin_loss,
+            "stress_violation_loss": stress_violation_loss,
+            "displacement_violation_loss": displacement_violation_loss,
+            "training_stress_excess": training_stress_excess,
+            "training_displacement_excess": training_displacement_excess,
+            "loss_stress_ratio": loss_stress_ratio,
+            "loss_displacement_ratio": loss_displacement_ratio,
             "stress_ratio": physical_stress_ratio,
             "displacement_ratio": physical_displacement_ratio,
             "training_stress_ratio": training_stress_ratio,
@@ -406,7 +479,10 @@ class Loss_FEM:
             "physical_displacement_ratio": physical_displacement_ratio,
             "constraint_violation": constraint_violation,
             "training_feasible": training_feasible,
+            "safety_margin_satisfied": safety_margin_satisfied,
             "physical_feasible": physical_feasible,
             "stress_max": stress_max_tensor.detach(),
             "displacement_max": displacement_max_tensor.detach(),
+            "stress_p_norm": stress_p_norm_tensor.detach(),
+            "displacement_p_norm": displacement_p_norm_tensor.detach(),
         }

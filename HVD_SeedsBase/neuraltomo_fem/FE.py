@@ -47,20 +47,20 @@ class FE:
         self.jK : (nele*24*24,) tensor
             Column indices for sparse stiffness assembly
         """
-        self.Ksize = self.mesh.ndof - self.mesh.fixed.flatten().shape[0]
-        row_indices_np = self.mesh.iK  # NumPy array of row indices
-        col_indices_np = self.mesh.jK  # NumPy array of column indices'
+        self.Ksize = self.mesh.free.flatten().shape[0]
+        row_indices_np = self.mesh.active_iK  # NumPy array of active row indices
+        col_indices_np = self.mesh.active_jK  # NumPy array of active column indices'
 
         # keep_index = np.delete(np.arange(0, self.mesh.ndof, dtype=int), self.mesh.fixed)
         keep_index = self.mesh.free
-        mask = ~(np.isin(row_indices_np, self.mesh.fixed) | np.isin(col_indices_np, self.mesh.fixed))
+        mask = np.isin(row_indices_np, keep_index) & np.isin(col_indices_np, keep_index)
 
         filtered_row_indices = row_indices_np[mask].astype(int)
         filtered_col_indices = col_indices_np[mask].astype(int)
         self.valid_mask = torch.from_numpy(mask).bool().to(device)
 
         ## ** Need to make sure Array not out of bounds ** ##
-        indexMap = np.zeros(self.mesh.ndof, dtype=int)
+        indexMap = np.full(self.mesh.ndof, -1, dtype=int)
         indexMap[keep_index] = np.arange(0, self.Ksize, dtype=int)
 
         # Map filtered indices to new indices in keep_index
@@ -72,14 +72,15 @@ class FE:
 
     def solve_c_new(self, phi, theta, stiffness_factor, penal=1.0, isotropic=False):
         # self.u = torch.zeros((self.mesh.ndof, 1), device=density.device)
+        active_ids = torch.as_tensor(self.mesh.active_element_ids, dtype=torch.long, device=stiffness_factor.device)
         if isotropic:
             ## isotropic
-            E = self.mesh.Emax * stiffness_factor
-            KE = torch.tensor(self.mesh.KE, dtype=torch.float32, device=density.device)
+            E = self.mesh.Emax * stiffness_factor[active_ids]
+            KE = torch.tensor(self.mesh.KE[self.mesh.active_element_ids], dtype=torch.float32, device=stiffness_factor.device)
             sK = torch.einsum('i,ijk->ijk', E, KE).flatten()
         else:
             ## anisotropic
-            sK = self.H8.angle2Ke(phi, theta, stiffness_factor, penal).flatten()
+            sK = self.H8.angle2Ke(phi[active_ids], theta[active_ids], stiffness_factor[active_ids], penal).flatten()
 
         d = sK[self.valid_mask]
 
@@ -89,20 +90,21 @@ class FE:
 
     def solve_stress_new(self, phi, theta, stiffness_factor, penal=1.0, isotropic=False):
         self.u = torch.zeros((self.mesh.ndof, 1), dtype=torch.float32, device=stiffness_factor.device)
+        active_ids = torch.as_tensor(self.mesh.active_element_ids, dtype=torch.long, device=stiffness_factor.device)
         if isotropic:
             ## isotropic
-            E = self.mesh.Emax * stiffness_factor
-            KE = torch.tensor(self.mesh.KE, dtype=torch.float32, device=stiffness_factor.device)
+            E = self.mesh.Emax * stiffness_factor[active_ids]
+            KE = torch.tensor(self.mesh.KE[self.mesh.active_element_ids], dtype=torch.float32, device=stiffness_factor.device)
             sK = torch.einsum('i,ijk->ijk', E, KE).flatten()
             B = torch.tensor(self.mesh.B.T, dtype=torch.float32, device=stiffness_factor.device).T
             C = torch.tensor(self.mesh.C, dtype=torch.float32, device=stiffness_factor.device).expand(self.mesh.numElems,-1,-1)
         else:
             ## anisotropic
-            sK = self.H8.angle2Ke(phi, theta, stiffness_factor, penal).flatten()
+            sK = self.H8.angle2Ke(phi[active_ids], theta[active_ids], stiffness_factor[active_ids], penal).flatten()
 
             B = self.H8.NodeB
-            C = self.H8.temp_C
-            T = self.H8.T
+            C_active = self.H8.temp_C
+            T_active = self.H8.T
 
         #i = self.sparseKIdx
         # selects only the valid entries of sK that correspond to the free DOFs, effectively removing contributions from fixed DOFs.
@@ -114,8 +116,12 @@ class FE:
         self.u[self.mesh.free, 0] = u
         c = (self.f*u).sum()
         uElem = self.u[self.mesh.edofMat].reshape(self.mesh.numElems, self.mesh.numDOFPerElem)
+        uElem_active = uElem[active_ids]
         uElemNodes = uElem.reshape(self.mesh.numElems, 8, 3)
-        disp_mag_elem = torch.linalg.norm(uElemNodes, dim=2).max(dim=1).values
+        uElemNodes_active = uElemNodes[active_ids]
+        disp_mag_active = torch.linalg.norm(uElemNodes_active, dim=2).max(dim=1).values
+        disp_mag_elem = torch.zeros((self.mesh.numElems,), dtype=torch.float32, device=stiffness_factor.device)
+        disp_mag_elem[active_ids] = disp_mag_active
         force_vec = torch.as_tensor(self.mesh.f[:, 0], dtype=torch.float32, device=stiffness_factor.device).reshape(self.mesh.numNodes, 3)
         uNodes = self.u.reshape(self.mesh.numNodes, 3)
         node_disp_mag = torch.linalg.norm(uNodes, dim=1)
@@ -134,8 +140,15 @@ class FE:
             load_dir = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=stiffness_factor.device)
         else:
             load_dir = load_dir / load_dir_norm
-        disp_load_dir_elem = torch.abs(torch.einsum('eij,j->ei', uElemNodes, load_dir)).mean(dim=1)
-        sigmaElem = torch.einsum('bij,jk,bk -> bi', C, B, uElem)
+        disp_load_dir_active = torch.abs(torch.einsum('eij,j->ei', uElemNodes_active, load_dir)).mean(dim=1)
+        disp_load_dir_elem = torch.zeros((self.mesh.numElems,), dtype=torch.float32, device=stiffness_factor.device)
+        disp_load_dir_elem[active_ids] = disp_load_dir_active
+        if isotropic:
+            C_active = C[active_ids]
+            T_active = None
+        sigma_active = torch.einsum('bij,jk,bk -> bi', C_active, B, uElem_active)
+        sigmaElem = torch.zeros((self.mesh.numElems, 6), dtype=torch.float32, device=stiffness_factor.device)
+        sigmaElem[active_ids] = sigma_active
         sigma_for_vm = sigmaElem
         sxx, syy, szz = sigma_for_vm[:, 0], sigma_for_vm[:, 1], sigma_for_vm[:, 2]
         syz, sxz, sxy = sigma_for_vm[:, 3], sigma_for_vm[:, 4], sigma_for_vm[:, 5]
@@ -157,24 +170,30 @@ class FE:
         # sigmaElem = torch.einsum('bij,jk,bk,bim -> bm', C, B, uElem, T)
 
         P, Q = self.H8.P, self.H8.Q
-        _A = 0.5 * torch.einsum('ij, jk, ik ->i', sigmaElem, P, sigmaElem)
-        _B = torch.einsum('i, ji ->j', Q, sigmaElem)
+        _A_active = 0.5 * torch.einsum('ij, jk, ik ->i', sigma_active, P, sigma_active)
+        _B_active = torch.einsum('i, ji ->j', Q, sigma_active)
+        _A = torch.zeros((self.mesh.numElems,), dtype=torch.float32, device=stiffness_factor.device)
+        _B = torch.zeros((self.mesh.numElems,), dtype=torch.float32, device=stiffness_factor.device)
+        _A[active_ids] = _A_active
+        _B[active_ids] = _B_active
         _C = -1
 
-        root = torch.zeros_like(_A)
-        is_linear = _A < 1e-5
+        root_active = torch.zeros_like(_A_active)
+        is_linear = _A_active < 1e-5
 
         # the max Force that element can retain
-        BL = _B[is_linear]
-        BNL = _B[~is_linear]
-        ANL = _A[~is_linear]
-        root[is_linear] = 1 / (BL.abs() + 1e-5)
-        root[~is_linear] = (-BNL + (BNL * BNL - 4 * ANL * _C).sqrt()) / (2 * ANL)
+        BL = _B_active[is_linear]
+        BNL = _B_active[~is_linear]
+        ANL = _A_active[~is_linear]
+        root_active[is_linear] = 1 / (BL.abs() + 1e-5)
+        root_active[~is_linear] = (-BNL + (BNL * BNL - 4 * ANL * _C).sqrt()) / (2 * ANL)
+        root = torch.zeros_like(_A)
+        root[active_ids] = root_active
 
 
-        Fmin = torch.linalg.vector_norm(root.abs() + 1e-5, ord=-6) # + 1e-5*root.mean()
+        Fmin = torch.linalg.vector_norm(root_active.abs() + 1e-5, ord=-6) # + 1e-5*root.mean()
         # Fmin = torch.linalg.vector_norm(root.abs(), ord=-10)
-        FRealMin = root.min()
+        FRealMin = root_active.min()
         Criterion = _A * FRealMin * FRealMin + _B * FRealMin + _C
 
         self.FRealMin = FRealMin
@@ -187,15 +206,21 @@ class FE:
 
     def solve(self, density):
         self.u=np.zeros((self.mesh.ndof,1))
-        E = self.mesh.material['E'] * density
-        sK = np.einsum('i,ijk->ijk',E, self.mesh.KE).flatten()
+        active_ids = self.mesh.active_element_ids
+        E = self.mesh.material['E'] * np.asarray(density).reshape(-1)[active_ids]
+        sK = np.einsum('i,ijk->ijk', E, self.mesh.KE[active_ids]).flatten()
 
-        K = coo_matrix((sK,(self.mesh.iK,self.mesh.jK)),shape=(self.mesh.ndof,self.mesh.ndof)).tocsc()
-        K = self.deleterowcol(K,self.mesh.fixed,self.mesh.fixed).tocsc()
+        K = coo_matrix((sK, (self.mesh.active_iK, self.mesh.active_jK)), shape=(self.mesh.ndof, self.mesh.ndof)).tocsc()
+        K = K[self.mesh.free, :][:, self.mesh.free].tocsc()
 
         B = self.mesh.f[self.mesh.free,0]
         B = scipy.sparse.linalg.spsolve(K, B)
         self.u[self.mesh.free,0]=np.array(B)
         uElem = self.u[self.mesh.edofMat].reshape(self.mesh.numElems,self.mesh.numDOFPerElem)
-        self.Jelem  = np.einsum('ik,ik->i',np.einsum('ij,ijk->ik',uElem, self.mesh.KE),uElem)
+        self.Jelem = np.zeros((self.mesh.numElems,), dtype=float)
+        self.Jelem[active_ids] = np.einsum(
+            'ik,ik->i',
+            np.einsum('ij,ijk->ik', uElem[active_ids], self.mesh.KE[active_ids]),
+            uElem[active_ids],
+        )
         return self.u, self.Jelem

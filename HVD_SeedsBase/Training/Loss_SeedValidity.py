@@ -32,7 +32,7 @@ def minimum_seed_spacing_loss(
         torch.ones((n_seed, n_seed), dtype=torch.bool, device=seed_xyz.device),
         diagonal=1,
     )
-    violations = torch.relu((d_min - distances[pair_mask]) / d_min)
+    violations = 100*torch.relu((d_min - distances[pair_mask]) / d_min)
     return violations.pow(float(spacing_power)).mean()
 
 

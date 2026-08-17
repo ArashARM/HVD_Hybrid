@@ -203,11 +203,22 @@ class H8_anisotropic_K:
         return np.stack(b, -1).reshape((xyz.shape[0], 6, 24))
 
     def angle2Ke(self, phi, theta, stiffness_factor, density_penal=1.0):
-        cosT, sinT = torch.cos(theta), torch.sin(theta)
-        cosT2, sinT2 = cosT * cosT, sinT * sinT
+        # Input convention:
+        # phi   = azimuth = atan2(y, x)
+        # theta = polar angle = acos(z)
+        #
+        # The transformation expressions below use:
+        # T = azimuth
+        # P = elevation = pi/2 - polar angle.
+        cosT = torch.cos(phi)
+        sinT = torch.sin(phi)
+        cosT2 = cosT * cosT
+        sinT2 = sinT * sinT
 
-        cosP, sinP = torch.cos(phi), torch.sin(phi)
-        cosP2, sinP2 = cosP * cosP, sinP * sinP
+        cosP = torch.sin(theta)  # cos(pi/2 - theta)
+        sinP = torch.cos(theta)  # sin(pi/2 - theta)
+        cosP2 = cosP * cosP
+        sinP2 = sinP * sinP
 
         o = torch.zeros_like(phi) # 0-vector
 
@@ -226,7 +237,7 @@ class H8_anisotropic_K:
         # C = R @ self.C_inv.unsqueeze(0).expand(batch_size, -1, -1) @ R.transpose(1, 2)
 
         C = torch.einsum('bij,jk,blk->bil', R, self.C_inv, R)
-        C_new = torch.einsum('bji,bjk->bik', R, C)
+        #C_new = torch.einsum('bji,bjk->bik', R, C)
 
         # self.B 27x6x24, C nx6x6
         B = self.B
@@ -238,7 +249,7 @@ class H8_anisotropic_K:
         # `stiffness_factor` already contains the SIMP penalization
         # and the minimum stiffness ratio. Do not apply either again.
         dK = torch.einsum('i,ijk->ijk', stiffness_factor, BT_C_B)
-        self.temp_C = C_new
+        self.temp_C = C
         self.T = R
         return dK
 

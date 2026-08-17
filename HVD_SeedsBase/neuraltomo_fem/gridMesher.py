@@ -8,6 +8,7 @@ import pyvista as pv
 class GridMesh:
     
     def __init__(self, problem):
+        self.problem = problem
         self.mesh = problem.mesh
         self.initMesh()
         
@@ -90,16 +91,16 @@ class GridMesh:
     # 7)self.iK, self.jK: (numElems*numDOFPerElem**2,) arrays of row and column indices for assembling the global stiffness matrix in COO format
     def initBC(self):
         self.ndof = self.bc['numDOFPerNode'] * self.numNodes
-        self.fixed = self.bc['fixed']
+        self.fixed = np.asarray(self.bc['fixed'], dtype=np.int64).reshape(-1)
 
-        if 'nonNullElem' in self.bc:
-            self.nonNullElem = self.bc['nonNullElem']
-            self.nullElem = np.setdiff1d(np.arange(self.numElems), self.nonNullElem)
-        else:
-            self.nonNullElem = np.arange(self.numElems)
-            self.nullElem = None
+        active_element_mask = self._active_element_mask_from_problem()
+        self.active_element_mask = active_element_mask
+        self.active_element_ids = np.flatnonzero(active_element_mask).astype(np.int64)
+        self.nonNullElem = self.active_element_ids
+        self.nullElem = np.flatnonzero(~active_element_mask).astype(np.int64)
+        if self.active_element_ids.size == 0:
+            raise ValueError("FEM active element mask is empty.")
 
-        self.free = np.setdiff1d(np.arange(self.ndof), self.fixed)
         self.f = self.bc['force']
         self.numDOFPerElem = 8 * self.bc['numDOFPerNode']
         self.edofMat = np.zeros((self.nelx * self.nely * self.nelz, self.numDOFPerElem), dtype=int)
@@ -122,10 +123,49 @@ class GridMesh:
 
         self.edofMat = self.edofMat.astype(int)
 
+        active_elem_nodes = self.elemNodes[self.active_element_ids].reshape(-1)
+        self.active_node_ids = np.unique(active_elem_nodes).astype(np.int64)
+        self.active_dofs = np.sort(
+            np.concatenate([self.bc['numDOFPerNode'] * self.active_node_ids + c for c in range(self.bc['numDOFPerNode'])])
+        ).astype(np.int64)
+        self.active_fixed = np.intersect1d(self.fixed, self.active_dofs).astype(np.int64)
+        self.free = np.setdiff1d(self.active_dofs, self.active_fixed).astype(np.int64)
+        loaded_dofs = np.flatnonzero(np.abs(self.f.reshape(-1)) > 0.0).astype(np.int64)
+        inactive_loaded_dofs = np.setdiff1d(loaded_dofs, self.active_dofs)
+        if inactive_loaded_dofs.size > 0:
+            raise ValueError(
+                "FEM loads include DOFs outside the active shell domain: "
+                f"{inactive_loaded_dofs[:12].tolist()}"
+            )
+        if loaded_dofs.size > 0 and np.intersect1d(loaded_dofs, self.free).size == 0:
+            raise ValueError("FEM loads do not act on any active free DOF.")
+        if self.active_fixed.size == 0:
+            raise ValueError("FEM boundary conditions do not constrain any active shell DOF.")
+
         self.iK = np.kron(self.edofMat, np.ones((self.numDOFPerElem, 1))).flatten()
         self.jK = np.kron(self.edofMat, np.ones((1, self.numDOFPerElem))).flatten()
+        self.active_edofMat = self.edofMat[self.active_element_ids]
+        self.active_iK = np.kron(self.active_edofMat, np.ones((self.numDOFPerElem, 1))).flatten()
+        self.active_jK = np.kron(self.active_edofMat, np.ones((1, self.numDOFPerElem))).flatten()
         bK = tuple(np.zeros((len(self.iK))).astype(int))  # batch values
         self.nodeIdx = [bK, self.iK, self.jK]
+
+    def _active_element_mask_from_problem(self):
+        if 'active_element_mask' in self.bc:
+            mask = np.asarray(self.bc['active_element_mask'], dtype=bool).reshape(-1)
+        elif 'nonNullElem' in self.bc:
+            ids = np.asarray(self.bc['nonNullElem'], dtype=np.int64).reshape(-1)
+            mask = np.zeros((self.numElems,), dtype=bool)
+            mask[ids] = True
+        elif hasattr(self.problem, "elem_occupancy") and self.problem.elem_occupancy is not None:
+            mask = np.asarray(self.problem.elem_occupancy, dtype=bool).reshape(-1)
+        else:
+            mask = np.ones((self.numElems,), dtype=bool)
+        if mask.size != self.numElems:
+            raise ValueError(
+                f"active_element_mask must have {self.numElems} entries, got {mask.size}."
+            )
+        return mask
 
     # -----------------------#
     def initK(self):

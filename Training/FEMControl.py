@@ -85,11 +85,31 @@ def checkpoint_feasibility_key(
     if feasible:
         return True, (score, fiber_length, step)
 
-    violation_score = violation if violation_is_finite else float("inf")
-    ranked_score = score if score_is_finite else float("inf")
-    ranked_fiber_length = fiber_length if fiber_length_is_finite else float("inf")
-    ranked_step = step if step_is_finite else float("inf")
-    return False, (violation_score, ranked_score, ranked_step)
+    violation_score = (
+        violation
+        if violation_is_finite
+        else float("inf")
+    )
+
+    # An invalid fibre length makes the geometry invalid, so it must
+    # not be ranked using an otherwise finite design score.
+    ranked_score = (
+        score
+        if score_is_finite and fiber_length_is_finite
+        else float("inf")
+    )
+
+    ranked_step = (
+        step
+        if step_is_finite
+        else float("inf")
+    )
+
+    return False, (
+        violation_score,
+        ranked_score,
+        ranked_step,
+    )
 
 
 def checkpoint_raw_fiber_length(checkpoint) -> float:

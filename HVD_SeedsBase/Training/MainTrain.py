@@ -347,6 +347,9 @@ class TrainingConfig:
     generate_decoder_density_fiber: bool = True
 
     cvt_temperature: float = 0.02
+    fem_cvt_displacement_importance: bool = True
+    fem_cvt_displacement_importance_power: float = 1.0
+    fem_cvt_displacement_importance_floor: float = 0.05
     curve_length_eps: float = 1e-8
     curve_length_tolerance: float = 0.15
     Edge_in_losses: str = "Interior"
@@ -356,7 +359,9 @@ class TrainingConfig:
 
     fem_max_displacement: float | None = None
     fem_yield_strength: float | None = None
-    fem_training_safety_factor: float = 0.95
+    fem_training_safety_factor: float = 0.70
+    fem_safety_margin_weight: float = 0.05
+    fem_constraint_p_norm: float = 12.0
     fem_constraint_weight: float = 2.0
     fem_baseline_weight: float = 0.05
     fem_violation_power: float = 4.0
@@ -603,6 +608,16 @@ class TrainingConfig:
                 "fem_training_safety_factor must satisfy 0 < factor <= 1, "
                 f"got {self.fem_training_safety_factor}"
             )
+        if not math.isfinite(float(self.fem_safety_margin_weight)) or self.fem_safety_margin_weight < 0.0:
+            raise ValueError(
+                "fem_safety_margin_weight must be finite and >= 0, "
+                f"got {self.fem_safety_margin_weight}"
+            )
+        if not math.isfinite(float(self.fem_constraint_p_norm)) or self.fem_constraint_p_norm <= 0.0:
+            raise ValueError(
+                "fem_constraint_p_norm must be positive finite, "
+                f"got {self.fem_constraint_p_norm}"
+            )
         for name in (
             "fem_lambda_initial",
             "fem_lambda_min",
@@ -642,6 +657,22 @@ class TrainingConfig:
             raise ValueError("minimum_learning_rate must be >= 0")
         if self.cvt_temperature <= 0.0:
             raise ValueError(f"cvt_temperature must be > 0, got {self.cvt_temperature}")
+        if (
+            not math.isfinite(float(self.fem_cvt_displacement_importance_power))
+            or self.fem_cvt_displacement_importance_power <= 0.0
+        ):
+            raise ValueError(
+                "fem_cvt_displacement_importance_power must be positive finite, "
+                f"got {self.fem_cvt_displacement_importance_power}"
+            )
+        if (
+            not math.isfinite(float(self.fem_cvt_displacement_importance_floor))
+            or self.fem_cvt_displacement_importance_floor < 0.0
+        ):
+            raise ValueError(
+                "fem_cvt_displacement_importance_floor must be finite and >= 0, "
+                f"got {self.fem_cvt_displacement_importance_floor}"
+            )
         for name in (
             "stage1_lam_fem",
             "stage1_lam_cvt",
@@ -7761,6 +7792,7 @@ class NN_Trainer:
 
                 rep_terms = []
                 cvt_terms = []
+                cvt_inputs = []
                 total_fiber_length_terms = []
                 curve_length_values = []
                 l_curve_cell_terms = []
@@ -7820,6 +7852,13 @@ class NN_Trainer:
                 compute_seed_spacing_loss = float(cfg.lam_seed_spacing) != 0.0
                 compute_total_fiber_length_loss = lam_total_fiber_length_step != 0.0
                 compute_l_curve_cell_loss = lam_l_curve_cell_step != 0.0
+                fem_constraints_active = lam_fem_step != 0.0 and bool(cfg.generate_decoder_density_fiber)
+                cvt_uses_fem_displacement = (
+                    compute_cvt_loss
+                    and fem_constraints_active
+                    and bool(getattr(cfg, "fem_cvt_displacement_importance", True))
+                )
+                cvt_importance_mode = "displacement_pending" if cvt_uses_fem_displacement else "uniform"
                 # Checkpoint rows feed adaptive topology control and final timelapse
                 # summaries, so keep topology diagnostics available on every step.
                 collect_topology_metrics = True
@@ -7924,18 +7963,29 @@ class NN_Trainer:
                             )
                         )
                     if compute_cvt_loss:
-                        cvt_terms.append(
-                            self.loss_cvt(
-                                seeds_uv=seeds_raw_i,
-                                sample_uv=ft["uv"],
-                                seed_xyz=seed_xyz_validity,
-                                sample_xyz=ft["points_xyz"],
-                                sample_area_weights=A_local,
-                                importance=None,
-                                temperature=float(cfg.cvt_temperature),
-                                eps=float(cfg.eps),
-                            )
+                        cvt_input_i = (
+                            seeds_raw_i,
+                            ft["uv"],
+                            seed_xyz_validity,
+                            ft["points_xyz"],
+                            A_local,
+                            ft["global_vertex_idx"],
                         )
+                        if cvt_uses_fem_displacement:
+                            cvt_inputs.append(cvt_input_i)
+                        else:
+                            cvt_terms.append(
+                                self.loss_cvt(
+                                    seeds_uv=seeds_raw_i,
+                                    sample_uv=ft["uv"],
+                                    seed_xyz=seed_xyz_validity,
+                                    sample_xyz=ft["points_xyz"],
+                                    sample_area_weights=A_local,
+                                    importance=None,
+                                    temperature=float(cfg.cvt_temperature),
+                                    eps=float(cfg.eps),
+                                )
+                            )
 
                     seeds_i = decoder_out["seeds"]
                     if getattr(cfg, "generate_decoder_density_fiber", True):
@@ -8141,12 +8191,12 @@ class NN_Trainer:
                     "physical_displacement_ratio": torch.zeros((), dtype=dtype, device=device),
                     "constraint_violation": torch.zeros((), dtype=dtype, device=device),
                     "training_feasible": True,
+                    "safety_margin_satisfied": True,
                     "physical_feasible": True,
                     "stress_max": torch.zeros((), dtype=dtype, device=device),
                     "displacement_max": torch.zeros((), dtype=dtype, device=device),
                 }
 
-                fem_constraints_active = lam_fem_step != 0.0 and bool(cfg.generate_decoder_density_fiber)
                 fem_was_evaluated = False
                 if fem_constraints_active:
                     fem_was_evaluated = True
@@ -8245,6 +8295,78 @@ class NN_Trainer:
                     disp_max = float("nan")
                     disp_p95 = float("nan")
                     disp_p99 = float("nan")
+
+                if cvt_uses_fem_displacement:
+                    cvt_terms = []
+                    if (
+                        isinstance(disp_metric_source, torch.Tensor)
+                        and disp_metric_source.numel() == rho.numel()
+                    ):
+                        displacement_importance_global = torch.nan_to_num(
+                            disp_metric_source.detach().reshape(-1).abs(),
+                            nan=0.0,
+                            posinf=0.0,
+                            neginf=0.0,
+                        ).clamp_min(0.0)
+                        mean_importance = displacement_importance_global.mean().clamp_min(float(cfg.eps))
+                        normalized_importance_global = displacement_importance_global / mean_importance
+                        importance_power = float(getattr(cfg, "fem_cvt_displacement_importance_power", 1.0))
+                        importance_floor = float(getattr(cfg, "fem_cvt_displacement_importance_floor", 0.05))
+                        for (
+                            cvt_seeds_uv,
+                            cvt_sample_uv,
+                            cvt_seed_xyz,
+                            cvt_sample_xyz,
+                            cvt_area_weights,
+                            cvt_global_vertex_idx,
+                        ) in cvt_inputs:
+                            local_importance = normalized_importance_global[
+                                cvt_global_vertex_idx.to(
+                                    device=normalized_importance_global.device,
+                                    dtype=torch.long,
+                                )
+                            ].pow(importance_power)
+                            local_importance = local_importance + local_importance.new_tensor(importance_floor)
+                            cvt_terms.append(
+                                self.loss_cvt(
+                                    seeds_uv=cvt_seeds_uv,
+                                    sample_uv=cvt_sample_uv,
+                                    seed_xyz=cvt_seed_xyz,
+                                    sample_xyz=cvt_sample_xyz,
+                                    sample_area_weights=cvt_area_weights,
+                                    importance=local_importance,
+                                    temperature=float(cfg.cvt_temperature),
+                                    eps=float(cfg.eps),
+                                )
+                            )
+                        cvt_importance_mode = "displacement"
+                    else:
+                        for (
+                            cvt_seeds_uv,
+                            cvt_sample_uv,
+                            cvt_seed_xyz,
+                            cvt_sample_xyz,
+                            cvt_area_weights,
+                            _cvt_global_vertex_idx,
+                        ) in cvt_inputs:
+                            cvt_terms.append(
+                                self.loss_cvt(
+                                    seeds_uv=cvt_seeds_uv,
+                                    sample_uv=cvt_sample_uv,
+                                    seed_xyz=cvt_seed_xyz,
+                                    sample_xyz=cvt_sample_xyz,
+                                    sample_area_weights=cvt_area_weights,
+                                    importance=None,
+                                    temperature=float(cfg.cvt_temperature),
+                                    eps=float(cfg.eps),
+                                )
+                            )
+                        cvt_importance_mode = "uniform_fallback"
+                    loss_cvt = (
+                        cvt_terms[0]
+                        if compute_cvt_loss and cvt_terms
+                        else zero
+                    )
 
                 # ----------------------------------------------------
                 # Normalize losses
@@ -8413,7 +8535,7 @@ class NN_Trainer:
                 )
                 overall_feasible = bool(
                     physical_feasible
-                    and seed_spacing_feasible
+                    # and seed_spacing_feasible
                 )
                 stage_monitor_mode = (
                     "design"
@@ -8589,7 +8711,7 @@ class NN_Trainer:
                     bool(getattr(cfg, "adaptive_fem_penalty", True))
                     and lam_fem_base_step != 0.0
                 ):
-                    fem_constraint_violation = (
+                    fem_constraint_violation_scalar = (
                         float(fem_out["constraint_violation"].detach().item())
                         if isinstance(fem_out.get("constraint_violation", None), torch.Tensor)
                         else float("nan")
@@ -8597,7 +8719,7 @@ class NN_Trainer:
                     adaptive_lambda_fem, adaptive_lambda_update_reason = update_adaptive_fem_lambda(
                         lambda_before=adaptive_lambda_fem,
                         fem_is_valid=bool(fem_is_valid),
-                        constraint_violation=fem_constraint_violation,
+                        constraint_violation=fem_constraint_violation_scalar,
                         tolerance=float(cfg.fem_constraint_tolerance),
                         growth=float(cfg.fem_lambda_growth),
                         decay=float(cfg.fem_lambda_decay),
@@ -8896,6 +9018,7 @@ class NN_Trainer:
                         "loss_l_curve_cell_reference": self._finite_or_default(n_l_curve_cell),
                         "loss_fem_reference": 1.0,
                         "loss_cvt": self._finite_or_default(loss_cvt),
+                        "cvt_importance_mode": cvt_importance_mode,
                         "loss_total_fiber_length": self._finite_or_default(loss_total_fiber_length),
                         "curve_length_min": curve_length_min,
                         "curve_length_max": curve_length_max,
@@ -8934,7 +9057,10 @@ class NN_Trainer:
                         "training_displacement_ratio": self._finite_or_default(fem_out.get("training_displacement_ratio", zero)),
                         "physical_stress_ratio": self._finite_or_default(fem_out.get("physical_stress_ratio", zero)),
                         "physical_displacement_ratio": self._finite_or_default(fem_out.get("physical_displacement_ratio", zero)),
+                        "fem_stress_p_norm": self._finite_or_default(fem_out.get("stress_p_norm", zero)),
+                        "fem_displacement_p_norm": self._finite_or_default(fem_out.get("displacement_p_norm", zero)),
                         "training_feasible": bool(fem_out.get("training_feasible", False)),
+                        "safety_margin_satisfied": bool(fem_out.get("safety_margin_satisfied", False)),
                         "physical_feasible": bool(physical_feasible),
                         "seed_spacing_feasible": bool(seed_spacing_feasible),
                         "overall_feasible": bool(overall_feasible),
