@@ -53,32 +53,67 @@ class GridMesh:
                     n1 = (self.nely + 1) * elx + ely
                     n2 = (self.nely + 1) * (elx + 1) + ely
                     self.elemNodes[el, :] = np.array(
-                        [n1 + 1 + nxy * elz,
-                         n2 + 1 + nxy * elz,
-                         n2 + nxy * elz,
-                         n1 + nxy * elz,
-                         n1 + 1 + nxy * (elz + 1),
-                         n2 + 1 + nxy * (elz + 1),
-                         n2 + nxy * (elz + 1),
-                         n1 + nxy * (elz + 1)])
+                        [
+                            n1 + nxy * elz,
+                            n2 + nxy * elz,
+                            n2 + 1 + nxy * elz,
+                            n1 + 1 + nxy * elz,
+
+                            n1 + nxy * (elz + 1),
+                            n2 + nxy * (elz + 1),
+                            n2 + 1 + nxy * (elz + 1),
+                            n1 + 1 + nxy * (elz + 1),
+                        ]
+                    )
         self.elemNodes = self.elemNodes.astype(int)
 
-        self.nodeXYZ = np.zeros((self.numNodes, 3))
-        ctr = 0
-        for k in range(self.nelz + 1):
-            for i in range(self.nelx + 1):
-                for j in range(self.nely + 1):
-                    self.nodeXYZ[ctr, 0] = self.elemSize[0] * i
-                    self.nodeXYZ[ctr, 1] = self.nely * self.elemSize[1] - self.elemSize[1] * j
-                    self.nodeXYZ[ctr, 2] = self.elemSize[2] * k
-                    ctr += 1
+        problem_node_xyz = getattr(
+            self.problem,
+            "node_coords",
+            None,
+        )
+
+        if problem_node_xyz is not None:
+            problem_node_xyz = np.asarray(
+                problem_node_xyz,
+                dtype=np.float64,
+            ).reshape(-1, 3)
+
+            if problem_node_xyz.shape != (self.numNodes, 3):
+                raise ValueError(
+                    "problem.node_coords is inconsistent with GridMesh: "
+                    f"{problem_node_xyz.shape} != "
+                    f"({self.numNodes}, 3)"
+                )
+
+            self.nodeXYZ = problem_node_xyz.copy()
+
+        else:
+            xs = np.arange(self.nelx + 1) * self.elemSize[0]
+            ys = np.arange(self.nely + 1) * self.elemSize[1]
+            zs = np.arange(self.nelz + 1) * self.elemSize[2]
+
+            Z, X, Y = np.meshgrid(
+                zs,
+                xs,
+                ys,
+                indexing="ij",
+            )
+
+            self.nodeXYZ = np.stack(
+                [X, Y, Z],
+                axis=-1,
+            ).reshape(-1, 3)
+
+
+        coordinate_min = self.nodeXYZ.min(axis=0)
+        coordinate_max = self.nodeXYZ.max(axis=0)
+
+        self.bb_xmin, self.bb_ymin, self.bb_zmin = coordinate_min
+        self.bb_xmax, self.bb_ymax, self.bb_zmax = coordinate_max
 
         self.elemCenters = self.generatePoints()
         self.elemCentersUpSampling = self.generatePoints(2)
-
-        self.bb_xmin, self.bb_xmax = 0, self.nelx * self.elemSize[0]
-        self.bb_ymin, self.bb_ymax = 0, self.nely * self.elemSize[1]
-        self.bb_zmin, self.bb_zmax = 0, self.nelz * self.elemSize[2]
 
     # -----------------------#
     # this function initializes the boundary condition by calculating and returning:
@@ -103,25 +138,19 @@ class GridMesh:
 
         self.f = self.bc['force']
         self.numDOFPerElem = 8 * self.bc['numDOFPerNode']
-        self.edofMat = np.zeros((self.nelx * self.nely * self.nelz, self.numDOFPerElem), dtype=int)
-        dofxy = 3 * (self.nely + 1) * (self.nelx + 1)
-        for elz in range(self.nelz):
-            for elx in range(self.nelx):
-                for ely in range(self.nely):
-                    el = ely + elx * self.nely + elz * self.nelx * self.nely
-                    n1 = (self.nely + 1) * elx + ely + (self.nely + 1) * (self.nelx + 1) * elz
-                    n2 = (self.nely + 1) * (elx + 1) + ely + (self.nely + 1) * (self.nelx + 1) * elz
-                    self.edofMat[el, :] = np.array(
-                        [3 * n1 + 3, 3 * n1 + 4, 3 * n1 + 5,
-                         3 * n2 + 3, 3 * n2 + 4, 3 * n2 + 5,
-                         3 * n2, 3 * n2 + 1, 3 * n2 + 2,
-                         3 * n1, 3 * n1 + 1, 3 * n1 + 2,
-                         3 * n1 + 3 + dofxy, 3 * n1 + 4 + dofxy, 3 * n1 + 5 + dofxy,
-                         3 * n2 + 3 + dofxy, 3 * n2 + 4 + dofxy, 3 * n2 + 5 + dofxy,
-                         3 * n2 + dofxy, 3 * n2 + 1 + dofxy, 3 * n2 + 2 + dofxy,
-                         3 * n1 + dofxy, 3 * n1 + 1 + dofxy, 3 * n1 + 2 + dofxy], dtype=int)
+        node_components = np.arange(
+            self.bc["numDOFPerNode"],
+            dtype=np.int64,
+        )
 
-        self.edofMat = self.edofMat.astype(int)
+        self.edofMat = (
+            self.bc["numDOFPerNode"]
+            * self.elemNodes[:, :, None]
+            + node_components[None, None, :]
+        ).reshape(
+            self.numElems,
+            self.numDOFPerElem,
+        ).astype(np.int64)
 
         active_elem_nodes = self.elemNodes[self.active_element_ids].reshape(-1)
         self.active_node_ids = np.unique(active_elem_nodes).astype(np.int64)
@@ -253,9 +282,20 @@ class GridMesh:
         for k in range(resolution * self.nelz):
             for i in range(resolution * self.nelx):
                 for j in range(resolution * self.nely):
-                    xy[ctr, 0] = self.elemSize[0] * (i + 0.5) / resolution
-                    xy[ctr, 1] = self.elemSize[1] * (resolution * self.nely - j - 0.5) / resolution
-                    xy[ctr, 2] = self.elemSize[2] * (k + 0.5) / resolution
+                    xy[ctr, 0] = (
+                        self.bb_xmin
+                        + self.elemSize[0] * (i + 0.5) / resolution
+                    )
+
+                    xy[ctr, 1] = (
+                        self.bb_ymin
+                        + self.elemSize[1] * (j + 0.5) / resolution
+                    )
+
+                    xy[ctr, 2] = (
+                        self.bb_zmin
+                        + self.elemSize[2] * (k + 0.5) / resolution
+                    )
                     ctr += 1
         return xy
 

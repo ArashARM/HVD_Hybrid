@@ -9,6 +9,7 @@ def seed_separation_loss(
     seed_xyz: torch.Tensor,
     *,
     min_seed_spacing: float | torch.Tensor,
+    valid_seed_mask: torch.Tensor | None = None,
     spacing_power: float = 2.0,
     safety_factor: float = 1.05,
     aggregate_temperature: float = 1.0e-4,
@@ -26,12 +27,28 @@ def seed_separation_loss(
 
     2. Collective repulsion:
        Weakly discourages several seeds from clustering near the limit.
+
+    If valid_seed_mask is provided, only pairs where both seeds are valid
+    contribute to the loss. This lets boundary/outside-domain handling own
+    invalid seeds instead of letting separation push valid seeds away from them.
     """
     if seed_xyz.ndim != 2 or seed_xyz.shape[-1] != 3:
         raise ValueError(
             "seed_xyz must have shape [N, 3], "
             f"got {tuple(seed_xyz.shape)}."
         )
+
+    if valid_seed_mask is not None:
+        valid_seed_mask = valid_seed_mask.to(
+            device=seed_xyz.device,
+            dtype=torch.bool,
+        ).reshape(-1)
+        if valid_seed_mask.numel() != seed_xyz.shape[0]:
+            raise ValueError(
+                "valid_seed_mask must contain one value per seed, "
+                f"got {valid_seed_mask.numel()} for {seed_xyz.shape[0]} seeds."
+            )
+        seed_xyz = seed_xyz[valid_seed_mask.detach()]
 
     n_seed = int(seed_xyz.shape[0])
     if n_seed < 2:
@@ -136,9 +153,12 @@ def seed_separation_loss(
     return total_loss
 
 
-def minimum_physical_seed_distance(
+def minimum_seed_spacing_loss(
     seed_xyz: torch.Tensor,
     *,
+    min_seed_spacing: float | torch.Tensor,
+    spacing_power: float = 2.0,
+    valid_seed_mask: torch.Tensor | None = None,
     eps: float = 1.0e-12,
 ) -> torch.Tensor:
     if seed_xyz.ndim != 2 or seed_xyz.shape[-1] != 3:
@@ -146,6 +166,59 @@ def minimum_physical_seed_distance(
             "seed_xyz must have shape [N, 3], "
             f"got {tuple(seed_xyz.shape)}."
         )
+    if valid_seed_mask is not None:
+        valid_seed_mask = valid_seed_mask.to(
+            device=seed_xyz.device,
+            dtype=torch.bool,
+        ).reshape(-1)
+        if valid_seed_mask.numel() != seed_xyz.shape[0]:
+            raise ValueError(
+                "valid_seed_mask must contain one value per seed, "
+                f"got {valid_seed_mask.numel()} for {seed_xyz.shape[0]} seeds."
+            )
+        seed_xyz = seed_xyz[valid_seed_mask.detach()]
+
+    n_seed = int(seed_xyz.shape[0])
+    if n_seed < 2:
+        return seed_xyz.sum() * 0.0
+
+    distances = torch.cdist(seed_xyz, seed_xyz)
+    pair_mask = torch.triu(
+        torch.ones((n_seed, n_seed), dtype=torch.bool, device=seed_xyz.device),
+        diagonal=1,
+    )
+    target = torch.as_tensor(
+        min_seed_spacing,
+        dtype=seed_xyz.dtype,
+        device=seed_xyz.device,
+    ).clamp_min(eps)
+    violation = torch.relu((target - distances[pair_mask]) / target)
+    return violation.pow(float(spacing_power)).mean()
+
+
+def minimum_physical_seed_distance(
+    seed_xyz: torch.Tensor,
+    *,
+    valid_seed_mask: torch.Tensor | None = None,
+    eps: float = 1.0e-12,
+) -> torch.Tensor:
+    if seed_xyz.ndim != 2 or seed_xyz.shape[-1] != 3:
+        raise ValueError(
+            "seed_xyz must have shape [N, 3], "
+            f"got {tuple(seed_xyz.shape)}."
+        )
+    if valid_seed_mask is not None:
+        valid_seed_mask = valid_seed_mask.to(
+            device=seed_xyz.device,
+            dtype=torch.bool,
+        ).reshape(-1)
+        if valid_seed_mask.numel() != seed_xyz.shape[0]:
+            raise ValueError(
+                "valid_seed_mask must contain one value per seed, "
+                f"got {valid_seed_mask.numel()} for {seed_xyz.shape[0]} seeds."
+            )
+        seed_xyz = seed_xyz[valid_seed_mask.detach()]
+
     n_seed = int(seed_xyz.shape[0])
     if n_seed < 2:
         return seed_xyz.new_tensor(float("inf"))

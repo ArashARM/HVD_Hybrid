@@ -779,3 +779,35 @@ def test_meaningful_improvement_resets_patience_after_min_steps():
     assert patience_history[:4] == [0, 0, 0, 0]
     assert patience_history[4] == 0
     assert patience_history[-3:] == [1, 2, 3]
+
+
+def test_patience_uses_stable_anchor_for_slow_cumulative_improvement():
+    runtime = make_stage_runtime(min_steps=1, max_steps=30, patience=20)
+    identifier = "stable"
+    monitors = [10.0] + [10.0 - 0.001 * index for index in range(1, 12)]
+    patience_history = []
+
+    for monitor in monitors:
+        meaningful = NN_Trainer.is_meaningful_improvement(
+            monitor,
+            runtime.best_raw_monitor,
+            runtime.spec.min_delta_abs,
+            runtime.spec.min_delta_rel,
+        )
+        if monitor < runtime.best_raw_monitor:
+            runtime.best_raw_monitor = monitor
+        row = controller_row(identifier)
+        diagnostics = NN_Trainer.update_adaptive_stage_controller(
+            runtime,
+            row,
+            meaningful_improvement=meaningful,
+            stage_monitor_raw=monitor,
+            stage_topology_grace_steps=0,
+        )
+        patience_history.append(runtime.patience_counter)
+        runtime.local_step += 1
+
+    assert any(count > 0 for count in patience_history)
+    assert patience_history[-1] == 0
+    assert diagnostics["patience_meaningful_improvement"] is True
+    assert math.isclose(runtime.patience_anchor_monitor, monitors[-1])

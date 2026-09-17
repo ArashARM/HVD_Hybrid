@@ -1,3 +1,5 @@
+import math
+
 import torch
 import matplotlib.pyplot as plt
 
@@ -5,6 +7,7 @@ from Decoder_CLasses.ContinuousVoronoiDecoder import (
     GUARD_SEED_EPS,
     ContinuousVoronoiDecoder,
     fixed_guard_seeds,
+    guard_seed_distance,
     remap_guard_seed_pairs,
 )
 
@@ -314,7 +317,7 @@ def test_fixed_guard_topology_rejects_periodic_domains():
 
 def test_fixed_guard_seeds_coordinates_and_gradient_state():
     guards = fixed_guard_seeds(device=torch.device("cpu"), dtype=torch.float64)
-    d = float(torch.tensor(2.0, dtype=torch.float64).sqrt().item() + GUARD_SEED_EPS)
+    d = guard_seed_distance(0.0)
     expected = torch.tensor(
         [
             [0.5, -d],
@@ -329,6 +332,65 @@ def test_fixed_guard_seeds_coordinates_and_gradient_state():
     assert guards.requires_grad is False
     assert guards.grad_fn is None
     assert torch.allclose(guards, expected)
+
+
+def test_fixed_guard_margin_zero_matches_legacy_distance():
+    d = guard_seed_distance(0.0)
+    legacy = math.sqrt(2.0) + GUARD_SEED_EPS
+    guards = fixed_guard_seeds(
+        device=torch.device("cpu"),
+        dtype=torch.float64,
+        seed_domain_margin=0.0,
+    )
+
+    assert d == legacy
+    assert torch.allclose(guards[0], torch.tensor([0.5, -legacy], dtype=torch.float64))
+
+
+def test_margin_aware_guards_are_never_nearest_inside_unit_square_for_adversarial_seeds():
+    margin = 0.25
+    dtype = torch.float64
+    guards = fixed_guard_seeds(
+        device=torch.device("cpu"),
+        dtype=dtype,
+        seed_domain_margin=margin,
+    )
+    configs = [
+        torch.tensor([[-margin, -margin]], dtype=dtype),
+        torch.tensor([[1.0 + margin, -margin]], dtype=dtype),
+        torch.tensor([[-margin, 1.0 + margin]], dtype=dtype),
+        torch.tensor([[1.0 + margin, 1.0 + margin]], dtype=dtype),
+        torch.tensor(
+            [
+                [-margin, -margin],
+                [1.0 + margin, -margin],
+                [1.0 + margin, 1.0 + margin],
+                [-margin, 1.0 + margin],
+            ],
+            dtype=dtype,
+        ),
+    ]
+    grid_1d = torch.linspace(0.0, 1.0, 81, dtype=dtype)
+    uu, vv = torch.meshgrid(grid_1d, grid_1d, indexing="ij")
+    query = torch.stack((uu.reshape(-1), vv.reshape(-1)), dim=1)
+
+    for real in configs:
+        nearest_real = torch.cdist(query, real).min(dim=1).values
+        nearest_guard = torch.cdist(query, guards).min(dim=1).values
+        assert torch.all(nearest_real < nearest_guard)
+
+
+def test_negative_seed_domain_margin_rejected():
+    try:
+        fixed_guard_seeds(
+            device=torch.device("cpu"),
+            dtype=torch.float64,
+            seed_domain_margin=-1e-3,
+        )
+    except ValueError as exc:
+        assert "seed_domain_margin" in str(exc)
+    else:
+        raise AssertionError("negative guard margin should fail")
 
 
 def test_fixed_guard_concat_preserves_real_seed_gradients_only():

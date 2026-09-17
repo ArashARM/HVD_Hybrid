@@ -36,34 +36,31 @@ try:
     from .FEMControl import (
         checkpoint_design_score,
         checkpoint_feasibility_key,
-        checkpoint_raw_fiber_length,
         checkpoint_stage_id,
         select_final_checkpoint,
         update_adaptive_fem_lambda,
         validate_optimizer_parameter_coverage,
     )
-    from .Loss_rep import Loss_rep
+
     from .Loss_DensityWeightedCVT import LossDensityWeightedCVT
     from .Loss_SeedValidity import (
         minimum_physical_seed_distance,
-        minimum_seed_spacing_loss,
+        seed_separation_loss,
     )
 except ImportError:
     from Loss_FEM import Loss_FEM
     from FEMControl import (
         checkpoint_design_score,
         checkpoint_feasibility_key,
-        checkpoint_raw_fiber_length,
         checkpoint_stage_id,
         select_final_checkpoint,
         update_adaptive_fem_lambda,
         validate_optimizer_parameter_coverage,
     )
-    from Loss_rep import Loss_rep
     from Loss_DensityWeightedCVT import LossDensityWeightedCVT
     from Loss_SeedValidity import (
         minimum_physical_seed_distance,
-        minimum_seed_spacing_loss,
+        seed_separation_loss,
     )
 
 
@@ -252,6 +249,47 @@ def build_shared_curve_geometry(
         cell_boundary_edge_directions=cell_boundary_edge_directions,
         cell_boundary_seed_ids=cell_boundary_seed_ids,
     )
+def curve_length_fields_from_decoder_output(
+    decoder_out: dict | None,
+) -> dict[str, torch.Tensor]:
+    if not isinstance(decoder_out, dict):
+        return {}
+    curves = decoder_out.get("edge_curves_xyz", None)
+    if not isinstance(curves, torch.Tensor):
+        return {}
+
+    edge_lengths = compute_all_edge_curve_lengths(curves)
+    finite = (
+        torch.isfinite(edge_lengths)
+        & torch.isfinite(curves).all(dim=-1).all(dim=-1)
+    )
+    total_curve_length = (
+        edge_lengths[finite].sum()
+        if bool(finite.any().detach().cpu().item())
+        else curves.sum() * 0.0
+    )
+
+    total_voronoi_curve_length = total_curve_length
+    graph = decoder_out.get("graph", None)
+    edge_type = graph.get("edge_type", None) if isinstance(graph, dict) else None
+    if isinstance(edge_type, torch.Tensor) and edge_type.numel() == edge_lengths.numel():
+        edge_type = edge_type.to(device=edge_lengths.device, dtype=torch.long).reshape(-1)
+        vd_mask = build_edge_type_mask(
+            edge_type,
+            EDGE_TYPES_BY_LOSS_MODE["VDonly"],
+        )
+        keep = finite & vd_mask
+        total_voronoi_curve_length = (
+            edge_lengths[keep].sum()
+            if bool(keep.any().detach().cpu().item())
+            else curves.sum() * 0.0
+        )
+
+    return {
+        "edge_curve_lengths_xyz": edge_lengths,
+        "total_curve_length": total_curve_length,
+        "total_voronoi_curve_length": total_voronoi_curve_length,
+    }
 def needs_shared_curve_geometry(
     *,
     compute_total_fiber_length_loss: bool,
@@ -279,6 +317,7 @@ class StageRuntime:
     spec: StageSpec
     local_step: int = 0
     best_raw_monitor: float = float("inf")
+    patience_anchor_monitor: float = float("inf")
     recovery_best_monitor: float = float("inf")
     patience_counter: int = 0
     topology_grace_remaining: int = 0
@@ -295,6 +334,9 @@ class TrainingConfig:
     seed_init_fps_seed: int | None = None
     use_balanced_seed_init: bool = True
     seed_number: int = 15
+    warm_start_optimized_function_path: str | None = None
+    warm_start_prune_inactive_seeds: bool = False
+    warm_start_skip_stage1: bool = True
     training_face_index: int = 0
     LoadingCase: str = "Unspecified loading case"
 
@@ -336,6 +378,13 @@ class TrainingConfig:
     seed_spacing_power: float = 2.0
     lam_seed_spacing: float = 1.0
 
+    seed_spacing_safety_factor: float = 1.05
+    seed_spacing_aggregate_temperature: float = 1.0e-4
+
+    seed_repulsion_factor: float = 1.10
+    seed_repulsion_temperature_ratio: float = 0.02
+    seed_repulsion_weight: float = 0.10
+
     use_3d_density_filter: bool = False
     filter_radius_3d: float = 0.03
     filter_self_weight: float = 1.0
@@ -356,6 +405,16 @@ class TrainingConfig:
     lam_cell_angle_uniform: float = 1.0
     lam_cell_radial_uniform: float = 0.5
     include_shell_in_length_loss: bool = False
+    optimization_mode: str = "constrained_displacement"
+    target_total_length: float | None = None
+    target_total_length_tolerance: float = 5.0
+    target_length_under_weight: float = 1.0
+    target_length_over_weight: float = 100.0
+    displacement_objective_weight: float = 1.0
+    displacement_objective_mode: str = "p_norm"
+    lock_seed_domain_after_target_length_feasible: bool = False
+    target_length_lock_patience: int = 25
+    target_length_unlock_on_violation: bool = False
 
     fem_max_displacement: float | None = None
     fem_yield_strength: float | None = None
@@ -397,7 +456,6 @@ class TrainingConfig:
     use_rolling_seed_anchors: bool = True
     disable_rolling_seed_anchors_for_curve_only: bool = True
     anchor_guard_updates: bool = True
-    anchor_guard_rep_max: float = 0.30
     anchor_guard_vol_eff_min: float = 0.10
 
     allow_seed_outside_domain: bool = True
@@ -419,14 +477,12 @@ class TrainingConfig:
 
     stage1_lam_fem: float = 0.0
     stage1_lam_cvt: float = 1.0
-    stage1_lam_rep: float = 2.0
     stage1_lam_total_fiber_length: float = 0.0
     stage1_lam_l_curve_cell: float = 0.05
     stage1_freeze_seeds: bool = True
     stage1_allow_seed_outside_domain: bool = True
     stage2_lam_fem: float = 1.0
     stage2_lam_cvt: float = 0.0
-    stage2_lam_rep: float = 0.10
     stage2_lam_total_fiber_length: float = 1.0
     stage2_lam_l_curve_cell: float = 0.05
     stage2_freeze_seeds: bool = True
@@ -494,6 +550,49 @@ class TrainingConfig:
                 setattr(self, name, value[0])
 
         self.Edge_in_losses = canonical_edge_in_losses_mode(self.Edge_in_losses)
+        self.optimization_mode = str(self.optimization_mode).strip().lower()
+        if self.optimization_mode == "constrained_displacment":
+            self.optimization_mode = "constrained_displacement"
+        if self.optimization_mode not in (
+            "constrained_displacement",
+            "target_length_constrained_displacement",
+        ):
+            raise ValueError(
+                "optimization_mode must be 'constrained_displacement' or "
+                f"'target_length_constrained_displacement', got {self.optimization_mode!r}"
+            )
+        if self.optimization_mode == "target_length_constrained_displacement":
+            if self.target_total_length is None:
+                raise ValueError(
+                    "target_total_length must be set when optimization_mode is "
+                    "'target_length_constrained_displacement'"
+                )
+            if not math.isfinite(float(self.target_total_length)) or float(self.target_total_length) <= 0.0:
+                raise ValueError("target_total_length must be positive finite")
+        for name in (
+            "target_total_length_tolerance",
+            "target_length_under_weight",
+            "target_length_over_weight",
+            "displacement_objective_weight",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and >= 0, got {value}")
+        self.displacement_objective_mode = str(self.displacement_objective_mode).strip().lower()
+        if self.displacement_objective_mode not in ("p_norm", "physical_max"):
+            raise ValueError(
+                "displacement_objective_mode must be 'p_norm' or 'physical_max', "
+                f"got {self.displacement_objective_mode!r}"
+            )
+        self.lock_seed_domain_after_target_length_feasible = bool(
+            self.lock_seed_domain_after_target_length_feasible
+        )
+        self.target_length_unlock_on_violation = bool(
+            self.target_length_unlock_on_violation
+        )
+        if int(self.target_length_lock_patience) < 1:
+            raise ValueError("target_length_lock_patience must be >= 1")
+        self.target_length_lock_patience = int(self.target_length_lock_patience)
         self.strut_thickness = float(self.strut_thickness)
         if self.strut_thickness <= 0.0:
             raise ValueError(f"strut_thickness must be > 0, got {self.strut_thickness}")
@@ -676,12 +775,10 @@ class TrainingConfig:
         for name in (
             "stage1_lam_fem",
             "stage1_lam_cvt",
-            "stage1_lam_rep",
             "stage1_lam_total_fiber_length",
             "stage1_lam_l_curve_cell",
             "stage2_lam_fem",
             "stage2_lam_cvt",
-            "stage2_lam_rep",
             "stage2_lam_total_fiber_length",
             "stage2_lam_l_curve_cell",
         ):
@@ -729,6 +826,14 @@ class TrainingConfig:
                 f"got {self.stage_transition_selection!r}"
             )
         self.use_balanced_seed_init = bool(self.use_balanced_seed_init)
+        self.warm_start_prune_inactive_seeds = bool(self.warm_start_prune_inactive_seeds)
+        self.warm_start_skip_stage1 = bool(self.warm_start_skip_stage1)
+        if self.warm_start_optimized_function_path is not None:
+            path = os.path.expanduser(str(self.warm_start_optimized_function_path))
+            if not path:
+                self.warm_start_optimized_function_path = None
+            else:
+                self.warm_start_optimized_function_path = path
 
 
 def _cfg_value(config, name: str, default=None):
@@ -1339,7 +1444,22 @@ def evaluate_optimized_shell_function(
             density = final_density
             fiber_3d = final_fiber
             density_binary = (density >= 0.5).to(dtype=density.dtype)
-            return {
+            best_pred = getattr(optimized_function, "best_pred", None)
+            if not isinstance(best_pred, dict):
+                best_pred = {}
+            graph = best_pred.get("graph", None)
+            curve_length_fields = curve_length_fields_from_decoder_output(best_pred)
+            if isinstance(graph, dict) and curve_length_fields:
+                graph["edge_curve_lengths_xyz"] = curve_length_fields[
+                    "edge_curve_lengths_xyz"
+                ]
+                graph["total_curve_length"] = curve_length_fields[
+                    "total_curve_length"
+                ]
+                graph["total_voronoi_curve_length"] = curve_length_fields[
+                    "total_voronoi_curve_length"
+                ]
+            fields = {
                 "2d_density": density,
                 "2d_fiberDir": None,
                 "3d_density": density,
@@ -1352,9 +1472,16 @@ def evaluate_optimized_shell_function(
                 "rho_postprocessed": density,
                 "fiber3d": fiber_3d,
                 "t_uv": None,
-                "decoder_output": None,
+                "seeds_uv": best_pred.get("seeds_uv", best_pred.get("seeds", None)),
+                "seeds_xyz": best_pred.get("seeds_xyz", None),
+                "edge_curves_uv": best_pred.get("edge_curves_uv", None),
+                "edge_curves_xyz": best_pred.get("edge_curves_xyz", None),
+                "graph": graph,
+                "decoder_output": best_pred if best_pred else None,
                 "face_tensor": face_tensor,
             }
+            fields.update(curve_length_fields)
+            return fields
 
     out = optimized_function.evaluate_face(
         face_tensor,
@@ -1365,7 +1492,14 @@ def evaluate_optimized_shell_function(
     fiber_3d = out["fiber3d"]
     rho_raw_decoder = out.get("rho_raw_decoder", density)
     density_binary = (density >= 0.5).to(dtype=density.dtype)
-    return {
+    curve_length_fields = curve_length_fields_from_decoder_output(out)
+    graph = out.get("graph", None)
+    if isinstance(graph, dict) and curve_length_fields:
+        graph["edge_curve_lengths_xyz"] = curve_length_fields["edge_curve_lengths_xyz"]
+        graph["total_curve_length"] = curve_length_fields["total_curve_length"]
+        graph["total_voronoi_curve_length"] = curve_length_fields["total_voronoi_curve_length"]
+
+    fields = {
         "2d_density": density,
         "2d_fiberDir": fiber_2d,
         "3d_density": density,
@@ -1378,9 +1512,16 @@ def evaluate_optimized_shell_function(
         "rho_postprocessed": out.get("rho_postprocessed", density),
         "fiber3d": fiber_3d,
         "t_uv": fiber_2d,
+        "seeds_uv": out.get("seeds_uv", out.get("seeds", None)),
+        "seeds_xyz": out.get("seeds_xyz", None),
+        "edge_curves_uv": out.get("edge_curves_uv", None),
+        "edge_curves_xyz": out.get("edge_curves_xyz", None),
+        "graph": graph,
         "decoder_output": out,
         "face_tensor": face_tensor,
     }
+    fields.update(curve_length_fields)
+    return fields
 
 
 def sanity_check_density_postprocess_pipeline(
@@ -1862,7 +2003,6 @@ class NN_Trainer:
         self.last_fem_debug = {}
         self.fem_debug_history = []
         self.loss_fem = Loss_FEM(self)
-        self.loss_rep = Loss_rep()
         self.loss_cvt = LossDensityWeightedCVT()
         self.timelapse_loading_img = (
             None if loading_img is None else self._composite_to_white(np.asarray(loading_img))
@@ -1891,13 +2031,15 @@ class NN_Trainer:
         curve_geometry: SharedCurveGeometry,
     ) -> torch.Tensor:
         """
-        Minimize the total selected Voronoi curve network length.
+        Minimize the total selected fiber network length.
 
         This is the final geometry objective: fixed width controls volume, while
-        this term shrinks the selected fixed-seed VD network.
+        this term shrinks the configured selected fiber network. The selected
+        edge types follow cfg.Edge_in_losses, so Edge_in_losses="all" makes this
+        a true total fiber length over all optimized fiber edge classes.
         """
         cfg = self.cfg
-        allowed_types = resolve_edge_types_in_losses("VDonly")
+        allowed_types = resolve_edge_types_in_losses(cfg.Edge_in_losses)
         type_mask = build_edge_type_mask(curve_geometry.edge_type, allowed_types)
         keep = curve_geometry.finite_edge_mask & type_mask
         edge_lengths = curve_geometry.edge_lengths[keep]
@@ -2002,6 +2144,7 @@ class NN_Trainer:
         row: dict[str, Any],
         *,
         meaningful_improvement: bool,
+        stage_monitor_raw: float | None = None,
         stage_topology_grace_steps: int,
         stage_topology_grace_max_resets: int | None = None,
         debug_stage_controller: bool = False,
@@ -2050,6 +2193,12 @@ class NN_Trainer:
         runtime.previous_edge_count = edge_count
 
         patience_active = runtime.local_step + 1 >= spec.min_steps
+        stage_monitor_value = (
+            float(stage_monitor_raw)
+            if stage_monitor_raw is not None
+            and math.isfinite(float(stage_monitor_raw))
+            else None
+        )
         grace_reset_budget = (
             int(stage_topology_grace_max_resets)
             if stage_topology_grace_max_resets is not None
@@ -2066,6 +2215,14 @@ class NN_Trainer:
         if patience_active:
             overall_feasible = bool(row.get("overall_feasible", True))
             design_patience_active = bool(overall_feasible)
+            patience_meaningful_improvement = bool(meaningful_improvement)
+            if design_patience_active and stage_monitor_value is not None:
+                patience_meaningful_improvement = NN_Trainer.is_meaningful_improvement(
+                    stage_monitor_value,
+                    runtime.patience_anchor_monitor,
+                    spec.min_delta_abs,
+                    spec.min_delta_rel,
+                )
             if not design_patience_active:
                 runtime.recovery_best_monitor = min(
                     float(runtime.recovery_best_monitor),
@@ -2079,13 +2236,16 @@ class NN_Trainer:
                     int(runtime.topology_grace_remaining) - 1,
                     0,
                 )
-            elif meaningful_improvement:
+            elif patience_meaningful_improvement:
                 runtime.patience_counter = 0
+                if stage_monitor_value is not None:
+                    runtime.patience_anchor_monitor = stage_monitor_value
             else:
                 runtime.patience_counter += 1
         else:
             overall_feasible = bool(row.get("overall_feasible", True))
             design_patience_active = False
+            patience_meaningful_improvement = False
             runtime.patience_counter = 0
             runtime.topology_grace_remaining = 0
         diagnostics = {
@@ -2095,6 +2255,7 @@ class NN_Trainer:
             "design_patience_active": bool(patience_active and design_patience_active),
             "stage_monitor_mode": str(row.get("stage_monitor_mode", "design" if overall_feasible else "recovery")),
             "meaningful_improvement": bool(meaningful_improvement),
+            "patience_meaningful_improvement": bool(patience_meaningful_improvement),
             "seed_count_changed": bool(seed_count_changed),
             "identifier_changed": bool(identifier_changed),
             "edge_count_changed": bool(edge_count_changed),
@@ -2122,6 +2283,7 @@ class NN_Trainer:
             )
 
         row["best_stage_monitor"] = runtime.best_raw_monitor
+        row["patience_anchor_monitor"] = runtime.patience_anchor_monitor
         row["recovery_best_monitor"] = runtime.recovery_best_monitor
         row["stage_patience_counter"] = runtime.patience_counter
         row["topology_grace_remaining"] = runtime.topology_grace_remaining
@@ -3021,6 +3183,28 @@ class NN_Trainer:
                     self.writer.add_histogram(tag, value[finite_mask].detach().cpu(), step)
         except Exception:
             pass
+
+    def _tb_log_all_loss_scalars(self, row: dict, step: int):
+        if self.writer is None:
+            return
+        for key, value in row.items():
+            key_text = str(key)
+            key_lower = key_text.lower()
+            is_loss_like = (
+                "loss" in key_lower
+                or key_lower.endswith("_penalty")
+                or key_lower in {
+                    "displacement_objective",
+                    "mechanical_violation",
+                    "fem_constraint_violation",
+                    "spacing_violation",
+                    "overall_constraint_violation",
+                }
+            )
+            if not is_loss_like or isinstance(value, bool):
+                continue
+            self._tb_add_scalar(f"LossAll/{key_text}", value, step)
+
     def _tb_log_step(
         self,
         step: int,
@@ -3041,7 +3225,6 @@ class NN_Trainer:
         self._tb_add_scalar("StageLambda/FEMBase", row.get("lam_fem_base", 0.0), step)
         self._tb_add_scalar("StageLambda/FEMAdaptiveMultiplier", row.get("adaptive_lambda_fem", 0.0), step)
         self._tb_add_scalar("StageLambda/CVT", row.get("lam_cvt_eff", 0.0), step)
-        self._tb_add_scalar("StageLambda/Repulsion", row.get("lam_rep_eff", 0.0), step)
         self._tb_add_scalar("StageLambda/SeedSpacing", row.get("lam_seed_spacing_eff", 0.0), step)
         self._tb_add_scalar("StageLambda/Total_Fiber_Length", row.get("lam_total_fiber_length_eff", 0.0), step)
         self._tb_add_scalar("StageLambda/L_curve_cell", row.get("lam_l_curve_cell_eff", 0.0), step)
@@ -3049,9 +3232,32 @@ class NN_Trainer:
         self._tb_add_scalar("Loss/Total", row["L_total"], step)
         self._tb_add_scalar("Loss/TrainObjective", row.get("L_train", row["L_total"]), step)
         self._tb_add_scalar("Loss/DesignScore", row.get("design_score", 0.0), step)
-        self._tb_add_scalar("Loss/Repulsion", row["loss_rep"], step)
+        self._tb_add_scalar("Objective/LTrain", row.get("L_train", row["L_total"]), step)
+        self._tb_add_scalar("Objective/DesignScore", row.get("design_score", 0.0), step)
+        self._tb_add_scalar("Objective/StageMonitor", row.get("stage_monitor_raw", 0.0), step)
+        self._tb_add_scalar("Objective/ContributionSum", row.get("objective_contribution_sum", 0.0), step)
+        for term in row.get("objective_terms", []) or []:
+            key = str(term.get("key", "term"))
+            self._tb_add_scalar(f"ObjectiveContribution/{key}", term.get("contribution", 0.0), step)
+            self._tb_add_scalar(f"ObjectiveValue/{key}", term.get("value", 0.0), step)
+            self._tb_add_scalar(f"ObjectiveWeight/{key}", term.get("weight", 0.0), step)
         self._tb_add_scalar("Loss/CVT", row["loss_cvt"], step)
         self._tb_add_scalar("Loss/SeedSpacing", row.get("loss_seed_spacing", 0.0), step)
+        self._tb_add_scalar(
+            "Loss/SeedSpacingBarrier",
+            row.get("loss_seed_spacing_barrier", 0.0),
+            step,
+        )
+        self._tb_add_scalar(
+            "Loss/SeedSpacingRepulsionRaw",
+            row.get("loss_seed_spacing_repulsion", 0.0),
+            step,
+        )
+        self._tb_add_scalar(
+            "Loss/SeedSpacingRepulsionWeighted",
+            row.get("loss_seed_spacing_repulsion_weighted", 0.0),
+            step,
+        )
         self._tb_add_scalar("Loss/Validity", row.get("validity_loss", 0.0), step)
         self._tb_add_scalar("Loss/Total_Fiber_Length", row["loss_total_fiber_length"], step)
         self._tb_add_scalar("Loss/L_curve_cell", row["loss_l_curve_cell"], step)
@@ -3063,20 +3269,28 @@ class NN_Trainer:
         self._tb_add_scalar("Loss/FEMDisplacementConstraint", row.get("loss_fem_displacement_constraint", 0.0), step)
         self._tb_add_scalar("Loss/FEMBaseline", row.get("baseline_fem_loss", 0.0), step)
         self._tb_add_scalar("Loss/FEMViolation", row.get("violation_fem_loss", 0.0), step)
+        self._tb_add_scalar("Loss/FEMStressMargin", row.get("fem_stress_margin_loss", 0.0), step)
+        self._tb_add_scalar("Loss/FEMDisplacementMargin", row.get("fem_displacement_margin_loss", 0.0), step)
+        self._tb_add_scalar("Loss/FEMStressViolation", row.get("fem_stress_violation_loss", 0.0), step)
+        self._tb_add_scalar("Loss/FEMDisplacementViolation", row.get("fem_displacement_violation_loss", 0.0), step)
+        self._tb_add_scalar("Loss/DisplacementObjective", row.get("displacement_objective", 0.0), step)
+        self._tb_add_scalar("Loss/TargetTotalLengthPenalty", row.get("target_total_length_penalty", 0.0), step)
+        self._tb_add_scalar("Loss/TargetTotalLengthRangeViolation", row.get("target_total_length_range_violation", 0.0), step)
+        self._tb_add_scalar("Loss/TargetTotalLengthUnderViolation", row.get("target_total_length_under_violation", 0.0), step)
+        self._tb_add_scalar("Loss/TargetTotalLengthOverViolation", row.get("target_total_length_over_violation", 0.0), step)
         self._tb_add_scalar("LossNormalized/CVT", row.get("loss_cvt_norm", 0.0), step)
-        self._tb_add_scalar("LossNormalized/Repulsion", row.get("loss_rep_norm", 0.0), step)
         self._tb_add_scalar("LossNormalized/Total_Fiber_Length", row.get("loss_total_fiber_length_norm", 0.0), step)
         self._tb_add_scalar("LossNormalized/L_curve_cell", row.get("loss_l_curve_cell_norm", 0.0), step)
+        self._tb_add_scalar("LossNormalized/FEM", row.get("loss_fem_norm", row.get("loss_fem", 0.0)), step)
         self._tb_add_scalar("LossReference/CVT", row.get("loss_cvt_reference", 1.0), step)
-        self._tb_add_scalar("LossReference/Repulsion", row.get("loss_rep_reference", 1.0), step)
         self._tb_add_scalar("LossReference/Total_Fiber_Length", row.get("loss_total_fiber_length_reference", 1.0), step)
         self._tb_add_scalar("LossReference/L_curve_cell", row.get("loss_l_curve_cell_reference", 1.0), step)
         self._tb_add_scalar("LossReference/FEM", row.get("loss_fem_reference", 1.0), step)
-        self._tb_add_scalar("Physics/FEMStressMax", row.get("fem_stress_max", 0.0), step)
+        self._tb_add_scalar("Physics/FEMStressMaxIP", row.get("fem_stress_max", 0.0), step)
         self._tb_add_scalar("Physics/FEMDisplacementMax", row.get("fem_displacement_max", 0.0), step)
         self._tb_add_scalar("Physics/FEMStressConstraintExcess", row.get("fem_stress_constraint_excess", 0.0), step)
         self._tb_add_scalar("Physics/FEMDisplacementConstraintExcess", row.get("fem_displacement_constraint_excess", 0.0), step)
-        self._tb_add_scalar("Physics/FEMStressRatio", row.get("fem_stress_ratio", 0.0), step)
+        self._tb_add_scalar("Physics/FEMStressRatioMaxIP", row.get("fem_stress_ratio", 0.0), step)
         self._tb_add_scalar("Physics/FEMDisplacementRatio", row.get("fem_displacement_ratio", 0.0), step)
         self._tb_add_scalar("Physics/FEMPhysicalStressRatio", row.get("physical_stress_ratio", 0.0), step)
         self._tb_add_scalar("Physics/FEMPhysicalDisplacementRatio", row.get("physical_displacement_ratio", 0.0), step)
@@ -3109,6 +3323,7 @@ class NN_Trainer:
         self._tb_add_scalar("Seeds/TotalCount", row.get("total_seed_count", 0.0), step)
         self._tb_add_scalar("Seeds/VisualInactiveCount", row.get("visual_inactive_seed_count", 0.0), step)
         self._tb_add_scalar("Seeds/MinDistance", row.get("min_seed_distance", row.get("minimum_seed_distance", 0.0)), step)
+        self._tb_log_all_loss_scalars(row, step)
 
         fiber_norm = torch.linalg.norm(fiber_surface, dim=1)
         if fiber_norm.numel() > 0:
@@ -3308,6 +3523,7 @@ class NN_Trainer:
         best_step: int,
         computation_time_sec: float,
         returned_best_source: str,
+        best_score_meaning: str = "",
     ) -> str | None:
         if not output_folder:
             return None
@@ -3353,7 +3569,10 @@ class NN_Trainer:
             if key in clean_best_row
         }
         summary = {
+            "optimization_mode": str(clean_best_row.get("optimization_mode", getattr(self.cfg, "optimization_mode", "constrained_displacement"))),
+            "optimization_mode_description": str(clean_best_row.get("optimization_mode_description", "")),
             "best_score": best_score,
+            "best_score_meaning": str(best_score_meaning or clean_best_row.get("best_score_meaning", "")),
             "best_design_score": float(clean_best_row.get("design_score", float("nan"))),
             "best_raw_fiber_length": float(clean_best_row.get("loss_total_fiber_length", float("nan"))),
             "best_physical_stress_ratio": float(clean_best_row.get("physical_stress_ratio", float("nan"))),
@@ -3365,6 +3584,9 @@ class NN_Trainer:
             "computation_time_seconds": computation_time_sec,
             "volume_metrics": self._volume_metric_definitions(),
             "best_solution_metrics": best_solution_metrics,
+            "objective_terms": clean_best_row.get("objective_terms", []),
+            "objective_terms_text": clean_best_row.get("objective_terms_text", ""),
+            "objective_contribution_sum": clean_best_row.get("objective_contribution_sum", float("nan")),
             "best_row": clean_best_row,
         }
         summary_path = os.path.join(log_dir, "optimization_summary.json")
@@ -3373,7 +3595,51 @@ class NN_Trainer:
 
         history_path = os.path.join(log_dir, "optimization_history.csv")
         if clean_history:
-            fieldnames = []
+            preferred_fieldnames = [
+                "step",
+                "stage",
+                "stage_local_step",
+                "optimization_mode",
+                "optimization_mode_description",
+                "L_train",
+                "design_score",
+                "stage_monitor_raw",
+                "stage_monitor_mode",
+                "objective_contribution_sum",
+                "objective_terms_text",
+                "loss_total_fiber_length",
+                "loss_total_fiber_length_norm",
+                "target_total_length",
+                "target_total_length_lower",
+                "target_total_length_upper",
+                "target_total_length_penalty",
+                "target_total_length_range_violation",
+                "target_total_length_under_violation",
+                "target_total_length_over_violation",
+                "displacement_objective",
+                "loss_displacement_ratio",
+                "loss_fem",
+                "loss_fem_norm",
+                "loss_fem_stress_constraint",
+                "loss_fem_displacement_constraint",
+                "baseline_fem_loss",
+                "violation_fem_loss",
+                "fem_stress_margin_loss",
+                "fem_displacement_margin_loss",
+                "fem_stress_violation_loss",
+                "fem_displacement_violation_loss",
+                "physical_stress_ratio",
+                "physical_displacement_ratio",
+                "overall_feasible",
+                "physical_feasible",
+                "seed_spacing_feasible",
+                "target_length_feasible",
+                "best_feasible_design_score",
+                "best_feasible_step",
+                "best_infeasible_violation",
+                "best_infeasible_step",
+            ]
+            fieldnames = [key for key in preferred_fieldnames if any(key in row for row in clean_history)]
             for row in clean_history:
                 for key in row.keys():
                     if key not in fieldnames:
@@ -3618,6 +3884,7 @@ class NN_Trainer:
             "use_spatial_pruning": bool(self.cfg.decoder_use_spatial_pruning),
             "min_tube_spacing": float(self.cfg.decoder_min_tube_spacing),
             "tube_target_spacing_ratio": float(self.cfg.decoder_tube_target_spacing_ratio),
+            "seed_domain_margin": float(self.cfg.seed_domain_margin),
             "n_seeds": None if seed_number is None else int(seed_number),
             "strut_thickness": float(self.cfg.strut_thickness),
             "rho_min": float(self.cfg.rho_min),
@@ -3921,8 +4188,117 @@ class NN_Trainer:
     @staticmethod
     def _face_id_key(face_id) -> int:
         return _safe_int_or_none(face_id, default=0)
+
+    def _warm_start_path(self) -> str | None:
+        path = getattr(self.cfg, "warm_start_optimized_function_path", None)
+        if path is None:
+            return None
+        path = os.path.expanduser(str(path))
+        return path if path else None
+
+    def _load_warm_start_seed_uv(self, *, device, dtype) -> torch.Tensor | None:
+        path = self._warm_start_path()
+        if path is None:
+            return None
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                "warm_start_optimized_function_path does not exist: "
+                f"{path}"
+            )
+
+        try:
+            package = torch.load(path, map_location=device, weights_only=False)
+        except TypeError:
+            package = torch.load(path, map_location=device)
+        if not isinstance(package, dict):
+            raise TypeError(
+                "Warm-start file must be a saved optimized shell package dict."
+            )
+
+        best_pred = package.get("best_pred", None)
+        if best_pred is None and isinstance(package.get("checkpoint", None), dict):
+            pred_list = package["checkpoint"].get("pred_list", [])
+            best_pred = pred_list[0] if pred_list else None
+        if not isinstance(best_pred, dict):
+            raise ValueError(
+                "Warm-start package does not contain best_pred seed data."
+            )
+
+        seeds = best_pred.get("seeds_raw", best_pred.get("seeds_uv", None))
+        if not isinstance(seeds, torch.Tensor):
+            raise ValueError(
+                "Warm-start best_pred must contain tensor key 'seeds_raw' "
+                "or 'seeds_uv'."
+            )
+        seeds = seeds.detach().to(device=device, dtype=dtype).clone()
+        if seeds.ndim != 2 or seeds.shape[-1] != 2:
+            raise ValueError(
+                "Warm-start seeds must have shape [S, 2], "
+                f"got {tuple(seeds.shape)}."
+            )
+        if int(seeds.shape[0]) <= 0:
+            raise ValueError("Warm-start package contains no seeds.")
+
+        original_count = int(seeds.shape[0])
+        pruned_count = 0
+        if bool(getattr(self.cfg, "warm_start_prune_inactive_seeds", False)):
+            inactive = best_pred.get("seed_visual_inactive_mask", None)
+            if not isinstance(inactive, torch.Tensor):
+                raise ValueError(
+                    "warm_start_prune_inactive_seeds=True requires "
+                    "best_pred['seed_visual_inactive_mask'] in the saved package."
+                )
+            inactive = inactive.detach().to(device=device, dtype=torch.bool).reshape(-1)
+            if inactive.numel() != original_count:
+                raise ValueError(
+                    "Warm-start inactive seed mask length does not match seeds: "
+                    f"{int(inactive.numel())} vs {original_count}."
+                )
+            keep = ~inactive
+            kept_count = int(keep.sum().item())
+            if kept_count <= 0:
+                raise ValueError(
+                    "Warm-start pruning would remove every seed; refusing to "
+                    "start optimization with an empty HVD seed set."
+                )
+            seeds = seeds[keep].clone()
+            pruned_count = original_count - kept_count
+
+        self.cfg.seed_number = int(seeds.shape[0])
+        tqdm.write(
+            "[Warm start] Loaded optimized shell seeds from "
+            f"{path} | seeds={original_count} -> {int(seeds.shape[0])} "
+            f"(pruned_inactive={pruned_count})"
+        )
+        return seeds
+
+    @staticmethod
+    def _reset_ppnet_to_identity_seed_mapping(ppnet) -> None:
+        def zero_value(value) -> None:
+            if value is None:
+                return
+            if isinstance(value, torch.Tensor):
+                value.zero_()
+                return
+            if isinstance(value, torch.nn.Module):
+                for parameter in value.parameters():
+                    parameter.zero_()
+
+        with torch.no_grad():
+            for module_name in ("seed_refine", "delta_head"):
+                zero_value(getattr(ppnet, module_name, None))
+            zero_value(getattr(ppnet, "global_latent", None))
+            zero_value(getattr(ppnet, "seed_id_embed", None))
+            zero_value(getattr(ppnet, "independent_seed_offsets", None))
     
     def _init_face_seed(self, face_tensor):
+        warm_start = self._load_warm_start_seed_uv(
+            device=face_tensor["uv"].device,
+            dtype=face_tensor["uv"].dtype,
+        )
+        if warm_start is not None:
+            return warm_start
+
         cfg = self.cfg
         boundary = self._true_open_boundary_idx(face_tensor)
         if not cfg.use_balanced_seed_init:
@@ -3994,7 +4370,6 @@ class NN_Trainer:
             "allow_seed_outside_domain": bool(getattr(cfg, f"{prefix}_allow_seed_outside_domain")),
             "lam_fem": float(getattr(cfg, f"{prefix}_lam_fem")),
             "lam_cvt": float(getattr(cfg, f"{prefix}_lam_cvt")),
-            "lam_rep": float(getattr(cfg, f"{prefix}_lam_rep")),
             "lam_total_fiber_length": float(getattr(cfg, f"{prefix}_lam_total_fiber_length")),
             "lam_l_curve_cell": float(getattr(cfg, f"{prefix}_lam_l_curve_cell")),
         }
@@ -4013,7 +4388,7 @@ class NN_Trainer:
 
     def _adaptive_stage_specs(self) -> list[StageSpec]:
         cfg = self.cfg
-        return [
+        specs = [
             StageSpec(
                 stage_id=1,
                 name="Stage 1",
@@ -4033,6 +4408,9 @@ class NN_Trainer:
                 min_delta_rel=float(cfg.stage2_min_delta_rel),
             ),
         ]
+        if self._warm_start_path() is not None and bool(getattr(cfg, "warm_start_skip_stage1", True)):
+            return [spec for spec in specs if int(spec.stage_id) != 1]
+        return specs
 
     @staticmethod
     def is_meaningful_improvement(
@@ -4072,7 +4450,6 @@ class NN_Trainer:
                 return tensor_value("design_score")
             for lam_name, loss_name in (
                 ("lam_cvt", "loss_cvt_norm"),
-                ("lam_rep", "loss_rep_norm"),
                 ("lam_l_curve_cell", "loss_l_curve_cell_norm"),
                 ("lam_seed_spacing", "loss_seed_spacing"),
             ):
@@ -4091,7 +4468,6 @@ class NN_Trainer:
             for lam_name, loss_name in (
                 ("lam_total_fiber_length", "loss_total_fiber_length_norm"),
                 ("lam_cvt", "loss_cvt_norm"),
-                ("lam_rep", "loss_rep_norm"),
                 ("lam_l_curve_cell", "loss_l_curve_cell_norm"),
                 ("lam_seed_spacing", "loss_seed_spacing"),
             ):
@@ -4159,34 +4535,111 @@ class NN_Trainer:
         fem_violation_loss: torch.Tensor,
         loss_total_fiber_length_stage2_norm: torch.Tensor,
         loss_cvt_normalized: torch.Tensor,
-        loss_rep_normalized: torch.Tensor,
         validity_loss: torch.Tensor,
         loss_curve_cell_normalized: torch.Tensor,
+        loss_rep_normalized: torch.Tensor | None = None,
+        displacement_objective: torch.Tensor | None = None,
+        target_length_penalty: torch.Tensor | None = None,
+        optimization_mode: str = "constrained_displacement",
         lam_fem_step: float,
         lam_total_fiber_length_step: float,
         lam_cvt_step: float,
-        lam_rep_step: float,
         lam_l_curve_cell_step: float,
+        lam_rep_step: float = 0.0,
+        displacement_objective_weight: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, str]:
-        design_score = (
-            float(lam_total_fiber_length_step) * loss_total_fiber_length_stage2_norm
-            + float(lam_cvt_step) * loss_cvt_normalized
-            + float(lam_rep_step) * loss_rep_normalized
-            + float(lam_l_curve_cell_step) * loss_curve_cell_normalized
-            + validity_loss
-        )
+        mode_name = str(optimization_mode).strip().lower()
+        if mode_name == "constrained_displacment":
+            mode_name = "constrained_displacement"
+        if mode_name == "target_length_constrained_displacement":
+            length_term = (
+                target_length_penalty
+                if isinstance(target_length_penalty, torch.Tensor)
+                else loss_total_fiber_length_stage2_norm
+            )
+            displacement_term = (
+                displacement_objective
+                if isinstance(displacement_objective, torch.Tensor)
+                else loss_total_fiber_length_stage2_norm.new_zeros(())
+            )
+            rep_term = (
+                loss_rep_normalized
+                if isinstance(loss_rep_normalized, torch.Tensor)
+                else loss_total_fiber_length_stage2_norm.new_zeros(())
+            )
+            design_score = (
+                float(displacement_objective_weight) * displacement_term
+                + float(lam_total_fiber_length_step) * length_term
+                + float(lam_cvt_step) * loss_cvt_normalized
+                + float(lam_rep_step) * rep_term
+                + float(lam_l_curve_cell_step) * loss_curve_cell_normalized
+                + validity_loss
+            )
+        else:
+            rep_term = (
+                loss_rep_normalized
+                if isinstance(loss_rep_normalized, torch.Tensor)
+                else loss_total_fiber_length_stage2_norm.new_zeros(())
+            )
+            design_score = (
+                float(lam_total_fiber_length_step) * loss_total_fiber_length_stage2_norm
+                + float(lam_cvt_step) * loss_cvt_normalized
+                + float(lam_rep_step) * rep_term
+                + float(lam_l_curve_cell_step) * loss_curve_cell_normalized
+                + validity_loss
+            )
         L_train = design_score + float(lam_fem_step) * fem_total_loss
-        mode = (
-            "feasible_design"
-            if bool(torch.as_tensor(fem_violation_loss.detach()).reshape(()).item() == 0.0)
-            else "infeasible_recovery"
-        )
+        fem_feasible = bool(torch.as_tensor(fem_violation_loss.detach()).reshape(()).item() == 0.0)
+        if not fem_feasible:
+            mode = "infeasible_recovery"
+        elif mode_name == "target_length_constrained_displacement":
+            mode = "target_length_feasible_displacement_design"
+        else:
+            mode = "feasible_design"
         return L_train, design_score, mode
 
     @staticmethod
+    def _target_total_length_band_loss(
+        *,
+        total_length: torch.Tensor,
+        target_total_length: float | None,
+        tolerance: float,
+        under_weight: float,
+        over_weight: float,
+        eps: float,
+    ) -> dict[str, torch.Tensor]:
+        if target_total_length is None:
+            zero = total_length.new_zeros(())
+            return {
+                "penalty": zero,
+                "under_violation": zero,
+                "over_violation": zero,
+                "range_violation": zero,
+                "relative_error": zero,
+            }
+        target = total_length.new_tensor(float(target_total_length)).clamp_min(float(eps))
+        tol = total_length.new_tensor(float(tolerance)).clamp_min(0.0)
+        lower = target - tol
+        upper = target + tol
+        under = torch.relu(lower - total_length)
+        over = torch.relu(total_length - upper)
+        scale = target.clamp_min(float(eps))
+        penalty = (
+            float(under_weight) * (under / scale).pow(2.0)
+            + float(over_weight) * (over / scale).pow(2.0)
+        )
+        relative_error = torch.abs(total_length - target) / scale
+        return {
+            "penalty": penalty,
+            "under_violation": under,
+            "over_violation": over,
+            "range_violation": under + over,
+            "relative_error": relative_error,
+        }
+
+    @staticmethod
     def _stage2_topology_valid_from_row(row: dict[str, Any]) -> bool:
-        spacing = float(row.get("loss_spacing_barrier", 0.0))
-        return math.isfinite(spacing) and spacing <= 0.0
+        return bool(row.get("seed_spacing_feasible", False))
 
     @staticmethod
     def _stage_monitor_uses_design_mode(stage_id: int, row: dict[str, Any]) -> bool:
@@ -4253,6 +4706,82 @@ class NN_Trainer:
             return none_label
         return f"{numeric:.4e}@{int(step):05d}"
 
+    @staticmethod
+    def _format_objective_terms_for_console(row: dict[str, Any], *, max_terms: int = 6) -> str:
+        del max_terms
+        terms = [term for term in row.get("objective_terms") or [] if bool(term.get("active", False))]
+        if not terms:
+            return "No active objective terms"
+        label_width = max(len(str(term.get("label", term.get("key", "Loss")))) for term in terms)
+        value_width = 0
+        value_texts: list[str] = []
+        for term in terms:
+            value = NN_Trainer._console_float(term.get("value", float("nan")))
+            raw = term.get("raw", None)
+            text = value
+            if raw is not None:
+                try:
+                    raw_value = float(raw)
+                    value_float = float(term.get("value", float("nan")))
+                    if math.isfinite(raw_value) and (
+                        not math.isfinite(value_float)
+                        or not math.isclose(raw_value, value_float, rel_tol=1.0e-12, abs_tol=1.0e-15)
+                    ):
+                        text = f"{value} (raw={NN_Trainer._console_float(raw)})"
+                except Exception:
+                    text = value
+            value_texts.append(text)
+            value_width = max(value_width, len(text))
+
+        lines = []
+        for term, value_text in zip(terms, value_texts):
+            label = str(term.get("label", term.get("key", "Loss")))
+            weight = NN_Trainer._console_float(term.get("weight", float("nan")), precision=4)
+            contribution = NN_Trainer._console_float(term.get("contribution", float("nan")))
+            lines.append(
+                f"{label:<{label_width}} : {value_text:<{value_width}} | "
+                f"weight={weight:<8} | contribution={contribution}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _console_float(value: Any, precision: int = 3, na: str = "N/A") -> str:
+        try:
+            numeric = float(value)
+        except Exception:
+            return na
+        if not math.isfinite(numeric):
+            return na
+        return f"{numeric:.{precision}e}"
+
+    @staticmethod
+    def _console_limit(value: Any, precision: int = 3, na: str = "N/A") -> str:
+        try:
+            numeric = float(value)
+        except Exception:
+            return na
+        if not math.isfinite(numeric):
+            return na
+        return f"{numeric:.{precision}g}"
+
+    @staticmethod
+    def _console_count(value: Any, na: str = "N/A") -> str:
+        try:
+            numeric = float(value)
+        except Exception:
+            return na
+        if not math.isfinite(numeric):
+            return na
+        return str(int(round(numeric)))
+
+    @staticmethod
+    def _pass_fail(condition: Any, *, inactive: bool = False, not_evaluated: bool = False) -> str:
+        if inactive:
+            return "INACTIVE"
+        if not_evaluated:
+            return "NOT EVALUATED"
+        return "PASS" if bool(condition) else "FAIL"
+
     @classmethod
     def _format_stage_progress_log(
         cls,
@@ -4263,54 +4792,188 @@ class NN_Trainer:
         best_feasible_checkpoint=None,
         best_infeasible_key=None,
         best_infeasible_checkpoint=None,
+        verbose: bool = False,
     ) -> str:
-        best_feasible_design_score = cls._best_feasible_design_score(best_feasible_key)
+        if str(row.get("optimization_mode", "")).strip().lower() == "target_length_constrained_displacement":
+            best_feasible_design_score = checkpoint_design_score(best_feasible_checkpoint)
+        else:
+            best_feasible_design_score = cls._best_feasible_design_score(best_feasible_key)
         best_feasible_step = cls._best_feasible_step(best_feasible_key, best_feasible_checkpoint)
-        best_infeasible_violation = cls._best_infeasible_violation(best_infeasible_key)
-        best_infeasible_step = cls._best_infeasible_step(best_infeasible_key, best_infeasible_checkpoint)
-        best_feasible_text = cls._format_optional_score(
-            best_feasible_design_score,
-            best_feasible_step,
-            "best_feasible_design=None",
+        best_feasible_row = (
+            best_feasible_checkpoint.get("row", {})
+            if best_feasible_checkpoint is not None
+            and hasattr(best_feasible_checkpoint, "get")
+            and isinstance(best_feasible_checkpoint.get("row", {}), dict)
+            else {}
         )
-        if best_feasible_text != "best_feasible_design=None":
-            best_feasible_text = f"best_feasible_design={best_feasible_text}"
-        best_recovery_text = cls._format_optional_score(
-            best_infeasible_violation,
-            best_infeasible_step,
-            "best_recovery_violation=None",
+        best_metric_row = best_feasible_row if best_feasible_row else row
+        best_feasible_text = (
+            f"step={best_feasible_step} | "
+            f"design_score={cls._console_float(best_feasible_design_score, precision=4)} | "
+            f"max_stress={cls._console_float(best_metric_row.get('stress_max', float('nan')))} | "
+            f"max_disp={cls._console_float(best_metric_row.get('disp_max', float('nan')))} | "
+            f"min_seed_dist={cls._console_float(best_metric_row.get('min_seed_distance', best_metric_row.get('minimum_seed_distance', float('nan'))))} | "
+            f"total_length={cls._console_float(best_metric_row.get('loss_total_fiber_length', float('nan')))}"
+            if best_feasible_step >= 0 and math.isfinite(float(best_feasible_design_score))
+            else "none"
         )
-        if best_recovery_text != "best_recovery_violation=None":
-            best_recovery_text = f"best_recovery_violation={best_recovery_text}"
-        stage_label = f"Stage {int(row.get('stage', 0))}"
+
+        terms = [term for term in row.get("objective_terms") or [] if bool(term.get("active", False))]
+        contribution_sum = float(sum(float(term.get("contribution", 0.0)) for term in terms))
+        l_train = float(row.get("L_train", row.get("L_total", float("nan"))))
+        objective_delta = contribution_sum - l_train
+        objective_mismatch = (
+            math.isfinite(objective_delta)
+            and math.isfinite(l_train)
+            and abs(objective_delta) > max(1.0e-8, 1.0e-6 * abs(l_train))
+        )
+
+        stage_id = int(row.get("stage", 0))
+        fem_active = bool(row.get("fem_constraints_active", False))
+        fem_evaluated = bool(row.get("fem_was_evaluated", False))
+        fem_valid = bool(row.get("fem_valid", False))
+        mechanical_not_evaluated = stage_id == 1 and not fem_evaluated
+        fem_invalid = fem_active and fem_evaluated and not fem_valid
+        stress_status = (
+            "NOT EVALUATED"
+            if mechanical_not_evaluated
+            else (
+                "INACTIVE"
+                if not fem_active
+                else ("NOT EVALUATED" if not fem_evaluated else ("INVALID" if fem_invalid else cls._pass_fail(float(row.get("physical_stress_ratio", float("inf"))) <= 1.0)))
+            )
+        )
+        displacement_status = (
+            "NOT EVALUATED"
+            if mechanical_not_evaluated
+            else (
+                "INACTIVE"
+                if not fem_active
+                else ("NOT EVALUATED" if not fem_evaluated else ("INVALID" if fem_invalid else cls._pass_fail(float(row.get("physical_displacement_ratio", float("inf"))) <= 1.0)))
+            )
+        )
+        target_length_active = bool(row.get("target_length_active", False))
+        length_status = cls._pass_fail(
+            row.get("target_total_length_feasible", False),
+            inactive=not target_length_active,
+        )
+        spacing_status = cls._pass_fail(row.get("seed_spacing_feasible", False))
+        overall_status = (
+            "NOT EVALUATED"
+            if mechanical_not_evaluated or (fem_active and not fem_evaluated)
+            else ("INVALID" if fem_invalid else cls._pass_fail(row.get("overall_feasible", False)))
+        )
+
+        length_lower = row.get("target_total_length_lower", float("nan"))
+        length_upper = row.get("target_total_length_upper", float("nan"))
+        length_limit = (
+            f"[{cls._console_limit(length_lower)}, {cls._console_limit(length_upper)}]"
+            if target_length_active
+            else "INACTIVE"
+        )
+        hard_limits = (
+            f"length={length_limit} | "
+            f"max_disp<={cls._console_limit(row.get('fem_max_displacement', float('nan')))} | "
+            f"max_stress<={cls._console_limit(row.get('fem_yield_strength', float('nan')))} | "
+            f"min_seed_dist>={cls._console_limit(row.get('min_seed_spacing', float('nan')))}"
+        )
+
+        fem_status = "NOT EVALUATED" if mechanical_not_evaluated else "INACTIVE"
+        if fem_active and not mechanical_not_evaluated:
+            fem_status = "NOT EVALUATED" if not fem_evaluated else ("OK" if fem_valid else "INVALID")
+        patience = (
+            f"{int(row.get('stage_patience_counter', 0))}/{int(row.get('stage_patience_limit', 0))}"
+            if bool(row.get("patience_active", False)) or bool(row.get("design_patience_active", False))
+            else "inactive"
+        )
+        diagnostics = [
+            f"FEM={fem_status}",
+            f"patience={patience}",
+            f"seeds={cls._console_count(row.get('total_seed_count', float('nan')))}",
+            f"inactive_seeds={cls._console_count(row.get('visual_inactive_seed_count', 0))}",
+            f"VolFrac={cls._console_limit(row.get('VolFrac', float('nan')))}",
+            f"min_edge={cls._console_float(row.get('curve_length_min', float('nan')))}",
+            f"topology_changed={bool(row.get('topology_changed', False))}",
+            f"grad_mean={cls._console_float(row.get('grad_mean', float('nan')), precision=2)}",
+        ]
+        if fem_invalid and row.get("fem_failure_reason"):
+            diagnostics.append(f"fem_failure={row.get('fem_failure_reason')}")
+        if objective_mismatch:
+            diagnostics.append(f"objective_sum_delta={objective_delta:.3e}")
+        if verbose:
+            verbose_items = [
+                ("FEM_baseline", "fem_baseline_loss"),
+                ("FEM_violation", "fem_violation_loss"),
+                ("stress_ratio_phys", "physical_stress_ratio"),
+                ("disp_ratio_phys", "physical_displacement_ratio"),
+                ("stress_ratio_train", "training_stress_ratio"),
+                ("disp_ratio_train", "training_displacement_ratio"),
+                ("spacing_barrier", "loss_seed_spacing_barrier"),
+                ("spacing_rep_w", "loss_seed_spacing_repulsion_weighted"),
+                ("rho", None),
+                ("filter_dmean", "filter_delta_mean"),
+                ("proj_dmean", "projection_delta_mean"),
+                ("lam_fem", "lam_fem_eff"),
+                ("lam_cvt", "lam_cvt_eff"),
+                ("lam_len", "lam_total_fiber_length_eff"),
+                ("lam_cell", "lam_l_curve_cell_eff"),
+                ("lam_spacing", "lam_seed_spacing_eff"),
+                ("dseed", "dseed"),
+                ("drho", "drho"),
+                ("topo_id", "topology_identifier_short"),
+                ("recovery_best", "best_infeasible_violation"),
+            ]
+            for label, key in verbose_items:
+                if label == "rho":
+                    diagnostics.append(
+                        "rho(min/mean/max)="
+                        f"{cls._console_limit(row.get('rho_min', float('nan')))}/"
+                        f"{cls._console_limit(row.get('rho_mean', float('nan')))}/"
+                        f"{cls._console_limit(row.get('rho_max', float('nan')))}"
+                    )
+                    continue
+                value = row.get(key, None)
+                if isinstance(value, str):
+                    diagnostics.append(f"{label}={value}")
+                else:
+                    diagnostics.append(f"{label}={cls._console_float(value, precision=3)}")
+
+        separator = "-" * 72
+        main_stress = (
+            row.get("stress_max", float("nan"))
+            if fem_evaluated
+            else float("nan")
+        )
+        main_displacement = (
+            row.get("disp_max", float("nan"))
+            if fem_evaluated
+            else float("nan")
+        )
         return (
+            "\n"
+            f"{separator}\n"
             f"[{int(row.get('step', -1)):05d}/{int(total_step_budget):05d}] "
-            f"({stage_label} {int(row.get('stage_local_step', 0)):05d}/"
-            f"{int(row.get('stage_max_steps', 0)):05d}) "
-            f"L_train={float(row.get('L_train', row.get('L_total', float('nan')))):.4e} | "
-            f"design_score={float(row.get('design_score', float('nan'))):.4e} | "
-            f"monitor={float(row.get('stage_monitor_raw', float('nan'))):.4e}"
+            f"Stage {stage_id} | Local step "
+            f"{int(row.get('stage_local_step', 0)):05d}/"
+            f"{int(row.get('stage_max_steps', 0)):05d}\n\n"
+            f"L_train={cls._console_float(l_train, precision=4)} | "
+            f"design_score={cls._console_float(row.get('design_score', float('nan')), precision=4)} | "
+            f"monitor={cls._console_float(row.get('stage_monitor_raw', float('nan')), precision=4)} "
             f"({str(row.get('stage_monitor_mode', ''))}) | "
-            f"{best_feasible_text} | "
-            f"{best_recovery_text} | "
-            f"FEM_total={float(row.get('fem_total_loss', row.get('loss_fem', float('nan')))):.3e} "
-            f"FEM_baseline={float(row.get('fem_baseline_loss', row.get('baseline_fem_loss', float('nan')))):.3e} "
-            f"FEM_violation_loss={float(row.get('fem_violation_loss', row.get('violation_fem_loss', float('nan')))):.3e} "
-            f"lam_FEM={float(row.get('lam_fem_eff', 0.0)):.3g} | "
-            f"ratios(phys s/d)="
-            f"{float(row.get('physical_stress_ratio', float('nan'))):.3e}/"
-            f"{float(row.get('physical_displacement_ratio', float('nan'))):.3e} "
-            f"seed_count={float(row.get('total_seed_count', float('nan'))):.0f} "
-            f"min_seed_distance={float(row.get('min_seed_distance', row.get('minimum_seed_distance', float('nan')))):.3e} "
-            f"physical_feasible={bool(row.get('physical_feasible', False))} "
-            f"seed_spacing_feasible={bool(row.get('seed_spacing_feasible', False))} "
-            f"overall_feasible={bool(row.get('overall_feasible', False))} "
-            f"overall_violation={float(row.get('overall_constraint_violation', float('nan'))):.3e} "
-            f"patience_active={bool(row.get('patience_active', False))} "
-            f"design_patience_active={bool(row.get('design_patience_active', False))} "
-            f"design_patience={int(row.get('stage_patience_counter', 0))}/"
-            f"{int(row.get('stage_patience_limit', 0))}"
-        )
+            f"max_stress={cls._console_float(main_stress)} | "
+            f"max_disp={cls._console_float(main_displacement)} | "
+            f"min_seed_dist={cls._console_float(row.get('min_seed_distance', row.get('minimum_seed_distance', float('nan'))))} | "
+            f"total_length={cls._console_float(row.get('loss_total_fiber_length', float('nan')))}\n\n"
+            f"{cls._format_objective_terms_for_console(row)}\n\n"
+            "Constraints: "
+            f"stress={stress_status} | displacement={displacement_status} | "
+            f"spacing={spacing_status} | length_band={length_status} | "
+            f"overall={overall_status}\n"
+            f"Hard limits: {hard_limits}\n"
+            f"Best feasible: {best_feasible_text}\n\n"
+            f"Diagnostics: {' | '.join(diagnostics)}\n"
+            f"{separator}"
+            )
 
     @staticmethod
     def _update_stage_runtime_checkpoint(
@@ -4488,7 +5151,6 @@ class NN_Trainer:
             "loss_cvt_norm": float(row.get("loss_cvt_norm", row.get("loss_cvt", float("inf")))),
             "loss_l_curve_cell_norm": float(row.get("loss_l_curve_cell_norm", row.get("loss_l_curve_cell", float("inf")))),
             "loss_total_fiber_length_norm": float(row.get("loss_total_fiber_length_norm", row.get("loss_total_fiber_length", float("inf")))),
-            "loss_rep_norm": float(row.get("loss_rep_norm", row.get("loss_rep", float("inf")))),
             "loss_seed_spacing": float(row.get("loss_seed_spacing", float("inf"))),
             "design_score": float(row.get("design_score", float("inf"))),
             "_zero": 0.0,
@@ -4562,37 +5224,233 @@ class NN_Trainer:
             f"(fem={float(row.get('lam_fem_eff', 0.0)):.2g}, "
             f"cvt={float(row.get('lam_cvt_eff', 0.0)):.2g}, "
             f"fiber={float(row.get('lam_total_fiber_length_eff', 0.0)):.2g}, "
-            f"rep={float(row.get('lam_rep_eff', 0.0)):.2g}, "
             f"cell={float(row.get('lam_l_curve_cell_eff', 0.0)):.2g}, "
             f"spacing={float(row.get('lam_seed_spacing_eff', 0.0)):.2g}, "
             ")"
         )
 
     @staticmethod
-    def _timelapse_loss_chart_dict(row: dict[str, Any], score: float | None = None) -> dict[str, float]:
-        def row_float(name: str, default: float = float("nan")) -> float:
+    def _optimization_mode_description(mode: str, stage_id: int) -> str:
+        mode = str(mode or "constrained_displacement").strip().lower()
+        if int(stage_id) == 1:
+            return "Stage 1 geometry/topology preparation"
+        if mode == "target_length_constrained_displacement":
+            return "Minimize displacement within the target length band"
+        return "Minimize fibre length under mechanical constraints"
+
+    @staticmethod
+    def _objective_term_report(row: dict[str, Any]) -> list[dict[str, Any]]:
+        def f(name: str, default: float = 0.0) -> float:
             try:
                 return float(row.get(name, default))
             except Exception:
-                return default
+                return float(default)
 
-        total_value = (
-            float(score)
-            if score is not None
-            else row_float("stage_monitor_raw", row_float("L_total"))
+        def term(
+            key: str,
+            label: str,
+            value: float,
+            weight: float,
+            *,
+            active: bool,
+            raw: float | None = None,
+            reference: float | None = None,
+            details: str = "",
+        ) -> dict[str, Any]:
+            contribution = float(value) * float(weight) if active else 0.0
+            return {
+                "key": key,
+                "label": label,
+                "active": bool(active),
+                "value": float(value),
+                "raw": None if raw is None else float(raw),
+                "reference": None if reference is None else float(reference),
+                "weight": float(weight),
+                "contribution": float(contribution),
+                "details": str(details or ""),
+            }
+
+        stage_id = int(row.get("stage", 0))
+        mode = str(row.get("optimization_mode", "constrained_displacement")).strip().lower()
+        target_mode = stage_id == 2 and mode == "target_length_constrained_displacement"
+        fem_active = bool(row.get("fem_constraints_active", False))
+        length_active = float(row.get("lam_total_fiber_length_eff", 0.0)) != 0.0
+        cvt_active = float(row.get("lam_cvt_eff", 0.0)) != 0.0
+        cell_active = float(row.get("lam_l_curve_cell_eff", 0.0)) != 0.0
+        seed_active = float(row.get("lam_seed_spacing_eff", 0.0)) != 0.0
+
+        terms: list[dict[str, Any]] = []
+        if target_mode:
+            terms.append(
+                term(
+                    "displacement",
+                    "Displacement Lu",
+                    f("displacement_objective"),
+                    f("displacement_objective_weight", 1.0),
+                    active=True,
+                    raw=f("fem_displacement_p_norm", f("fem_displacement_max")),
+                    reference=f("fem_max_displacement", 1.0),
+                    details=f"mode={row.get('displacement_objective_mode', 'p_norm')}",
+                )
+            )
+            lower = f("target_total_length") - f("target_total_length_tolerance")
+            upper = f("target_total_length") + f("target_total_length_tolerance")
+            terms.append(
+                term(
+                    "length_band",
+                    "Length band",
+                    f("target_total_length_penalty"),
+                    f("lam_total_fiber_length_eff"),
+                    active=length_active,
+                    raw=f("loss_total_fiber_length"),
+                    details=(
+                        f"length={f('loss_total_fiber_length'):.6g}, "
+                        f"allowed=[{lower:.6g}, {upper:.6g}], "
+                        f"under={f('target_total_length_under_violation'):.6g}, "
+                        f"over={f('target_total_length_over_violation'):.6g}, "
+                        f"w_under={f('target_length_under_weight', 1.0):.6g}, "
+                        f"w_over={f('target_length_over_weight', 100.0):.6g}"
+                    ),
+                )
+            )
+        else:
+            terms.append(
+                term(
+                    "total_fiber_length",
+                    "Total fibre length",
+                    f("loss_total_fiber_length_norm"),
+                    f("lam_total_fiber_length_eff"),
+                    active=length_active,
+                    raw=f("loss_total_fiber_length"),
+                    reference=f("loss_total_fiber_length_reference", 1.0),
+                )
+            )
+
+        terms.extend(
+            [
+                term(
+                    "cvt",
+                    "CVT",
+                    f("loss_cvt_norm"),
+                    f("lam_cvt_eff"),
+                    active=cvt_active,
+                    raw=f("loss_cvt"),
+                    reference=f("loss_cvt_reference", 1.0),
+                ),
+                term(
+                    "cell_uniformity",
+                    "Cell uniformity",
+                    f("loss_l_curve_cell_norm"),
+                    f("lam_l_curve_cell_eff"),
+                    active=cell_active,
+                    raw=f("loss_l_curve_cell"),
+                    reference=f("loss_l_curve_cell_reference", 1.0),
+                ),
+                term(
+                    "seed_separation",
+                    "Seed separation",
+                    f("loss_seed_spacing"),
+                    f("lam_seed_spacing_eff"),
+                    active=seed_active,
+                    raw=f("loss_seed_spacing"),
+                    details=(
+                        f"barrier={f('loss_seed_spacing_barrier'):.6g}, "
+                        f"repulsion={f('loss_seed_spacing_repulsion'):.6g}, "
+                        f"repulsion_weighted={f('loss_seed_spacing_repulsion_weighted'):.6g}, "
+                        f"internal_repulsion_weight={f('seed_repulsion_weight'):.6g}"
+                    ),
+                ),
+            ]
         )
-        def label(name: str, lam_name: str) -> str:
-            return f"{name}({row_float(lam_name, 0.0):.2g})"
 
-        return {
-            "Total": total_value,
-            label("FEM", "lam_fem_eff"): row_float("loss_fem_norm"),
-            label("CVT", "lam_cvt_eff"): row_float("loss_cvt_norm"),
-            label("Rep", "lam_rep_eff"): row_float("loss_rep_norm"),
-            label("Spacing", "lam_seed_spacing_eff"): row_float("loss_seed_spacing"),
-            label("TotLen", "lam_total_fiber_length_eff"): row_float("loss_total_fiber_length_norm"),
-            label("EdgeLen", "lam_l_curve_cell_eff"): row_float("loss_l_curve_cell_norm"),
-        }
+        if stage_id == 2:
+            terms.append(
+                term(
+                    "fem",
+                    "FEM",
+                    f("fem_total_loss", f("loss_fem")),
+                    f("lam_fem_eff"),
+                    active=fem_active,
+                    details=(
+                        f"baseline={f('fem_baseline_loss'):.6g}, "
+                        f"stress_violation={f('fem_stress_violation_loss'):.6g}, "
+                        f"disp_violation={f('fem_displacement_violation_loss'):.6g}, "
+                        f"stress_margin={f('fem_stress_margin_loss'):.6g}, "
+                        f"disp_margin={f('fem_displacement_margin_loss'):.6g}, "
+                        f"adaptive_multiplier={f('adaptive_lambda_fem', 1.0):.6g}"
+                    ),
+                )
+            )
+        return terms
+
+    @classmethod
+    def _attach_objective_report(cls, row: dict[str, Any]) -> None:
+        mode = str(row.get("optimization_mode", "constrained_displacement")).strip().lower()
+        stage_id = int(row.get("stage", 0))
+        row["optimization_mode_description"] = cls._optimization_mode_description(mode, stage_id)
+        terms = cls._objective_term_report(row)
+        row["objective_terms"] = terms
+        active_terms = [t for t in terms if bool(t.get("active", False))]
+        contribution_sum = float(sum(float(t["contribution"]) for t in active_terms))
+        row["objective_contribution_sum"] = contribution_sum
+        for term in terms:
+            prefix = f"objective_{term['key']}"
+            row[f"{prefix}_active"] = bool(term["active"])
+            row[f"{prefix}_value"] = float(term["value"])
+            row[f"{prefix}_weight"] = float(term["weight"])
+            row[f"{prefix}_contribution"] = float(term["contribution"])
+            if term.get("raw") is not None:
+                row[f"{prefix}_raw"] = float(term["raw"])
+            if term.get("reference") is not None:
+                row[f"{prefix}_reference"] = float(term["reference"])
+            if term.get("details"):
+                row[f"{prefix}_details"] = str(term["details"])
+        row["objective_terms_text"] = " | ".join(
+            (
+                f"{t['label']}: {t['value']:.4g}"
+                + (f" (raw={t['raw']:.4g}" if t.get("raw") is not None else "")
+                + (
+                    f", ref={t['reference']:.4g})"
+                    if t.get("raw") is not None and t.get("reference") is not None
+                    else (")" if t.get("raw") is not None else "")
+                )
+                + f" x {t['weight']:.4g} = {t['contribution']:.4g}"
+                + ("" if t.get("active") else " [inactive]")
+            )
+            for t in terms
+        )
+
+    @classmethod
+    def _timelapse_loss_chart_dict(cls, row: dict[str, Any], score: float | None = None) -> dict[str, float]:
+        del score
+        row = row or {}
+        if not row.get("objective_terms"):
+            cls._attach_objective_report(row)
+
+        chart: dict[str, float] = {}
+        try:
+            l_train = float(row.get("L_train", row.get("L_total", float("nan"))))
+        except Exception:
+            l_train = float("nan")
+        if math.isfinite(l_train):
+            chart["L-train"] = l_train
+        for term in row.get("objective_terms", []) or []:
+            if not bool(term.get("active", False)):
+                continue
+            try:
+                contribution = float(term.get("contribution", float("nan")))
+                weight = float(term.get("weight", float("nan")))
+            except Exception:
+                continue
+            if not math.isfinite(contribution):
+                continue
+            term_label = str(term.get("label", term.get("key", "term"))).replace(" Lu", "")
+            label = f"{term_label} x{weight:.2g}"
+            chart[label] = contribution
+
+        if chart:
+            return chart
+        return {"No active weighted terms": 0.0}
 
     @staticmethod
     def _timelapse_geometry_summary_text(row: dict[str, Any] | None) -> str:
@@ -5044,7 +5902,14 @@ class NN_Trainer:
             rho_raw_decoder_dense = rho_dense
             rho_postprocessed_dense = rho_dense
 
-        return {
+        curve_length_fields = curve_length_fields_from_decoder_output(decoder_out)
+        graph = decoder_out.get("graph", None)
+        if isinstance(graph, dict) and curve_length_fields:
+            graph["edge_curve_lengths_xyz"] = curve_length_fields["edge_curve_lengths_xyz"]
+            graph["total_curve_length"] = curve_length_fields["total_curve_length"]
+            graph["total_voronoi_curve_length"] = curve_length_fields["total_voronoi_curve_length"]
+
+        fields = {
             "xyz_dense": render_cache["xyz_dense"],
             "rho_dense": rho_dense,
             "rho_raw_decoder_dense": rho_raw_decoder_dense,
@@ -5055,9 +5920,11 @@ class NN_Trainer:
             "seeds_xyz": decoder_out.get("seeds_xyz", None),
             "edge_curves_uv": decoder_out.get("edge_curves_uv", None),
             "edge_curves_xyz": decoder_out.get("edge_curves_xyz", None),
-            "graph": decoder_out.get("graph", None),
+            "graph": graph,
             "faces_ijk": render_cache["faces_ijk"],
         }
+        fields.update(curve_length_fields)
+        return fields
 
     @staticmethod
     def _concat_polydata(meshes, scalar_name=None):
@@ -6045,7 +6912,7 @@ class NN_Trainer:
         )
         stress_img = _render_fem_cell_field(
             fem_stress_field,
-            "FEM Stress Diagnostic (Material Only)",
+            "FEM Max-IP Stress (Material Only)",
             "stress",
             "turbo",
             clim=[float(stress_normalize.vmin), float(stress_normalize.vmax)],
@@ -7477,15 +8344,18 @@ class NN_Trainer:
         A_v[gidx] += A_local
 
         # ------------------------------------------------------------
-        # Build models / optimizer / scheduler
+        # Build initial seeds, then models / optimizer / scheduler.
+        # Warm-start pruning can change cfg.seed_number, so it must happen
+        # before PPNet/decoder construction.
         # ------------------------------------------------------------
+        uv_init = self._init_face_seed(face_tensor)
         decoder, ppnet = self._build_face_model(face_tensor=face_tensor, device=device)
+        if self._warm_start_path() is not None:
+            self._reset_ppnet_to_identity_seed_mapping(ppnet)
         decoders = [decoder]
         ppnets = [ppnet]
         named_trainable_modules = [("ppnet", ppnet), ("decoder", decoder)]
         trainable_modules = [module for _, module in named_trainable_modules]
-        # Build initial seeds from the selected face tensor, which will be optimized during training.
-        uv_init = self._init_face_seed(face_tensor)
         uv_anchor = uv_init.clone()
         uv_init_list = [uv_init]
 
@@ -7536,6 +8406,18 @@ class NN_Trainer:
         stage1_transition_score = float("nan")
         stage1_transition_checkpoint_source = None
         physical_checkpoint_trackers_reset = first_physical_stage <= 1
+        startup_optimization_mode = str(
+            getattr(cfg, "optimization_mode", "constrained_displacement")
+        ).strip().lower()
+        tqdm.write(f"Optimization mode: {startup_optimization_mode}")
+        tqdm.write(
+            "Objective: "
+            + self._optimization_mode_description(
+                startup_optimization_mode,
+                2,
+            )
+            + "."
+        )
 
         stage_settings_initial = self._stage_settings_for_stage_id(current_stage_runtime.spec.stage_id)
         self._apply_stage_trainability(ppnet, stage_settings_initial)
@@ -7605,7 +8487,11 @@ class NN_Trainer:
                     f"{shape_path.name} ({geometry_summary}) | "
                     f"BC: {cfg.LoadingCase} (F = {load_value:.3f} , FEM elements: {fem_elems})"
                 ),
-                header_subtitle=self._timelapse_optimized_parameter_summary(),
+                header_subtitle=(
+                    f"Mode: {startup_optimization_mode} | "
+                    f"Objective: {self._optimization_mode_description(startup_optimization_mode, 2)}. | "
+                    f"{self._timelapse_optimized_parameter_summary()}"
+                ),
             )
             # building a cache for rendering the timelapse, which likely includes precomputing certain data or settings that will be used 
             # repeatedly during the rendering of each frame in the timelapse video. 
@@ -7628,9 +8514,7 @@ class NN_Trainer:
         # ------------------------------------------------------------
         # These RunningNorm instances are used to keep track of the running mean and standard deviation of various loss components during training.
         # if on , it will normalize the loss components to have a more stable training process, especially when the scales of different loss terms vary significantly.
-        norm_rep = RunningNorm()
         norm_cvt = RunningNorm()
-        norm_seed_spacing = RunningNorm()
         norm_total_fiber_length = RunningNorm()
         norm_l_curve_cell = RunningNorm()
         adaptive_lambda_fem = float(
@@ -7670,6 +8554,8 @@ class NN_Trainer:
         rho0 = None
         seeds0 = None
         anchor_update_allowed = True
+        target_length_feasible_steps = 0
+        target_length_seed_domain_locked = False
         history = []
 
         def reset_physical_checkpoint_trackers(reset_stage: int) -> None:
@@ -7760,6 +8646,29 @@ class NN_Trainer:
                 stage_id = int(stage_settings["stage"])
                 stage_local_step = int(current_stage_runtime.local_step)
                 stage_max_steps = int(current_stage_runtime.spec.max_steps)
+                optimization_mode = str(
+                    getattr(cfg, "optimization_mode", "constrained_displacement")
+                ).strip().lower()
+                target_length_mode = (
+                    optimization_mode == "target_length_constrained_displacement"
+                )
+                target_length_active = target_length_mode and int(stage_id) == 2
+                target_length_lock_enabled = (
+                    target_length_active
+                    and bool(getattr(cfg, "lock_seed_domain_after_target_length_feasible", False))
+                )
+                target_length_lock_patience = max(
+                    int(getattr(cfg, "target_length_lock_patience", 25)),
+                    1,
+                )
+                target_length_domain_lock_active = (
+                    target_length_lock_enabled
+                    and (
+                        target_length_seed_domain_locked
+                        or target_length_feasible_steps >= target_length_lock_patience
+                    )
+                )
+                target_length_domain_lock_applied = bool(target_length_domain_lock_active)
 
                 # Stage-local warmup for allowing seeds outside the domain.
                 allow_seed_outside_domain_step = self.allow_seed_outside_domain_for_step(
@@ -7767,6 +8676,8 @@ class NN_Trainer:
                     stage_max_steps,
                     stage_allow_seed_outside_domain=bool(stage_settings["allow_seed_outside_domain"]),
                 )
+                if target_length_domain_lock_applied:
+                    allow_seed_outside_domain_step = False
 
                 ppnet.allow_seed_outside_domain = allow_seed_outside_domain_step
                 rho_acc = torch.zeros((vertices_number,), dtype=dtype, device=device)
@@ -7790,7 +8701,6 @@ class NN_Trainer:
                 }
                 density_post_stats_weight = 0.0
 
-                rep_terms = []
                 cvt_terms = []
                 cvt_inputs = []
                 total_fiber_length_terms = []
@@ -7798,6 +8708,9 @@ class NN_Trainer:
                 l_curve_cell_terms = []
                 cell_area_values = []
                 seed_spacing_terms = []
+                seed_spacing_barrier_terms = []
+                seed_spacing_repulsion_terms = []
+                seed_spacing_weighted_repulsion_terms = []
                 h_terms = []
                 raw_seed_count_total = 0
                 topology_seed_count_total = 0
@@ -7817,7 +8730,6 @@ class NN_Trainer:
                 if bool(getattr(cfg, "adaptive_fem_penalty", True)) and lam_fem_base_step != 0.0:
                     lam_fem_step = lam_fem_base_step * adaptive_lambda_fem
                 lam_cvt_step = float(stage_settings["lam_cvt"])
-                lam_rep_step = float(stage_settings["lam_rep"])
                 lam_total_fiber_length_step = float(stage_settings["lam_total_fiber_length"])
                 lam_l_curve_cell_step = float(stage_settings["lam_l_curve_cell"])
                 if (
@@ -7847,10 +8759,13 @@ class NN_Trainer:
                         )
                     reset_physical_checkpoint_trackers(first_physical_stage)
 
-                compute_rep_loss = lam_rep_step != 0.0
+
                 compute_cvt_loss = lam_cvt_step != 0.0
                 compute_seed_spacing_loss = float(cfg.lam_seed_spacing) != 0.0
-                compute_total_fiber_length_loss = lam_total_fiber_length_step != 0.0
+                compute_total_fiber_length_loss = (
+                    lam_total_fiber_length_step != 0.0
+                    or target_length_active
+                )
                 compute_l_curve_cell_loss = lam_l_curve_cell_step != 0.0
                 fem_constraints_active = lam_fem_step != 0.0 and bool(cfg.generate_decoder_density_fiber)
                 cvt_uses_fem_displacement = (
@@ -7906,6 +8821,19 @@ class NN_Trainer:
                             "seeds",
                         ],
                     )
+                    seed_visual_inactive_mask_i = decoder_out.get("seed_visual_inactive_mask", None)
+                    seed_visual_inactive_ids_i = decoder_out.get("seed_visual_inactive_ids", None)
+                    seed_visual_outside_domain_mask_i = decoder_out.get("seed_visual_outside_domain_mask", None)
+                    seed_visual_participates_mask_i = decoder_out.get("seed_visual_participates_in_domain_vd_mask", None)
+                    seed_spacing_valid_mask_i = None
+                    if (
+                        isinstance(seed_visual_outside_domain_mask_i, torch.Tensor)
+                        and seed_visual_outside_domain_mask_i.numel() == seeds_raw_i.shape[0]
+                    ):
+                        seed_spacing_valid_mask_i = ~seed_visual_outside_domain_mask_i.to(
+                            device=seeds_raw_i.device,
+                            dtype=torch.bool,
+                        ).reshape(-1).detach()
                     need_curve_geometry = needs_shared_curve_geometry(
                         compute_total_fiber_length_loss=compute_total_fiber_length_loss,
                         compute_l_curve_cell_loss=compute_l_curve_cell_loss,
@@ -7954,13 +8882,33 @@ class NN_Trainer:
                         )
                     seed_xyz_validity = self._eval_uv_to_xyz_differentiable(seeds_raw_i)
                     if compute_seed_spacing_loss:
-                        seed_spacing_terms.append(
-                            minimum_seed_spacing_loss(
-                                seed_xyz_validity,
-                                min_seed_spacing=float(cfg.min_seed_spacing),
-                                spacing_power=float(cfg.seed_spacing_power),
-                                eps=float(cfg.eps),
-                            )
+                        separation_i, separation_components_i = seed_separation_loss(
+                            seed_xyz_validity,
+                            min_seed_spacing=float(cfg.min_seed_spacing),
+                            valid_seed_mask=seed_spacing_valid_mask_i,
+                            spacing_power=float(cfg.seed_spacing_power),
+                            safety_factor=float(cfg.seed_spacing_safety_factor),
+                            aggregate_temperature=float(
+                                cfg.seed_spacing_aggregate_temperature
+                            ),
+                            repulsion_factor=float(cfg.seed_repulsion_factor),
+                            repulsion_temperature_ratio=float(
+                                cfg.seed_repulsion_temperature_ratio
+                            ),
+                            repulsion_weight=float(cfg.seed_repulsion_weight),
+                            eps=float(cfg.eps),
+                            return_components=True,
+                        )
+
+                        seed_spacing_terms.append(separation_i)
+                        seed_spacing_barrier_terms.append(
+                            separation_components_i["barrier"]
+                        )
+                        seed_spacing_repulsion_terms.append(
+                            separation_components_i["repulsion"]
+                        )
+                        seed_spacing_weighted_repulsion_terms.append(
+                            separation_components_i["weighted_repulsion"]
                         )
                     if compute_cvt_loss:
                         cvt_input_i = (
@@ -8015,10 +8963,6 @@ class NN_Trainer:
                     topology_seed_count_i = int(decoder_out.get("topology_seeds_uv", seeds_raw_i).shape[0])
                     raw_seed_count_total += total_seed_i
                     topology_seed_count_total += topology_seed_count_i
-                    seed_visual_inactive_mask_i = decoder_out.get("seed_visual_inactive_mask", None)
-                    seed_visual_inactive_ids_i = decoder_out.get("seed_visual_inactive_ids", None)
-                    seed_visual_outside_domain_mask_i = decoder_out.get("seed_visual_outside_domain_mask", None)
-                    seed_visual_participates_mask_i = decoder_out.get("seed_visual_participates_in_domain_vd_mask", None)
                     if isinstance(seed_visual_inactive_ids_i, torch.Tensor):
                         inactive_ids_cpu = seed_visual_inactive_ids_i.detach().cpu().to(torch.long).reshape(-1)
                         visual_inactive_seed_count_total += int(inactive_ids_cpu.numel())
@@ -8061,7 +9005,13 @@ class NN_Trainer:
                     seeds_list.append(seeds_i)
                     seeds_xyz_i = decoder_out.get("seeds_xyz")
                     if isinstance(seeds_xyz_i, torch.Tensor):
-                        seed_xyz_list.append(seeds_xyz_i)
+                        if (
+                            isinstance(seed_spacing_valid_mask_i, torch.Tensor)
+                            and seed_spacing_valid_mask_i.numel() == seeds_xyz_i.shape[0]
+                        ):
+                            seed_xyz_list.append(seeds_xyz_i[seed_spacing_valid_mask_i])
+                        else:
+                            seed_xyz_list.append(seeds_xyz_i)
                     if update_seed_anchors:
                         anchor_alpha = float(cfg.seed_anchor_momentum)
                         uv_anchor_next_i = (
@@ -8107,14 +9057,7 @@ class NN_Trainer:
                         ),
                     })
 
-                    if compute_rep_loss:
-                        rep_terms.append(
-                            self.loss_rep(
-                                seed_positions=decoder_out["seeds_xyz"],
-                                target_dist=1.5 * float(cfg.strut_thickness),
-                                eps=cfg.eps,
-                            )
-                        )
+
 
                     h_terms.append(h_i.reshape(()))
 
@@ -8145,7 +9088,7 @@ class NN_Trainer:
 
                 zero = self._trainable_zero(ppnets, dtype=dtype, device=device)
 
-                loss_rep = rep_terms[0] if compute_rep_loss and rep_terms else zero
+
                 loss_total_fiber_length = (
                     total_fiber_length_terms[0]
                     if compute_total_fiber_length_loss and total_fiber_length_terms
@@ -8162,8 +9105,27 @@ class NN_Trainer:
                     else zero
                 )
                 loss_seed_spacing = (
-                    seed_spacing_terms[0]
+                    torch.stack(seed_spacing_terms).mean()
                     if compute_seed_spacing_loss and seed_spacing_terms
+                    else zero
+                )
+
+                loss_seed_spacing_barrier = (
+                    torch.stack(seed_spacing_barrier_terms).mean()
+                    if compute_seed_spacing_loss and seed_spacing_barrier_terms
+                    else zero
+                )
+
+                loss_seed_spacing_repulsion = (
+                    torch.stack(seed_spacing_repulsion_terms).mean()
+                    if compute_seed_spacing_loss and seed_spacing_repulsion_terms
+                    else zero
+                )
+
+                loss_seed_spacing_repulsion_weighted = (
+                    torch.stack(seed_spacing_weighted_repulsion_terms).mean()
+                    if compute_seed_spacing_loss
+                    and seed_spacing_weighted_repulsion_terms
                     else zero
                 )
                 # ----------------------------------------------------
@@ -8385,7 +9347,7 @@ class NN_Trainer:
                     for _ref_name, _ref_loss, _ref_enabled in (
                         ("total_fiber_length", loss_total_fiber_length, compute_total_fiber_length_loss),
                         ("cvt", loss_cvt, compute_cvt_loss),
-                        ("repulsion", loss_rep, compute_rep_loss),
+
                         ("cell_edge_uniformity", loss_l_curve_cell, compute_l_curve_cell_loss),
                     ):
                         self._capture_fixed_stage2_reference(
@@ -8398,7 +9360,6 @@ class NN_Trainer:
 
                 if stage2_fixed_norm_active:
                     n_cvt = stage2_loss_references.get("cvt", loss_cvt.new_tensor(1.0))
-                    n_rep = stage2_loss_references.get("repulsion", loss_rep.new_tensor(1.0))
                     n_total_fiber_length = stage2_loss_references.get(
                         "total_fiber_length",
                         loss_total_fiber_length.new_tensor(1.0),
@@ -8413,10 +9374,7 @@ class NN_Trainer:
                         loss_cvt.detach().item(),
                         compute_cvt_loss,
                     )
-                    n_rep = norm_rep.update_if_active(
-                        loss_rep.detach().item(),
-                        compute_rep_loss,
-                    )
+
                     n_total_fiber_length = norm_total_fiber_length.update_if_active(
                         loss_total_fiber_length.detach().item(),
                         compute_total_fiber_length_loss,
@@ -8430,7 +9388,7 @@ class NN_Trainer:
                     # structure must remain strongly penalized.
                     n_fem = 1.0
                 else:
-                    n_cvt = n_rep = n_fem = n_total_fiber_length = n_l_curve_cell = 1.0
+                    n_cvt = n_fem = n_total_fiber_length = n_l_curve_cell = 1.0
 
                 # FEM represents hard mechanical constraint violations.
                 # Do not normalize it by its running magnitude because a severely failed
@@ -8442,11 +9400,7 @@ class NN_Trainer:
                     n_cvt,
                     cfg.eps,
                 )
-                loss_rep_normalized = self._fixed_reference_normalized(
-                    loss_rep,
-                    n_rep,
-                    cfg.eps,
-                )
+
                 loss_total_fiber_length_normalized = self._fixed_reference_normalized(
                     loss_total_fiber_length,
                     n_total_fiber_length,
@@ -8458,6 +9412,33 @@ class NN_Trainer:
                     cfg.eps,
                 )
                 loss_fem_normalized = loss_fem
+                target_length_out = self._target_total_length_band_loss(
+                    total_length=loss_total_fiber_length,
+                    target_total_length=getattr(cfg, "target_total_length", None) if target_length_active else None,
+                    tolerance=float(getattr(cfg, "target_total_length_tolerance", 0.0)),
+                    under_weight=float(getattr(cfg, "target_length_under_weight", 1.0)),
+                    over_weight=float(getattr(cfg, "target_length_over_weight", 100.0)),
+                    eps=float(cfg.eps),
+                )
+                target_length_penalty = target_length_out["penalty"]
+                target_length_range_violation = target_length_out["range_violation"]
+                displacement_objective_source = str(
+                    getattr(cfg, "displacement_objective_mode", "p_norm")
+                ).strip().lower()
+                displacement_objective_raw = (
+                    fem_out.get("physical_displacement_ratio", zero)
+                    if displacement_objective_source == "physical_max"
+                    else fem_out.get(
+                        "loss_displacement_ratio",
+                        fem_out.get("physical_displacement_ratio", zero),
+                    )
+                )
+                displacement_objective = torch.nan_to_num(
+                    displacement_objective_raw.reshape(()),
+                    nan=0.0,
+                    posinf=1.0e6,
+                    neginf=0.0,
+                ).clamp_min(0.0)
                 validity_loss = (
                     float(cfg.lam_seed_spacing) * loss_seed_spacing
                 )
@@ -8469,7 +9450,6 @@ class NN_Trainer:
                     zero
                     + lam_total_fiber_length_step * loss_total_fiber_length_normalized
                     + lam_cvt_step * loss_cvt_normalized
-                    + lam_rep_step * loss_rep_normalized
                     + lam_l_curve_cell_step * loss_l_curve_cell_normalized
                     + validity_loss
                 )
@@ -8480,14 +9460,18 @@ class NN_Trainer:
                         fem_violation_loss=fem_violation_loss,
                         loss_total_fiber_length_stage2_norm=loss_total_fiber_length_normalized,
                         loss_cvt_normalized=loss_cvt_normalized,
-                        loss_rep_normalized=loss_rep_normalized,
                         validity_loss=validity_loss,
                         loss_curve_cell_normalized=loss_l_curve_cell_normalized,
+                        displacement_objective=displacement_objective,
+                        target_length_penalty=target_length_penalty,
+                        optimization_mode=optimization_mode,
                         lam_fem_step=lam_fem_step,
                         lam_total_fiber_length_step=lam_total_fiber_length_step,
                         lam_cvt_step=lam_cvt_step,
-                        lam_rep_step=lam_rep_step,
                         lam_l_curve_cell_step=lam_l_curve_cell_step,
+                        displacement_objective_weight=float(
+                            getattr(cfg, "displacement_objective_weight", 1.0)
+                        ),
                     )
 
                 else:
@@ -8495,7 +9479,6 @@ class NN_Trainer:
                     L_total = (
                         zero
                         + lam_cvt_step * loss_cvt_normalized
-                        + lam_rep_step * loss_rep_normalized
                         + validity_loss
                         + lam_total_fiber_length_step
                         * loss_total_fiber_length_normalized
@@ -8517,9 +9500,33 @@ class NN_Trainer:
                     / max(float(cfg.min_seed_spacing), float(cfg.eps))
                 )
                 fem_constraint_violation = fem_out.get("constraint_violation", zero)
+                target_length_feasible = bool(
+                    (not target_length_active)
+                    or float(target_length_range_violation.detach().item())
+                    <= float(cfg.fem_constraint_tolerance)
+                )
+                if target_length_lock_enabled:
+                    if target_length_feasible:
+                        target_length_feasible_steps += 1
+                        if target_length_feasible_steps >= target_length_lock_patience:
+                            target_length_seed_domain_locked = True
+                    else:
+                        target_length_feasible_steps = 0
+                        if bool(getattr(cfg, "target_length_unlock_on_violation", False)):
+                            target_length_seed_domain_locked = False
+                    target_length_domain_lock_active = bool(target_length_seed_domain_locked)
+                else:
+                    target_length_feasible_steps = 0
+                    target_length_seed_domain_locked = False
+                    target_length_domain_lock_active = False
                 overall_constraint_violation = (
                     fem_constraint_violation.reshape(())
                     + spacing_violation.reshape(())
+                    + (
+                        target_length_penalty.reshape(())
+                        if target_length_active
+                        else zero.reshape(())
+                    )
                 )
                 physical_feasible = bool(
                     True
@@ -8535,7 +9542,8 @@ class NN_Trainer:
                 )
                 overall_feasible = bool(
                     physical_feasible
-                    # and seed_spacing_feasible
+                    and seed_spacing_feasible
+                    and target_length_feasible
                 )
                 stage_monitor_mode = (
                     "design"
@@ -8547,7 +9555,6 @@ class NN_Trainer:
                 loss_debug_terms = [
                     ("L_total", L_total),
                     ("loss_cvt", loss_cvt),
-                    ("loss_rep", loss_rep),
                     ("loss_seed_spacing", loss_seed_spacing),
                     ("loss_total_fiber_length", loss_total_fiber_length),
                     ("loss_l_curve_cell", loss_l_curve_cell),
@@ -8932,7 +9939,6 @@ class NN_Trainer:
                         "lam_fem_base": lam_fem_base_step,
                         "adaptive_lambda_fem": adaptive_lambda_fem,
                         "lam_cvt": lam_cvt_step,
-                        "lam_rep": lam_rep_step,
                         "lam_seed_spacing": float(cfg.lam_seed_spacing),
                         "lam_total_fiber_length": lam_total_fiber_length_step,
                         "lam_l_curve_cell": lam_l_curve_cell_step,
@@ -8943,7 +9949,8 @@ class NN_Trainer:
                         "loss_cvt_norm": loss_cvt_normalized.detach(),
                         "loss_l_curve_cell_norm": loss_l_curve_cell_normalized.detach(),
                         "loss_total_fiber_length_norm": loss_total_fiber_length_normalized.detach(),
-                        "loss_rep_norm": loss_rep_normalized.detach(),
+                        "target_total_length_penalty": target_length_penalty.detach(),
+                        "target_total_length_range_violation": target_length_range_violation.detach(),
                         "loss_seed_spacing": loss_seed_spacing.detach(),
                         "validity_loss": validity_loss.detach(),
                         "design_score": design_score.detach(),
@@ -8995,7 +10002,6 @@ class NN_Trainer:
                         "adaptive_lambda_update_reason": adaptive_lambda_update_reason,
                         "fem_constraints_active": bool(fem_constraints_active),
                         "lam_cvt_eff": lam_cvt_step,
-                        "lam_rep_eff": lam_rep_step,
                         "lam_seed_spacing_eff": float(cfg.lam_seed_spacing),
                         "lam_total_fiber_length_eff": lam_total_fiber_length_step,
                         "lam_l_curve_cell_eff": lam_l_curve_cell_step,
@@ -9004,22 +10010,95 @@ class NN_Trainer:
                         "design_score": self._finite_or_default(design_score),
                         "stage2_objective_mode": stage2_objective_mode,
                         "stage_monitor_mode": stage_monitor_mode,
-                        "loss_rep": self._finite_or_default(loss_rep),
+      
                         "loss_fem_norm": self._finite_or_default(monitor_loss_values["loss_fem_norm"]),
                         "loss_cvt_norm": self._finite_or_default(monitor_loss_values["loss_cvt_norm"]),
                         "loss_total_fiber_length_norm": self._finite_or_default(monitor_loss_values["loss_total_fiber_length_norm"]),
-                        "loss_rep_norm": self._finite_or_default(monitor_loss_values["loss_rep_norm"]),
-                        "loss_seed_spacing": self._finite_or_default(loss_seed_spacing),
+   
+                        "loss_seed_spacing": self._finite_or_default(
+                            loss_seed_spacing
+                        ),
+                        "loss_seed_spacing_barrier": self._finite_or_default(
+                            loss_seed_spacing_barrier
+                        ),
+                        "loss_seed_spacing_repulsion": self._finite_or_default(
+                            loss_seed_spacing_repulsion
+                        ),
+                        "loss_seed_spacing_repulsion_weighted": self._finite_or_default(
+                            loss_seed_spacing_repulsion_weighted
+                        ),
+                        "seed_repulsion_weight": float(cfg.seed_repulsion_weight),
                         "validity_loss": self._finite_or_default(validity_loss),
                         "loss_l_curve_cell_norm": self._finite_or_default(monitor_loss_values["loss_l_curve_cell_norm"]),
                         "loss_cvt_reference": self._finite_or_default(n_cvt),
-                        "loss_rep_reference": self._finite_or_default(n_rep),
+    
                         "loss_total_fiber_length_reference": self._finite_or_default(n_total_fiber_length),
                         "loss_l_curve_cell_reference": self._finite_or_default(n_l_curve_cell),
                         "loss_fem_reference": 1.0,
                         "loss_cvt": self._finite_or_default(loss_cvt),
                         "cvt_importance_mode": cvt_importance_mode,
                         "loss_total_fiber_length": self._finite_or_default(loss_total_fiber_length),
+                        "optimization_mode": optimization_mode,
+                        "target_total_length": (
+                            float(cfg.target_total_length)
+                            if getattr(cfg, "target_total_length", None) is not None
+                            else float("nan")
+                        ),
+                        "target_total_length_tolerance": float(
+                            getattr(cfg, "target_total_length_tolerance", 0.0)
+                        ),
+                        "target_total_length_lower": (
+                            float(cfg.target_total_length)
+                            - float(getattr(cfg, "target_total_length_tolerance", 0.0))
+                            if getattr(cfg, "target_total_length", None) is not None
+                            else float("nan")
+                        ),
+                        "target_total_length_upper": (
+                            float(cfg.target_total_length)
+                            + float(getattr(cfg, "target_total_length_tolerance", 0.0))
+                            if getattr(cfg, "target_total_length", None) is not None
+                            else float("nan")
+                        ),
+                        "target_length_under_weight": float(
+                            getattr(cfg, "target_length_under_weight", 1.0)
+                        ),
+                        "target_length_over_weight": float(
+                            getattr(cfg, "target_length_over_weight", 100.0)
+                        ),
+                        "target_total_length_under_violation": self._finite_or_default(
+                            target_length_out["under_violation"]
+                        ),
+                        "target_total_length_over_violation": self._finite_or_default(
+                            target_length_out["over_violation"]
+                        ),
+                        "target_total_length_range_violation": self._finite_or_default(
+                            target_length_range_violation
+                        ),
+                        "target_total_length_penalty": self._finite_or_default(
+                            target_length_penalty
+                        ),
+                        "target_total_length_relative_error": self._finite_or_default(
+                            target_length_out["relative_error"]
+                        ),
+                        "target_total_length_feasible": bool(target_length_feasible),
+                        "target_length_active": bool(target_length_active),
+                        "target_length_feasible_steps": int(target_length_feasible_steps),
+                        "target_length_lock_patience": int(target_length_lock_patience),
+                        "target_length_seed_domain_locked": bool(target_length_seed_domain_locked),
+                        "target_length_domain_lock_active": bool(target_length_seed_domain_locked),
+                        "target_length_domain_lock_applied": bool(
+                            target_length_domain_lock_applied
+                        ),
+                        "lock_seed_domain_after_target_length_feasible": bool(
+                            target_length_lock_enabled
+                        ),
+                        "displacement_objective": self._finite_or_default(
+                            displacement_objective
+                        ),
+                        "displacement_objective_weight": float(
+                            getattr(cfg, "displacement_objective_weight", 1.0)
+                        ),
+                        "displacement_objective_mode": displacement_objective_source,
                         "curve_length_min": curve_length_min,
                         "curve_length_max": curve_length_max,
                         "curve_length_mean": curve_length_mean,
@@ -9053,12 +10132,34 @@ class NN_Trainer:
                         "fem_displacement_constraint_excess": self._finite_or_default(fem_out.get("displacement_constraint_excess", zero)),
                         "fem_stress_ratio": self._finite_or_default(fem_out.get("stress_ratio", zero)),
                         "fem_displacement_ratio": self._finite_or_default(fem_out.get("displacement_ratio", zero)),
+                        "loss_displacement_ratio": self._finite_or_default(fem_out.get("loss_displacement_ratio", zero)),
                         "training_stress_ratio": self._finite_or_default(fem_out.get("training_stress_ratio", zero)),
                         "training_displacement_ratio": self._finite_or_default(fem_out.get("training_displacement_ratio", zero)),
                         "physical_stress_ratio": self._finite_or_default(fem_out.get("physical_stress_ratio", zero)),
+                        "stress_ratio_max_ip": self._finite_or_default(fem_out.get("stress_ratio_max_ip", zero)),
+                        "stress_constraint_value": self._finite_or_default(fem_out.get("stress_constraint_value", zero)),
+                        "stress_constraint_mode": fem_out.get("stress_constraint_mode", "hard_max"),
+                        "critical_element_label": self._finite_or_default(fem_out.get("critical_element_label", zero)),
+                        "critical_integration_point": self._finite_or_default(fem_out.get("critical_integration_point", zero)),
                         "physical_displacement_ratio": self._finite_or_default(fem_out.get("physical_displacement_ratio", zero)),
                         "fem_stress_p_norm": self._finite_or_default(fem_out.get("stress_p_norm", zero)),
+                        "fem_stress_p_norm_mean_diagnostic": self._finite_or_default(fem_out.get("stress_p_norm_mean_diagnostic", zero)),
                         "fem_displacement_p_norm": self._finite_or_default(fem_out.get("displacement_p_norm", zero)),
+                        "fem_stress_margin_loss": self._finite_or_default(fem_out.get("stress_margin_loss", zero)),
+                        "fem_displacement_margin_loss": self._finite_or_default(fem_out.get("displacement_margin_loss", zero)),
+                        "fem_stress_violation_loss": self._finite_or_default(fem_out.get("stress_violation_loss", zero)),
+                        "fem_displacement_violation_loss": self._finite_or_default(fem_out.get("displacement_violation_loss", zero)),
+                        "fem_max_displacement": (
+                            float(cfg.fem_max_displacement)
+                            if cfg.fem_max_displacement is not None
+                            else float("nan")
+                        ),
+                        "fem_yield_strength": (
+                            float(cfg.fem_yield_strength)
+                            if cfg.fem_yield_strength is not None
+                            else float("nan")
+                        ),
+                        "min_seed_spacing": float(cfg.min_seed_spacing),
                         "training_feasible": bool(fem_out.get("training_feasible", False)),
                         "safety_margin_satisfied": bool(fem_out.get("safety_margin_satisfied", False)),
                         "physical_feasible": bool(physical_feasible),
@@ -9073,6 +10174,9 @@ class NN_Trainer:
                             stage_max_steps,
                         ),
                         "fem_stress_max": self._finite_or_default(fem_out.get("stress_max", zero)),
+                        "maximum_integration_point_von_mises": self._finite_or_default(
+                            fem_out.get("maximum_integration_point_von_mises", zero)
+                        ),
                         "fem_displacement_max": self._finite_or_default(fem_out.get("displacement_max", zero)),
                         "stress_max": stress_max,
                         "stress_p95": stress_p95,
@@ -9108,7 +10212,11 @@ class NN_Trainer:
                         "best_step": self._best_feasible_step(best_feasible_key, best_feasible_checkpoint),
                         "legacy_l_train_best_score": best_score,
                         "legacy_l_train_best_step": best_step,
-                        "best_feasible_design_score": self._best_feasible_design_score(best_feasible_key),
+                        "best_feasible_design_score": (
+                            checkpoint_design_score(best_feasible_checkpoint)
+                            if target_length_mode
+                            else self._best_feasible_design_score(best_feasible_key)
+                        ),
                         "best_feasible_step": self._best_feasible_step(best_feasible_key, best_feasible_checkpoint),
                         "best_infeasible_violation": self._best_infeasible_violation(best_infeasible_key),
                         "best_infeasible_step": self._best_infeasible_step(best_infeasible_key, best_infeasible_checkpoint),
@@ -9126,6 +10234,7 @@ class NN_Trainer:
                         "visual_inactive_seed_ids": ",".join(visual_inactive_seed_records),
                         "anchor_update_allowed": 1.0 if anchor_update_allowed else 0.0,
                     }
+                    self._attach_objective_report(row)
                     stage_lam_text = self._stage_lambda_summary(row)
                     Logg_stage = f"Stage {int(row.get('stage', 0))} "
                     row["stage_lam_text"] = stage_lam_text
@@ -9202,6 +10311,10 @@ class NN_Trainer:
                                 global_step=int(step),
                                 total_loss_is_finite=bool(total_is_finite),
                                 fem_is_valid=bool(row.get("fem_valid", False)),
+                                optimization_mode=str(row.get("optimization_mode", "constrained_displacement")),
+                                target_length_feasible=bool(
+                                    row.get("target_total_length_feasible", True)
+                                ),
                             )
                             if candidate_is_feasible:
                                 feasible_key = candidate_key
@@ -9220,22 +10333,24 @@ class NN_Trainer:
                                     best_feasible_checkpoint = dict(last_valid_checkpoint)
                                     best_feasible_checkpoint["source"] = "best_feasible"
                                     best_feasible_checkpoint["best_feasible_key"] = tuple(feasible_key)
-                                    best_feasible_checkpoint["best_design_score"] = float(feasible_key[0])
-                                    best_feasible_checkpoint["best_raw_fiber_length"] = float(feasible_key[1])
+                                    best_feasible_checkpoint["best_design_score"] = design_score_key
+                                    best_feasible_checkpoint["best_raw_fiber_length"] = fiber_length_key
+                                    best_feasible_checkpoint["best_displacement_ratio"] = float(
+                                        row.get("physical_displacement_ratio", float("nan"))
+                                    )
                                     row_best_feasible = best_feasible_checkpoint.get("row", {})
                                     if isinstance(row_best_feasible, dict):
-                                        row_best_feasible["design_score"] = float(feasible_key[0])
+                                        row_best_feasible["design_score"] = design_score_key
                                     if should_publish_best_feasible:
                                         tqdm.write(
                                             "[Best feasible] "
                                             f"step={int(step)} "
-                                            f"design_score={float(feasible_key[0]):.6g} "
-                                            f"raw_fiber_length={float(feasible_key[1]):.6g} "
+                                            f"design_score={design_score_key:.6g} "
+                                            f"raw_fiber_length={fiber_length_key:.6g} "
                                             f"stress_ratio={float(row.get('physical_stress_ratio', float('nan'))):.6g} "
                                             f"displacement_ratio={float(row.get('physical_displacement_ratio', float('nan'))):.6g} "
                                             f"seed_count={float(row.get('total_seed_count', float('nan'))):.0f} "
-                                            f"feasible_key=(design_score, raw_fiber_length, step)="
-                                            f"({float(feasible_key[0]):.6g}, {float(feasible_key[1]):.6g}, {int(feasible_key[2])})"
+                                            f"feasible_key={tuple(feasible_key)}"
                                         )
                                     if should_publish_best_feasible:
                                         live_best_output_folder = (
@@ -9267,7 +10382,11 @@ class NN_Trainer:
                                     best_infeasible_checkpoint = dict(last_valid_checkpoint)
                                     best_infeasible_checkpoint["source"] = "best_infeasible"
 
-                        row["best_feasible_design_score"] = self._best_feasible_design_score(best_feasible_key)
+                        row["best_feasible_design_score"] = (
+                            checkpoint_design_score(best_feasible_checkpoint)
+                            if target_length_mode
+                            else self._best_feasible_design_score(best_feasible_key)
+                        )
                         row["best_feasible_step"] = self._best_feasible_step(best_feasible_key, best_feasible_checkpoint)
                         row["best_step"] = row["best_feasible_step"]
                         row["best_infeasible_violation"] = self._best_infeasible_violation(best_infeasible_key)
@@ -9288,6 +10407,7 @@ class NN_Trainer:
                             current_stage_runtime,
                             row,
                             meaningful_improvement=meaningful,
+                            stage_monitor_raw=stage_monitor_raw,
                             stage_topology_grace_steps=int(cfg.stage_topology_grace_steps),
                             stage_topology_grace_max_resets=int(cfg.stage_topology_grace_max_resets),
                             debug_stage_controller=bool(getattr(cfg, "debug_stage_controller", False)),
@@ -9342,9 +10462,11 @@ class NN_Trainer:
                             loss_dict=self._timelapse_loss_chart_dict(row),
                             title_text=(
                                 f"S{int(row['stage'])} | "
+                                f"L_train={float(row.get('L_train', float('nan'))):.3e} | "
                                 f"Best Step={int(row['best_step'])} | "
                                 f"{self._timelapse_geometry_summary_text(row)}"
                             ),
+                            chart_title="Weighted Objective Contributions",
                             stage=row["stage"],
                         )
 
@@ -9369,55 +10491,21 @@ class NN_Trainer:
                                 best_feasible_checkpoint=best_feasible_checkpoint,
                                 best_infeasible_key=best_infeasible_key,
                                 best_infeasible_checkpoint=best_infeasible_checkpoint,
+                                verbose=bool(
+                                    getattr(cfg, "debug_stage_controller", False)
+                                    or getattr(cfg, "debug_fem_integrity", False)
+                                    or getattr(cfg, "debug_anomaly_detection", False)
+                                ),
                             )
-                            + " | "
-                            f"Seeds={row['total_seed_count']:.0f} | "
-                            f"VisInactive={row.get('visual_inactive_seed_count', 0):.0f} "
-                            f"L_cvt={row['loss_cvt']:.3e}(lam={row['lam_cvt_eff']:.2g}) "
-                            f"L_total_fiber_length={row['loss_total_fiber_length']:.3e}(lam={row['lam_total_fiber_length_eff']:.2g}) "
-                            f"L_curve_cell={row['loss_l_curve_cell']:.3e}(lam={row['lam_l_curve_cell_eff']:.2g}) "
-                            f"L_rep={row['loss_rep']:.3e}(lam={row['lam_rep_eff']:.2g}) "
-                            f"L_spacing={row['loss_seed_spacing']:.3e}(lam={row['lam_seed_spacing_eff']:.2g}) | "
-                            f"stress_max={row['stress_max']:.3e} "
-                            f"disp_max={row['disp_max']:.3e} "
-                            f"disp_field_max={row['disp_field_max']:.3e} | "
-                            f"L(min/max/mean/ratio)={row['curve_length_min']:.3e}/{row['curve_length_max']:.3e}/{row['curve_length_mean']:.3e}/{row['curve_length_ratio']:.2f} "
-                            f"Acell(min/mean/max)={row['cell_area_min']:.3e}/{row['cell_area_mean']:.3e}/{row['cell_area_max']:.3e} |"
-                            f"VolFrac={row['VolFrac']:.3f} "
-                            f"rho(min/mean/max)={rho_min:.3f}/{rho_mean:.3f}/{rho_max:.3f} "
-                            f"Δrho={drho:.2e} Δseed={dseed:.2e} "
-                            f"d_seed={row['min_seed_distance']:.2e} "
-                            f"grad_mean={g_mean:.2e} | "
-                            f"Filter Δrho mean={row['filter_delta_mean']:.2e} "
-                            f"Filter Δrho max={row['filter_delta_max']:.2e} "
-                            f"Projection Δrho mean={row['projection_delta_mean']:.2e} "
-                            f"Projection Δrho max={row['projection_delta_max']:.2e} | "
-                            f"rho_raw_mean={row['rho_raw_mean']:.3f} "
-                            f"rho_filtered_mean={row['rho_filtered_mean']:.3f} "
-                            f"rho_final_mean={row['rho_final_mean']:.3f} | "
-                            f"fem_solve={'OK' if fem_is_valid else f'BAD({fem_failure_reason})'} "
-                            f"train_feas={'OK' if bool(row.get('training_feasible', False)) else 'BAD'} "
-                            f"ratios(train s/d)="
-                            f"{float(row.get('training_stress_ratio', float('nan'))):.3e}/"
-                            f"{float(row.get('training_displacement_ratio', float('nan'))):.3e} "
-                            f"fem_violation={float(row.get('fem_constraint_violation', float('nan'))):.3e} "
-                            f"spacing_violation={float(row.get('spacing_violation', float('nan'))):.3e} "
-                            f"grace={int(row.get('topology_grace_remaining', 0))} "
-                            f"grace_resets={int(row.get('topology_grace_resets_used', 0))}/{int(cfg.stage_topology_grace_max_resets)} "
-                            f"topo_changed={bool(row.get('topology_changed', False))} "
-                            f"topo_id={str(row.get('topology_identifier_short', ''))} "
-                            f"meaningful={bool(row.get('meaningful_improvement', False))} "
-                            f"anchor_update_allowed={bool(row.get('anchor_update_allowed', False))} "
                         )
 
-                    rep_value = float(row["loss_rep"])
                     vol_eff_value = float(row["VolFrac"])
                     min_seed_dist_value = float(row["min_seed_distance"])
 
                     anchor_update_allowed = (
-                        rep_value <= float(cfg.anchor_guard_rep_max)
-                        and vol_eff_value >= float(cfg.anchor_guard_vol_eff_min)
-                        and min_seed_dist_value >= float(cfg.min_seed_spacing)
+                        vol_eff_value >= float(cfg.anchor_guard_vol_eff_min)
+                        and min_seed_dist_value
+                        >= float(cfg.seed_spacing_safety_factor) * float(cfg.min_seed_spacing)
                     )
 
                     if not optimizer_step_skipped:
@@ -9705,6 +10793,12 @@ class NN_Trainer:
                 )
                 else str(best_feasible_key)
             )
+            best_feasible_key_label = (
+                "displacement_ratio, design_score, step"
+                if str(selected_row_for_log.get("optimization_mode", "")).strip().lower()
+                == "target_length_constrained_displacement"
+                else "design_score, raw_fiber_length, step"
+            )
             tqdm.write(
                 "[Final selection] "
                 f"source={selected_checkpoint_source} "
@@ -9719,7 +10813,7 @@ class NN_Trainer:
                 f"stage_best_local_step={stage_best_local_step} "
                 f"stage_best_global_step={stage_best_global_step} "
                 f"best_feasible_global_step={best_feasible_global_step} "
-                f"best_feasible_key=(design_score, raw_fiber_length, step)="
+                f"best_feasible_key=({best_feasible_key_label})="
                 f"{best_feasible_key_for_log}"
             )
             uv_anchor = self._restore_stage_checkpoint(
@@ -10005,6 +11099,7 @@ class NN_Trainer:
                 best_step=best_step,
                 computation_time_sec=computation_time_sec,
                 returned_best_source=returned_best_source,
+                best_score_meaning=best_score_meaning,
             )
             if optimization_log_dir is not None:
                 tqdm.write(f"Saved optimization logs: {optimization_log_dir}")
@@ -10039,6 +11134,7 @@ class NN_Trainer:
                     total_seed_slots = int(pred_list_for_frame[0]["seeds_raw"].shape[0])
                     title_parts = [
                         f"S{int(row.get('stage', checkpoint.get('stage_id', 0)))}",
+                        f"L_train={float(row.get('L_train', float('nan'))):.3e}",
                         f"best_step={int(checkpoint.get('global_step', frame_step))}",
                         self._timelapse_geometry_summary_text(row),
                     ]
@@ -10164,15 +11260,7 @@ class NN_Trainer:
             "history": history,
             "best_score": best_score,
             "best_score_meaning": best_score_meaning,
-            "best_design_score": (
-                float(best_feasible_key[0])
-                if (
-                    best_feasible_key is not None
-                    and len(best_feasible_key) >= 1
-                    and math.isfinite(float(best_feasible_key[0]))
-                )
-                else float("nan")
-            ),
+            "best_design_score": final_design_score,
             "best_raw_fiber_length": final_physical_fiber_length,
             "best_physical_stress_ratio": final_physical_stress_ratio,
             "best_physical_displacement_ratio": final_physical_displacement_ratio,
@@ -10184,7 +11272,11 @@ class NN_Trainer:
             "physical_feasible": final_physical_feasible,
             "overall_feasible": final_overall_feasible,
             "best_step": best_step,
-            "best_feasible_design_score": self._best_feasible_design_score(best_feasible_key),
+            "best_feasible_design_score": (
+                checkpoint_design_score(best_feasible_checkpoint)
+                if target_length_mode
+                else self._best_feasible_design_score(best_feasible_key)
+            ),
             "best_feasible_step": self._best_feasible_step(best_feasible_key, best_feasible_checkpoint),
             "best_infeasible_violation": self._best_infeasible_violation(best_infeasible_key),
             "best_infeasible_design_score": (

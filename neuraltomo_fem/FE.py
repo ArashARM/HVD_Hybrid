@@ -70,7 +70,7 @@ class FE:
         self.f = torch.tensor(self.mesh.f[keep_index, 0], dtype=torch.float32, device=device)
 
 
-    def solve_c_new(self, phi, theta, stiffness_factor, penal=1.0, isotropic=False):
+    def solve_c_new(self, phi, theta, stiffness_factor, penal=1.0, isotropic=False, orientation_matrix=None):
         # self.u = torch.zeros((self.mesh.ndof, 1), device=density.device)
         active_ids = torch.as_tensor(self.mesh.active_element_ids, dtype=torch.long, device=stiffness_factor.device)
         if isotropic:
@@ -80,7 +80,10 @@ class FE:
             sK = torch.einsum('i,ijk->ijk', E, KE).flatten()
         else:
             ## anisotropic
-            sK = self.H8.angle2Ke(phi[active_ids], theta[active_ids], stiffness_factor[active_ids], penal).flatten()
+            if orientation_matrix is None:
+                sK = self.H8.angle2Ke(phi[active_ids], theta[active_ids], stiffness_factor[active_ids], penal).flatten()
+            else:
+                sK = self.H8.orientation2Ke(orientation_matrix[active_ids], stiffness_factor[active_ids], penal).flatten()
 
         d = sK[self.valid_mask]
 
@@ -88,7 +91,7 @@ class FE:
         c = sk2c(d, (self.new_row_indices, self.new_col_indices), f, self.f, self.Ksize)
         return c
 
-    def solve_stress_new(self, phi, theta, stiffness_factor, penal=1.0, isotropic=False):
+    def solve_stress_new(self, phi, theta, stiffness_factor, penal=1.0, isotropic=False, orientation_matrix=None):
         self.u = torch.zeros((self.mesh.ndof, 1), dtype=torch.float32, device=stiffness_factor.device)
         active_ids = torch.as_tensor(self.mesh.active_element_ids, dtype=torch.long, device=stiffness_factor.device)
         if isotropic:
@@ -100,9 +103,13 @@ class FE:
             C = torch.tensor(self.mesh.C, dtype=torch.float32, device=stiffness_factor.device).expand(self.mesh.numElems,-1,-1)
         else:
             ## anisotropic
-            sK = self.H8.angle2Ke(phi[active_ids], theta[active_ids], stiffness_factor[active_ids], penal).flatten()
+            if orientation_matrix is None:
+                sK = self.H8.angle2Ke(phi[active_ids], theta[active_ids], stiffness_factor[active_ids], penal).flatten()
+            else:
+                sK = self.H8.orientation2Ke(orientation_matrix[active_ids], stiffness_factor[active_ids], penal).flatten()
 
-            B = self.H8.NodeB
+            B_ip = self.H8.B
+            B_centroid = self.H8.NodeB
             C_active = self.H8.temp_C
             T_active = self.H8.T
 
@@ -146,36 +153,126 @@ class FE:
         if isotropic:
             C_active = C[active_ids]
             T_active = None
-        sigma_active = torch.einsum('bij,jk,bk -> bi', C_active, B, uElem_active)
-        sigmaElem = torch.zeros((self.mesh.numElems, 6), dtype=torch.float32, device=stiffness_factor.device)
-        sigmaElem[active_ids] = sigma_active
-        sigma_for_vm = sigmaElem
-        sxx, syy, szz = sigma_for_vm[:, 0], sigma_for_vm[:, 1], sigma_for_vm[:, 2]
-        syz, sxz, sxy = sigma_for_vm[:, 3], sigma_for_vm[:, 4], sigma_for_vm[:, 5]
-        stress_vm = torch.sqrt(
-            torch.clamp(
-                0.5 * ((sxx - syy) ** 2 + (syy - szz) ** 2 + (szz - sxx) ** 2)
-                + 3.0 * (sxy ** 2 + syz ** 2 + sxz ** 2),
-                min=0.0,
+
+            B_ip = self.H8.B.to(
+                device=stiffness_factor.device,
+                dtype=uElem_active.dtype,
             )
+
+            B_centroid = self.H8.NodeB.to(
+                device=stiffness_factor.device,
+                dtype=uElem_active.dtype,
+            )
+
+
+        # --------------------------------------------------------
+        # Use the same effective constitutive stiffness that was
+        # used to assemble the element stiffness matrix.
+        #
+        # stiffness_factor already contains:
+        #   - shell occupancy
+        #   - density interpolation
+        #   - SIMP penalization
+        #   - minimum stiffness ratio
+        #
+        # Therefore, do not apply penalization again here.
+        # --------------------------------------------------------
+
+        active_stiffness = stiffness_factor[
+            active_ids
+        ].reshape(-1, 1, 1)
+
+        C_effective_active = (
+            C_active * active_stiffness
+        )
+
+
+        # Physical stress matching the Abaqus voxel exporter:
+        # sigma = C_effective @ B_bar @ u
+
+        sigma_active_ip = torch.einsum(
+            "bij,gjk,bk->bgi",
+            C_effective_active,
+            B_ip,
+            uElem_active,
+        )
+
+        sigma_active_centroid = torch.einsum(
+            "bij,jk,bk->bi",
+            C_effective_active,
+            B_centroid,
+            uElem_active,
+        )
+        sigma_ip = torch.zeros((self.mesh.numElems, 8, 6), dtype=torch.float32, device=stiffness_factor.device)
+        sigma_ip[active_ids] = sigma_active_ip
+        sigma_centroid_legacy = torch.zeros((self.mesh.numElems, 6), dtype=torch.float32, device=stiffness_factor.device)
+        sigma_centroid_legacy[active_ids] = sigma_active_centroid
+        sigma_for_vm = sigma_ip
+        sxx, syy, szz = sigma_for_vm[..., 0], sigma_for_vm[..., 1], sigma_for_vm[..., 2]
+        syz, sxz, sxy = sigma_for_vm[..., 3], sigma_for_vm[..., 4], sigma_for_vm[..., 5]
+        vm_squared = torch.clamp(
+            0.5 * ((sxx - syy) ** 2 + (syy - szz) ** 2 + (szz - sxx) ** 2)
+            + 3.0 * (sxy ** 2 + syz ** 2 + sxz ** 2),
+            min=0.0,
+        )
+        stress_vm = torch.sqrt(
+            vm_squared.clamp_min(
+                torch.as_tensor(1.0e-24, dtype=vm_squared.dtype, device=vm_squared.device)
+            )
+        )
+        stress_vm_element_max = torch.zeros((self.mesh.numElems,), dtype=torch.float32, device=stiffness_factor.device)
+        stress_vm_element_max[active_ids] = stress_vm[active_ids].amax(dim=1)
+        stress_max_ip = stress_vm[active_ids].amax()
+        stress_argmax_flat = torch.argmax(stress_vm[active_ids].reshape(-1))
+        stress_ip_argmax_active_rank = torch.div(stress_argmax_flat, 8, rounding_mode='floor')
+        stress_ip_argmax_gp = stress_argmax_flat.remainder(8)
+        stress_ip_argmax_element = active_ids[stress_ip_argmax_active_rank]
+
+        element_size = torch.as_tensor(self.mesh.elemSize, dtype=torch.float32, device=stiffness_factor.device)
+        active_centroids = torch.as_tensor(
+            self.mesh.elemCenters[self.mesh.active_element_ids],
+            dtype=torch.float32,
+            device=stiffness_factor.device,
+        )
+        critical_ip_coordinates = (
+            active_centroids[stress_ip_argmax_active_rank]
+            + self.H8.gauss_points[stress_ip_argmax_gp] * element_size
         )
         self.displacement_mag_elem = disp_mag_elem
         self.displacement_mag_loaded_boundary = loaded_disp_mag
         self.displacement_load_dir_elem = disp_load_dir_elem
-        self.displacement_load_dir_loaded_boundary = loaded_disp_mag
+        self.displacement_load_dir_loaded_boundary = loaded_disp_load_dir
         self.displacement_load_dir_loaded_boundary_projection = loaded_disp_load_dir
-        self.sigmaElem = sigmaElem
-        self.stress_vm = stress_vm
+        self.sigma_ip = sigma_ip
+        self.sigma_ip_active = sigma_active_ip
+        self.C_effective_active = C_effective_active
+        self.sigmaElem_legacy_centroid = sigma_centroid_legacy
+        self.stress_vm_ip = stress_vm
+        self.stress_vm_ip_active = stress_vm[active_ids]
+        self.stress_vm_element_max = stress_vm_element_max
+        self.stress_max_ip = stress_max_ip
+        self.stress_ip_argmax_element = stress_ip_argmax_element
+        self.stress_ip_argmax_active_rank = stress_ip_argmax_active_rank
+        self.stress_ip_argmax_gp = stress_ip_argmax_gp
+        self.critical_ip_coordinates = critical_ip_coordinates
+        self.critical_stress_components = sigma_active_ip.reshape(-1, 6)[stress_argmax_flat]
+        self.critical_abaqus_element_label = stress_ip_argmax_active_rank + 1
+        self.critical_abaqus_integration_point = stress_ip_argmax_gp + 1
+        self.gauss_points_parent = self.H8.gauss_points_parent
+        self.gauss_points = self.H8.gauss_points
+        self.sigmaElem = sigma_ip
+        self.stress_vm = stress_vm_element_max
         
         # sigmaElem = torch.einsum('bij,jk,bk,bim -> bm', C, B, uElem, T)
 
         P, Q = self.H8.P, self.H8.Q
-        _A_active = 0.5 * torch.einsum('ij, jk, ik ->i', sigma_active, P, sigma_active)
-        _B_active = torch.einsum('i, ji ->j', Q, sigma_active)
-        _A = torch.zeros((self.mesh.numElems,), dtype=torch.float32, device=stiffness_factor.device)
-        _B = torch.zeros((self.mesh.numElems,), dtype=torch.float32, device=stiffness_factor.device)
-        _A[active_ids] = _A_active
-        _B[active_ids] = _B_active
+        sigma_failure_active = sigma_active_ip.reshape(-1, 6)
+        _A_active = 0.5 * torch.einsum('ij, jk, ik ->i', sigma_failure_active, P, sigma_failure_active)
+        _B_active = torch.einsum('i, ji ->j', Q, sigma_failure_active)
+        _A = torch.zeros((self.mesh.numElems, 8), dtype=torch.float32, device=stiffness_factor.device)
+        _B = torch.zeros((self.mesh.numElems, 8), dtype=torch.float32, device=stiffness_factor.device)
+        _A[active_ids] = _A_active.reshape(-1, 8)
+        _B[active_ids] = _B_active.reshape(-1, 8)
         _C = -1
 
         root_active = torch.zeros_like(_A_active)
@@ -188,7 +285,7 @@ class FE:
         root_active[is_linear] = 1 / (BL.abs() + 1e-5)
         root_active[~is_linear] = (-BNL + (BNL * BNL - 4 * ANL * _C).sqrt()) / (2 * ANL)
         root = torch.zeros_like(_A)
-        root[active_ids] = root_active
+        root[active_ids] = root_active.reshape(-1, 8)
 
 
         Fmin = torch.linalg.vector_norm(root_active.abs() + 1e-5, ord=-6) # + 1e-5*root.mean()

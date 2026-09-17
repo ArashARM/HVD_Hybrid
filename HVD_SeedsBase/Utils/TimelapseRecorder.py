@@ -145,10 +145,10 @@ class TimelapseRecorder:
             "L_FEM_norm": "L FEM Norm",
             "disp_norm": "Disp. Norm",
             "stress_norm": "Stress Norm",
-            "stress_max": "Max Stress",
+            "stress_max": "Max IP Stress",
             "disp_max": "Max Disp.",
             "disp_field_max": "Max Field Disp.",
-            "Max_Stress": "Max Stress",
+            "Max_Stress": "Max IP Stress",
             "Max_Displacement": "Max Disp.",
             "Max_Displacement_Field": "Max Field Disp.",
             "compliance_reduction": "Com. Red. ",
@@ -246,24 +246,68 @@ class TimelapseRecorder:
 
         if self.header_subtitle:
             max_width = self.frame_width - (2 * x)
-            lines = self._wrap_cv2_text(
-                self.header_subtitle,
-                max_width=max_width,
-                font=font,
-                font_scale=0.62,
-                thickness=1,
-            )
-            for line_idx, line in enumerate(lines[:2]):
+            subtitle = self.header_subtitle
+            mode_prefix = "Mode:"
+            if subtitle.startswith(mode_prefix) and "|" in subtitle:
+                mode_text, rest = subtitle.split("|", 1)
                 cv2.putText(
                     canvas,
-                    line,
-                    (x, subtitle_y + line_idx * 26),
+                    mode_text.strip(),
+                    (x, subtitle_y),
                     font,
                     0.62,
+                    text,
+                    2,
+                    cv2.LINE_AA,
+                )
+                mode_width = cv2.getTextSize(mode_text.strip(), font, 0.62, 2)[0][0]
+                rest_lines = self._wrap_cv2_text(
+                    rest.strip(),
+                    max_width=max(max_width - mode_width - 20, 400),
+                    font=font,
+                    font_scale=0.54,
+                    thickness=1,
+                )
+                cv2.putText(
+                    canvas,
+                    "| " + rest_lines[0],
+                    (x + mode_width + 18, subtitle_y),
+                    font,
+                    0.54,
                     muted,
                     1,
                     cv2.LINE_AA,
                 )
+                for line_idx, line in enumerate(rest_lines[1:2], start=1):
+                    cv2.putText(
+                        canvas,
+                        line,
+                        (x, subtitle_y + line_idx * 26),
+                        font,
+                        0.54,
+                        muted,
+                        1,
+                        cv2.LINE_AA,
+                    )
+            else:
+                lines = self._wrap_cv2_text(
+                    subtitle,
+                    max_width=max_width,
+                    font=font,
+                    font_scale=0.62,
+                    thickness=1,
+                )
+                for line_idx, line in enumerate(lines[:2]):
+                    cv2.putText(
+                        canvas,
+                        line,
+                        (x, subtitle_y + line_idx * 26),
+                        font,
+                        0.62,
+                        muted,
+                        1,
+                        cv2.LINE_AA,
+                    )
 
         return header_h
 

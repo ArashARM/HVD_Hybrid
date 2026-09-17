@@ -19,13 +19,27 @@ class NeuralTOMOFEM:
 
         self.isotropic = isotropic
 
-    def __call__(self, density: torch.Tensor, phi: torch.Tensor, theta: torch.Tensor, penal=3):
+    def __call__(
+        self,
+        density: torch.Tensor,
+        phi: torch.Tensor,
+        theta: torch.Tensor,
+        penal=3,
+        orientation_matrix: torch.Tensor | None = None,
+    ):
         density = density.to(self.device).flatten().float()
         phi = phi.to(self.device).flatten().float()
         theta = theta.to(self.device).flatten().float()
+        if orientation_matrix is not None:
+            orientation_matrix = orientation_matrix.to(self.device).float()
         # exact call used in NeuralTOMO:
         stress, compliance = self.fe.solve_stress_new(
-            phi, theta, density, penal=penal, isotropic=self.isotropic
+            phi,
+            theta,
+            density,
+            penal=penal,
+            isotropic=self.isotropic,
+            orientation_matrix=orientation_matrix,
         )
         return stress, compliance
     
@@ -85,8 +99,8 @@ class NeuralTOMOFEM:
         # self.fem.H8.nut: Poisson’s ratio in the transverse direction (e.g. 0.30)
         # self.fem.H8.C_inv_np: (6,6) NumPy constitutive stiffness matrix for the anisotropic material (e.g. array([[10.96, ...], ...]))
         # self.fem.H8.C_inv: (6,6) torch constitutive stiffness matrix on the selected device (e.g. tensor([[10.96, ...]], device='cuda:0'))
-        # self.fem.H8.int_weight: (27,) Gauss quadrature weights for 3x3x3 integration in the H8 element (e.g. tensor([0.0214, 0.0343, ...]))
-        # self.fem.H8.B: (27,6,24) strain-displacement matrices at all 27 Gauss points (e.g. one 6x24 matrix per integration point)
-        # self.fem.H8.NodeB: (6,24) strain-displacement matrix used at the element center for nodal/element strain evaluation
+        # self.fem.H8.int_weight: (8,) Gauss quadrature weights for full C3D8 integration
+        # self.fem.H8.B: (8,6,24) B-bar strain-displacement matrices at Abaqus-compatible integration points
+        # self.fem.H8.NodeB: (6,24) legacy centroid strain-displacement matrix for debug comparisons only
         # self.fem.H8.temp_C: (batch,6,6) rotated constitutive matrices saved from the latest angle2Ke() call (e.g. one per element in the batch)
         # self.fem.H8.T: (batch,6,6) rotation/transformation matrices saved from the latest angle2Ke() call (e.g. one per element in the batch) 

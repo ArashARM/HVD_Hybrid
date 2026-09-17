@@ -113,3 +113,18 @@ def test_uniform_active_stiffness_scaling_and_gradient_direction():
     assert grad_dir < 0.0
     assert fd < 0.0
     assert torch.allclose(grad_dir, fd, rtol=2.5e-1, atol=2.5e-1)
+
+
+def test_integration_point_stress_backward_is_finite_with_zero_stress_points():
+    problem, _, _ = _tiny_active_domain_problem()
+    fem = NeuralTOMOFEM(problem, device="cpu")
+    stiffness = torch.tensor([1.0, 0.0], dtype=torch.float32, requires_grad=True)
+    phi = torch.zeros(2)
+    theta = torch.zeros(2)
+
+    fem(stiffness, phi, theta, penal=1.0)
+    stress_loss = fem.fe.stress_vm_ip_active.max()
+    stress_loss.backward()
+
+    assert stiffness.grad is not None
+    assert torch.isfinite(stiffness.grad).all()

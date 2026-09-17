@@ -1,24 +1,64 @@
 from __future__ import annotations
 
+import math
 import torch
+import torch.nn.functional as F
 
 
-def minimum_seed_spacing_loss(
+def seed_separation_loss(
     seed_xyz: torch.Tensor,
     *,
     min_seed_spacing: float | torch.Tensor,
+    valid_seed_mask: torch.Tensor | None = None,
     spacing_power: float = 2.0,
+    safety_factor: float = 1.05,
+    aggregate_temperature: float = 1.0e-4,
+    repulsion_factor: float = 1.10,
+    repulsion_temperature_ratio: float = 0.02,
+    repulsion_weight: float = 0.10,
     eps: float = 1.0e-12,
-) -> torch.Tensor:
+    return_components: bool = False,
+):
+    """
+    Combined seed-separation loss.
+
+    1. Barrier:
+       Strongly controls the worst pair and enforces minimum spacing.
+
+    2. Collective repulsion:
+       Weakly discourages several seeds from clustering near the limit.
+
+    If valid_seed_mask is provided, only pairs where both seeds are valid
+    contribute to the loss. This lets boundary/outside-domain handling own
+    invalid seeds instead of letting separation push valid seeds away from them.
+    """
     if seed_xyz.ndim != 2 or seed_xyz.shape[-1] != 3:
         raise ValueError(
             "seed_xyz must have shape [N, 3], "
             f"got {tuple(seed_xyz.shape)}."
         )
 
+    if valid_seed_mask is not None:
+        valid_seed_mask = valid_seed_mask.to(
+            device=seed_xyz.device,
+            dtype=torch.bool,
+        ).reshape(-1)
+        if valid_seed_mask.numel() != seed_xyz.shape[0]:
+            raise ValueError(
+                "valid_seed_mask must contain one value per seed, "
+                f"got {valid_seed_mask.numel()} for {seed_xyz.shape[0]} seeds."
+            )
+        seed_xyz = seed_xyz[valid_seed_mask.detach()]
+
     n_seed = int(seed_xyz.shape[0])
     if n_seed < 2:
-        return seed_xyz.sum() * 0.0
+        zero = seed_xyz.sum() * 0.0
+        if return_components:
+            return zero, {
+                "barrier": zero,
+                "repulsion": zero,
+            }
+        return zero
 
     d_min = torch.as_tensor(
         min_seed_spacing,
@@ -26,19 +66,99 @@ def minimum_seed_spacing_loss(
         device=seed_xyz.device,
     ).clamp_min(eps)
 
-    diff = seed_xyz[:, None, :] - seed_xyz[None, :, :]
-    distances = torch.sqrt((diff * diff).sum(dim=-1) + float(eps))
+    distances = torch.cdist(seed_xyz, seed_xyz)
+
     pair_mask = torch.triu(
-        torch.ones((n_seed, n_seed), dtype=torch.bool, device=seed_xyz.device),
+        torch.ones(
+            (n_seed, n_seed),
+            dtype=torch.bool,
+            device=seed_xyz.device,
+        ),
         diagonal=1,
     )
-    violations = 100*torch.relu((d_min - distances[pair_mask]) / d_min)
-    return violations.pow(float(spacing_power)).mean()
+
+    pair_distances = distances[pair_mask]
+
+    # ============================================================
+    # 1. Smooth worst-pair spacing barrier
+    # ============================================================
+
+    d_safe = float(safety_factor) * d_min
+
+    barrier_violation = torch.relu(
+        (d_safe - pair_distances) / d_safe
+    )
+
+    pair_barrier = barrier_violation.pow(float(spacing_power))
+
+    tau_aggregate = torch.as_tensor(
+        aggregate_temperature,
+        dtype=seed_xyz.dtype,
+        device=seed_xyz.device,
+    ).clamp_min(eps)
+
+    barrier_loss = tau_aggregate * (
+        torch.logsumexp(
+            pair_barrier / tau_aggregate,
+            dim=0,
+        )
+        - math.log(pair_barrier.numel())
+    )
+
+    # ============================================================
+    # 2. Weak collective repulsion
+    # ============================================================
+
+    d_repulsion = float(repulsion_factor) * d_min
+
+    tau_repulsion = (
+        float(repulsion_temperature_ratio) * d_min
+    ).clamp_min(eps)
+
+    repulsion_violation = (
+        F.softplus(
+            (d_repulsion - pair_distances) / tau_repulsion
+        )
+        * tau_repulsion
+        / d_repulsion
+    )
+
+    pair_repulsion = repulsion_violation.square()
+
+    # Sum/N instead of mean over all N(N-1)/2 pairs.
+    # This gives a more consistent per-seed scale.
+    collective_repulsion = pair_repulsion.sum() / float(n_seed)
+
+    # ============================================================
+    # Combined loss
+    # ============================================================
+
+    total_loss = (
+        barrier_loss
+        + float(repulsion_weight) * collective_repulsion
+    )
+
+    if return_components:
+        return total_loss, {
+            "barrier": barrier_loss,
+            "repulsion": collective_repulsion,
+            "weighted_repulsion": (
+                float(repulsion_weight) * collective_repulsion
+            ),
+            "minimum_distance": pair_distances.min(),
+            "safe_distance": d_safe,
+            "repulsion_distance": d_repulsion,
+        }
+
+    return total_loss
 
 
-def minimum_physical_seed_distance(
+def minimum_seed_spacing_loss(
     seed_xyz: torch.Tensor,
     *,
+    min_seed_spacing: float | torch.Tensor,
+    spacing_power: float = 2.0,
+    valid_seed_mask: torch.Tensor | None = None,
     eps: float = 1.0e-12,
 ) -> torch.Tensor:
     if seed_xyz.ndim != 2 or seed_xyz.shape[-1] != 3:
@@ -46,6 +166,59 @@ def minimum_physical_seed_distance(
             "seed_xyz must have shape [N, 3], "
             f"got {tuple(seed_xyz.shape)}."
         )
+    if valid_seed_mask is not None:
+        valid_seed_mask = valid_seed_mask.to(
+            device=seed_xyz.device,
+            dtype=torch.bool,
+        ).reshape(-1)
+        if valid_seed_mask.numel() != seed_xyz.shape[0]:
+            raise ValueError(
+                "valid_seed_mask must contain one value per seed, "
+                f"got {valid_seed_mask.numel()} for {seed_xyz.shape[0]} seeds."
+            )
+        seed_xyz = seed_xyz[valid_seed_mask.detach()]
+
+    n_seed = int(seed_xyz.shape[0])
+    if n_seed < 2:
+        return seed_xyz.sum() * 0.0
+
+    distances = torch.cdist(seed_xyz, seed_xyz)
+    pair_mask = torch.triu(
+        torch.ones((n_seed, n_seed), dtype=torch.bool, device=seed_xyz.device),
+        diagonal=1,
+    )
+    target = torch.as_tensor(
+        min_seed_spacing,
+        dtype=seed_xyz.dtype,
+        device=seed_xyz.device,
+    ).clamp_min(eps)
+    violation = torch.relu((target - distances[pair_mask]) / target)
+    return violation.pow(float(spacing_power)).mean()
+
+
+def minimum_physical_seed_distance(
+    seed_xyz: torch.Tensor,
+    *,
+    valid_seed_mask: torch.Tensor | None = None,
+    eps: float = 1.0e-12,
+) -> torch.Tensor:
+    if seed_xyz.ndim != 2 or seed_xyz.shape[-1] != 3:
+        raise ValueError(
+            "seed_xyz must have shape [N, 3], "
+            f"got {tuple(seed_xyz.shape)}."
+        )
+    if valid_seed_mask is not None:
+        valid_seed_mask = valid_seed_mask.to(
+            device=seed_xyz.device,
+            dtype=torch.bool,
+        ).reshape(-1)
+        if valid_seed_mask.numel() != seed_xyz.shape[0]:
+            raise ValueError(
+                "valid_seed_mask must contain one value per seed, "
+                f"got {valid_seed_mask.numel()} for {seed_xyz.shape[0]} seeds."
+            )
+        seed_xyz = seed_xyz[valid_seed_mask.detach()]
+
     n_seed = int(seed_xyz.shape[0])
     if n_seed < 2:
         return seed_xyz.new_tensor(float("inf"))

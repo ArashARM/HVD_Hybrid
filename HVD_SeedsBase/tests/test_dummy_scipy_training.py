@@ -6,6 +6,7 @@ import torch.nn as nn
 from Decoder_CLasses.ContinuousVoronoiDecoder import ContinuousVoronoiDecoder
 import Training.MainTrain as main_train
 from Training.MainTrain import (
+    CELL_LENGTH_EDGE_TYPES,
     NN_Trainer,
     RunningNorm,
     TrainingConfig,
@@ -27,6 +28,55 @@ def make_decoder(**kwargs):
     return ContinuousVoronoiDecoder(None, face_mesh, **kwargs)
 
 
+def rectangle_boundary_data(
+    dtype: torch.dtype = torch.float64,
+    *,
+    origin: tuple[float, float] = (0.0, 0.0),
+    size: tuple[float, float] = (1.0, 1.0),
+    loop_id: int = 0,
+) -> dict[str, torch.Tensor]:
+    x0, y0 = origin
+    width, height = size
+    c0 = [x0, y0]
+    c1 = [x0 + width, y0]
+    c2 = [x0 + width, y0 + height]
+    c3 = [x0, y0 + height]
+    return {
+        "boundary_curve_uv": torch.tensor(
+            [c0, c1, c1, c2, c2, c3, c3, c0],
+            dtype=dtype,
+        ),
+        "boundary_curve_offsets": torch.tensor([0, 2, 4, 6, 8], dtype=torch.long),
+        "boundary_curve_loop_id": torch.full((4,), int(loop_id), dtype=torch.long),
+    }
+
+
+def uv_curve_length(curve: torch.Tensor) -> torch.Tensor:
+    return torch.linalg.vector_norm(curve[1:] - curve[:-1], dim=1).sum()
+
+
+def make_shell_graph(
+    decoder: ContinuousVoronoiDecoder,
+    nodes: torch.Tensor,
+    cad_domain: dict,
+) -> dict[str, torch.Tensor]:
+    edge_index, edge_type, boundary_data, metadata = decoder.build_boundary_loop_edges(
+        nodes,
+        torch.ones((nodes.shape[0],), dtype=torch.long, device=nodes.device),
+        cad_domain=cad_domain,
+    )
+    graph = {
+        "nodes_uv": nodes,
+        "edge_index": edge_index,
+        "edge_type": edge_type,
+        "edge_seed_pair": torch.full((edge_index.shape[0], 2), -1, dtype=torch.long, device=nodes.device),
+    }
+    graph.update(metadata)
+    for key, value in boundary_data.items():
+        graph[key] = value
+    return graph
+
+
 def test_training_config_numeric_defaults_are_scalars() -> None:
     cfg = TrainingConfig()
 
@@ -35,6 +85,28 @@ def test_training_config_numeric_defaults_are_scalars() -> None:
     assert isinstance(cfg.cell_edge_uniform_eps, float)
     assert isinstance(cfg.cell_angle_eps, float)
     assert isinstance(cfg.cell_vertex_merge_tolerance, float)
+
+
+def test_decoder_init_kwargs_pass_seed_domain_margin() -> None:
+    trainer = NN_Trainer.__new__(NN_Trainer)
+    trainer.cfg = TrainingConfig(seed_domain_margin=0.25)
+    trainer.Cad_domain = None
+    trainer.face_mesh = None
+
+    kwargs = trainer._decoder_init_kwargs(
+        device=torch.device("cpu"),
+        seed_number=4,
+        u_periodic=False,
+        v_periodic=False,
+        face_tensor={
+            "uv": torch.empty((0, 2)),
+            "Xu": None,
+            "Xv": None,
+            "points_xyz": None,
+        },
+    )
+
+    assert kwargs["seed_domain_margin"] == 0.25
 
 
 def test_training_config_normalizes_single_item_numeric_tuples() -> None:
@@ -162,12 +234,15 @@ def test_edge_in_losses_modes_select_expected_lengths_and_skip_reserved() -> Non
 
     trainer.cfg = TrainingConfig(Edge_in_losses="Interior")
     assert torch.allclose(trainer.curve_3d_edge_lengths(geometry), edge_curves_xyz.new_tensor([1.0]))
+    assert torch.allclose(trainer.curve_network_length_loss(geometry), edge_curves_xyz.new_tensor(1.0))
 
     trainer.cfg = TrainingConfig(Edge_in_losses="VDonly")
     assert torch.allclose(trainer.curve_3d_edge_lengths(geometry), edge_curves_xyz.new_tensor([1.0, 2.0, 3.0]))
+    assert torch.allclose(trainer.curve_network_length_loss(geometry), edge_curves_xyz.new_tensor(6.0))
 
     trainer.cfg = TrainingConfig(Edge_in_losses="all")
     assert torch.allclose(trainer.curve_3d_edge_lengths(geometry), edge_curves_xyz.new_tensor([1.0, 2.0, 3.0, 4.0]))
+    assert torch.allclose(trainer.curve_network_length_loss(geometry), edge_curves_xyz.new_tensor(10.0))
 
 
 def test_compute_all_edge_curve_lengths_known_cases() -> None:
@@ -1071,6 +1146,140 @@ def test_graph_edge_curve_sampling_dispatches_only_shell_edges_to_boundary_suppo
     assert not bool(first_on_boundary)
 
 
+def test_rectangular_boundary_loop_is_covered_once_by_shell_paths() -> None:
+    decoder = make_decoder(return_xyz=False)
+    dtype = torch.float64
+    cad_domain = {
+        "boundary_curve_uv": torch.tensor(
+            [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]],
+            dtype=dtype,
+        ),
+        "boundary_curve_offsets": torch.tensor([0, 2, 3, 4, 5], dtype=torch.long),
+        "boundary_curve_loop_id": torch.zeros((4,), dtype=torch.long),
+    }
+    nodes = cad_domain["boundary_curve_uv"][:-1].clone()
+    graph = make_shell_graph(decoder, nodes, cad_domain)
+
+    curves = decoder.sample_graph_edge_curves_uv(nodes, graph, n_samples=33)
+    lengths = torch.stack([uv_curve_length(curve) for curve in curves])
+
+    assert graph["edge_index"].shape[0] == 4
+    assert torch.allclose(lengths.sum(), torch.tensor(4.0, dtype=dtype), atol=2e-3)
+    assert torch.all(graph["boundary_path_loop_id"] == 0)
+
+
+def test_two_boundary_nodes_create_complementary_paths_not_duplicate_shortest_paths() -> None:
+    decoder = make_decoder(return_xyz=False)
+    dtype = torch.float64
+    cad_domain = {
+        "boundary_curve_uv": torch.tensor(
+            [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]],
+            dtype=dtype,
+        ),
+        "boundary_curve_offsets": torch.tensor([0, 2, 3, 4, 5], dtype=torch.long),
+        "boundary_curve_loop_id": torch.zeros((4,), dtype=torch.long),
+    }
+    nodes = torch.tensor([[0.0, 0.0], [1.0, 0.0]], dtype=dtype)
+    graph = make_shell_graph(decoder, nodes, cad_domain)
+    curves = decoder.sample_graph_edge_curves_uv(nodes, graph, n_samples=65)
+    lengths = torch.sort(torch.stack([uv_curve_length(curve) for curve in curves])).values
+
+    assert graph["edge_index"].shape[0] == 2
+    assert torch.allclose(lengths, torch.tensor([1.0, 3.0], dtype=dtype), atol=3e-3)
+
+
+def test_cyclic_closing_interval_can_be_longer_than_half_the_loop() -> None:
+    decoder = make_decoder(return_xyz=False)
+    dtype = torch.float64
+    cad_domain = {
+        "boundary_curve_uv": torch.tensor(
+            [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]],
+            dtype=dtype,
+        ),
+        "boundary_curve_offsets": torch.tensor([0, 2, 3, 4, 5], dtype=torch.long),
+        "boundary_curve_loop_id": torch.zeros((4,), dtype=torch.long),
+    }
+    nodes = torch.tensor([[0.0, 0.0], [1.0, 0.25]], dtype=dtype)
+    graph = make_shell_graph(decoder, nodes, cad_domain)
+    curves = decoder.sample_graph_edge_curves_uv(nodes, graph, n_samples=97)
+    lengths = torch.sort(torch.stack([uv_curve_length(curve) for curve in curves])).values
+
+    assert torch.allclose(lengths, torch.tensor([1.25, 2.75], dtype=dtype), atol=4e-3)
+
+
+def test_one_node_smooth_closed_loop_produces_complete_shell_path() -> None:
+    decoder = make_decoder(return_xyz=False)
+    dtype = torch.float64
+    theta = torch.linspace(0.0, 2.0 * torch.pi, 129, dtype=dtype)
+    boundary_uv = torch.stack((0.5 + 0.35 * torch.cos(theta), 0.5 + 0.35 * torch.sin(theta)), dim=1)
+    cad_domain = {
+        "boundary_curve_uv": boundary_uv,
+        "boundary_curve_offsets": torch.tensor([0, boundary_uv.shape[0]], dtype=torch.long),
+        "boundary_curve_loop_id": torch.zeros((1,), dtype=torch.long),
+    }
+    nodes = boundary_uv[:1].clone()
+    graph = make_shell_graph(decoder, nodes, cad_domain)
+    curves = decoder.sample_graph_edge_curves_uv(nodes, graph, n_samples=129)
+
+    assert graph["edge_index"].shape == (1, 2)
+    assert int(graph["edge_index"][0, 0]) == int(graph["edge_index"][0, 1])
+    assert int(graph["boundary_path_is_full_loop"][0]) == 1
+    assert torch.allclose(
+        uv_curve_length(curves[0]),
+        torch.tensor(2.0 * torch.pi * 0.35, dtype=dtype),
+        atol=2e-2,
+    )
+
+
+def test_exterior_and_interior_boundary_loops_are_covered_independently() -> None:
+    decoder = make_decoder(return_xyz=False)
+    dtype = torch.float64
+    outer = torch.tensor(
+        [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]],
+        dtype=dtype,
+    )
+    inner = torch.tensor(
+        [[0.3, 0.3], [0.7, 0.3], [0.7, 0.7], [0.3, 0.7], [0.3, 0.3]],
+        dtype=dtype,
+    )
+    cad_domain = {
+        "boundary_curve_uv": torch.cat((outer, inner), dim=0),
+        "boundary_curve_offsets": torch.tensor([0, 2, 3, 4, 5, 7, 8, 9, 10], dtype=torch.long),
+        "boundary_curve_loop_id": torch.tensor([0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.long),
+    }
+    nodes = torch.cat((outer[:-1], inner[:-1]), dim=0)
+    graph = make_shell_graph(decoder, nodes, cad_domain)
+    curves = decoder.sample_graph_edge_curves_uv(nodes, graph, n_samples=33)
+    lengths = torch.stack([uv_curve_length(curve) for curve in curves])
+
+    outer_total = lengths[graph["boundary_path_loop_id"] == 0].sum()
+    inner_total = lengths[graph["boundary_path_loop_id"] == 1].sum()
+    assert graph["edge_index"].shape[0] == 8
+    assert torch.allclose(outer_total, torch.tensor(4.0, dtype=dtype), atol=2e-3)
+    assert torch.allclose(inner_total, torch.tensor(1.6, dtype=dtype), atol=2e-3)
+
+
+def test_shell_path_endpoint_projection_has_finite_gradients() -> None:
+    decoder = make_decoder(return_xyz=False)
+    dtype = torch.float64
+    cad_domain = {
+        "boundary_curve_uv": torch.tensor(
+            [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]],
+            dtype=dtype,
+        ),
+        "boundary_curve_offsets": torch.tensor([0, 2, 3, 4, 5], dtype=torch.long),
+        "boundary_curve_loop_id": torch.zeros((4,), dtype=torch.long),
+    }
+    nodes = torch.tensor([[0.0, 0.2], [0.7, 0.0]], dtype=dtype, requires_grad=True)
+    graph = make_shell_graph(decoder, nodes, cad_domain)
+    curves = decoder.sample_graph_edge_curves_uv(nodes, graph, n_samples=41)
+    loss = curves.square().sum()
+    loss.backward()
+
+    assert nodes.grad is not None
+    assert torch.isfinite(nodes.grad).all()
+
+
 def test_scipy_shell_curves_stay_on_uv_box() -> None:
     seeds = irregular_test_seeds().requires_grad_(True)
     decoder = ContinuousVoronoiDecoder(return_xyz=False)
@@ -1573,6 +1782,118 @@ def test_init_face_seed_can_use_seeded_random_points() -> None:
     seeds = trainer._init_face_seed(face_tensor)
 
     assert torch.equal(seeds, face_tensor["uv"][expected_idx])
+
+
+def test_init_face_seed_can_warm_start_and_prune_inactive_seeds(tmp_path) -> None:
+    path = tmp_path / "optimized_shell_function.pt"
+    saved_seeds = torch.tensor(
+        [
+            [0.10, 0.20],
+            [1.20, 0.30],
+            [0.60, 0.70],
+        ],
+        dtype=torch.float64,
+    )
+    torch.save(
+        {
+            "package_type": "OptimizedShellFunction",
+            "best_pred": {
+                "seeds_raw": saved_seeds,
+                "seed_visual_inactive_mask": torch.tensor([False, True, False]),
+            },
+        },
+        path,
+    )
+
+    trainer = NN_Trainer.__new__(NN_Trainer)
+    trainer.cfg = TrainingConfig(
+        seed_number=99,
+        warm_start_optimized_function_path=str(path),
+        warm_start_prune_inactive_seeds=True,
+    )
+    trainer.generator = object()
+    trainer._true_open_boundary_idx = lambda face_tensor: torch.empty(0, dtype=torch.long)
+
+    face_tensor = {
+        "uv": torch.zeros((5, 2), dtype=torch.float32),
+        "points_xyz": torch.zeros((5, 3), dtype=torch.float32),
+    }
+
+    seeds = trainer._init_face_seed(face_tensor)
+
+    assert torch.equal(seeds, saved_seeds[[0, 2]].to(dtype=torch.float32))
+    assert trainer.cfg.seed_number == 2
+
+
+def test_warm_start_skip_stage1_uses_stage2_only(tmp_path) -> None:
+    path = tmp_path / "optimized_shell_function.pt"
+    torch.save(
+        {
+            "package_type": "OptimizedShellFunction",
+            "best_pred": {
+                "seeds_raw": torch.tensor([[0.25, 0.25], [0.75, 0.75]]),
+            },
+        },
+        path,
+    )
+
+    trainer = NN_Trainer.__new__(NN_Trainer)
+    trainer.cfg = TrainingConfig(warm_start_optimized_function_path=str(path))
+
+    assert [spec.stage_id for spec in trainer._adaptive_stage_specs()] == [2]
+
+
+def test_evaluate_loaded_final_shell_returns_saved_graph_curve_metrics() -> None:
+    from Training.MainTrain import evaluate_optimized_shell_function
+
+    density = torch.tensor([0.2, 0.8], dtype=torch.float64)
+    fiber = torch.tensor(
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=torch.float64,
+    )
+    edge_curves_xyz = torch.tensor(
+        [
+            [[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [0.0, 4.0, 0.0]],
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 5.0]],
+        ],
+        dtype=torch.float64,
+    )
+    graph = {
+        "edge_type": torch.tensor(
+            [
+                main_train.EDGE_INTERIOR_VORONOI,
+                main_train.EDGE_DOMAIN_SHELL,
+                main_train.EDGE_CLIPPED_ONE_SIDE,
+            ],
+            dtype=torch.long,
+        )
+    }
+    optimized_function = type("LoadedFinalShell", (), {})()
+    optimized_function.face_tensor = None
+    optimized_function.final_shape_density = density
+    optimized_function.final_shape_fiber_direction = fiber
+    optimized_function.best_pred = {
+        "seeds_uv": torch.tensor([[0.25, 0.25]], dtype=torch.float64),
+        "edge_curves_xyz": edge_curves_xyz,
+        "graph": graph,
+    }
+
+    fields = evaluate_optimized_shell_function(optimized_function)
+
+    assert fields["decoder_output"] is optimized_function.best_pred
+    assert fields["graph"] is graph
+    assert torch.equal(fields["edge_curves_xyz"], edge_curves_xyz)
+    assert torch.allclose(
+        fields["edge_curve_lengths_xyz"],
+        torch.tensor([3.0, 4.0, 5.0], dtype=torch.float64),
+    )
+    assert torch.allclose(fields["total_curve_length"], torch.tensor(12.0, dtype=torch.float64))
+    assert torch.allclose(
+        fields["total_voronoi_curve_length"],
+        torch.tensor(8.0, dtype=torch.float64),
+    )
+    assert graph["total_curve_length"] is fields["total_curve_length"]
 
 
 if __name__ == "__main__":

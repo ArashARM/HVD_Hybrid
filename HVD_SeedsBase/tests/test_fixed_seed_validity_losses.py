@@ -4,6 +4,7 @@ from Training.FEMControl import checkpoint_feasibility_key
 from Training.Loss_SeedValidity import (
     minimum_seed_spacing_loss,
     seed_trim_boundary_loss,
+    seed_separation_loss,
     signed_trim_boundary_distance,
 )
 
@@ -41,6 +42,35 @@ def test_spacing_gradient_separates_close_pair():
     assert torch.isfinite(seeds.grad).all()
     assert seeds.grad[0, 0] > 0.0
     assert seeds.grad[1, 0] < 0.0
+
+
+def test_seed_separation_ignores_invalid_seed_pairs():
+    seeds = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [0.1, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+        ],
+        dtype=torch.float64,
+    )
+    valid = torch.tensor([True, False, True])
+
+    unmasked = seed_separation_loss(
+        seeds,
+        min_seed_spacing=1.0,
+        aggregate_temperature=1.0e-4,
+        repulsion_weight=0.0,
+    )
+    masked = seed_separation_loss(
+        seeds,
+        min_seed_spacing=1.0,
+        valid_seed_mask=valid,
+        aggregate_temperature=1.0e-4,
+        repulsion_weight=0.0,
+    )
+
+    assert unmasked.item() > 0.0
+    assert masked.item() == 0.0
 
 
 def test_trim_boundary_loss_outer_and_inner_hole():

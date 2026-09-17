@@ -33,6 +33,8 @@ def checkpoint_feasibility_key(
     total_loss_is_finite: bool,
     fem_is_valid: bool,
     global_step: int | float = 0,
+    optimization_mode: str = "constrained_displacement",
+    target_length_feasible: bool = True,
 ) -> tuple[bool, tuple[float, float, float]]:
     displacement_ratio = float(physical_displacement_ratio)
     stress_ratio = float(physical_stress_ratio)
@@ -71,6 +73,9 @@ def checkpoint_feasibility_key(
         if physical_feasible is not None
         else physical_max_ratio <= 1.0
     )
+    mode_name = str(optimization_mode).strip().lower()
+    if mode_name == "constrained_displacment":
+        mode_name = "constrained_displacement"
     feasible = (
         bool(fem_is_valid)
         and bool(total_loss_is_finite)
@@ -81,8 +86,14 @@ def checkpoint_feasibility_key(
         and step_is_finite
         and physical_ok
         and bool(seed_spacing_feasible)
+        and (
+            mode_name != "target_length_constrained_displacement"
+            or bool(target_length_feasible)
+        )
     )
     if feasible:
+        if mode_name == "target_length_constrained_displacement":
+            return True, (displacement_ratio, score, step)
         return True, (score, fiber_length, step)
 
     violation_score = (

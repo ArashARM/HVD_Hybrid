@@ -675,9 +675,15 @@ class CADTensorGenerator:
         else:
             uv_np = np.empty((0, 2), dtype=np.float64)
             arclength_np = np.empty((0,), dtype=np.float64)
+        if uv_np.shape[0] > 0:
+            evaluated = self.eval_uv_norm(uv_np, return_inside_mask=False)
+            xyz_np = evaluated["xyz"].detach().cpu().numpy().astype(np.float64, copy=False)
+        else:
+            xyz_np = np.empty((0, 3), dtype=np.float64)
 
         data_np = {
             "boundary_curve_uv": uv_np,
+            "boundary_curve_xyz": xyz_np,
             "boundary_curve_arclength": arclength_np,
             "boundary_curve_offsets": np.asarray(offsets, dtype=np.int64),
             "boundary_curve_loop_id": np.asarray(loop_ids, dtype=np.int64),
@@ -693,6 +699,7 @@ class CADTensorGenerator:
 
         data_t = {
             "boundary_curve_uv": torch.as_tensor(data_np["boundary_curve_uv"], dtype=torch.float32, device=self.device),
+            "boundary_curve_xyz": torch.as_tensor(data_np["boundary_curve_xyz"], dtype=torch.float32, device=self.device),
             "boundary_curve_arclength": torch.as_tensor(data_np["boundary_curve_arclength"], dtype=torch.float32, device=self.device),
             "boundary_curve_offsets": torch.as_tensor(data_np["boundary_curve_offsets"], dtype=torch.long, device=self.device),
             "boundary_curve_loop_id": torch.as_tensor(data_np["boundary_curve_loop_id"], dtype=torch.long, device=self.device),

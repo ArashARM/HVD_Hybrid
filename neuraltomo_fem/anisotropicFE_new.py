@@ -4,6 +4,9 @@ import warnings
 import numpy as np
 import torch
 
+VOIGT_PAIRS = ((0, 0), (1, 1), (2, 2), (1, 2), (0, 2), (0, 1))
+
+
 def _unit_checked_material(kwargs):
     length_unit = kwargs.get("length_unit", "mm")
     force_unit = kwargs.get("force_unit", "N")
@@ -14,6 +17,89 @@ def _unit_checked_material(kwargs):
             f"Got {(length_unit, force_unit, stress_unit)}."
         )
 
+
+def _normalize(vector, eps=1.0e-12):
+    return vector / torch.linalg.norm(vector, dim=-1, keepdim=True).clamp_min(eps)
+
+
+def orientation_frame_from_fiber(fiber, a3_reference=None, eps=1.0e-12):
+    """Return a right-handed local-to-global frame with columns [a1, a2, a3]."""
+    a1 = _normalize(fiber, eps=eps)
+    if a3_reference is None:
+        basis = torch.eye(3, dtype=a1.dtype, device=a1.device)
+        alignment = torch.abs(torch.einsum("...i,ji->...j", a1, basis))
+        ref_ids = torch.argmin(alignment, dim=-1)
+        a3_reference = basis[ref_ids]
+    else:
+        a3_reference = _normalize(a3_reference.to(device=a1.device, dtype=a1.dtype), eps=eps)
+
+    a2_raw = torch.cross(a3_reference, a1, dim=-1)
+    a2_norm = torch.linalg.norm(a2_raw, dim=-1, keepdim=True)
+    if bool(torch.any(a2_norm <= eps).detach().cpu().item()):
+        basis = torch.eye(3, dtype=a1.dtype, device=a1.device)
+        alignment = torch.abs(torch.einsum("...i,ji->...j", a1, basis))
+        fallback_ref = basis[torch.argmin(alignment, dim=-1)]
+        fallback_a2 = torch.cross(fallback_ref, a1, dim=-1)
+        a2_raw = torch.where(a2_norm > eps, a2_raw, fallback_a2)
+    a2 = _normalize(a2_raw, eps=eps)
+    a3 = _normalize(torch.cross(a1, a2, dim=-1), eps=eps)
+    return torch.stack((a1, a2, a3), dim=-1)
+
+
+def orientation_frame_from_angles(phi, theta, a3_reference=None, eps=1.0e-12):
+    phi, theta = torch.broadcast_tensors(phi, theta)
+    fiber = torch.stack(
+        (
+            torch.sin(theta) * torch.cos(phi),
+            torch.sin(theta) * torch.sin(phi),
+            torch.cos(theta),
+        ),
+        dim=-1,
+    )
+    if a3_reference is None:
+        z_ref = torch.zeros(phi.shape + (3,), dtype=fiber.dtype, device=fiber.device)
+        z_ref[..., 2] = 1.0
+        a3_reference = z_ref
+    return orientation_frame_from_fiber(fiber, a3_reference=a3_reference, eps=eps)
+
+
+def engineering_stiffness_to_tensor(C6):
+    C4 = C6.new_zeros(C6.shape[:-2] + (3, 3, 3, 3))
+    for row, (i, j) in enumerate(VOIGT_PAIRS):
+        row_pairs = {(i, j), (j, i)}
+        for col, (k, l) in enumerate(VOIGT_PAIRS):
+            for ii, jj in row_pairs:
+                for kk, ll in {(k, l), (l, k)}:
+                    C4[..., ii, jj, kk, ll] = C6[..., row, col]
+    return C4
+
+
+def tensor_to_engineering_stiffness(C4):
+    rows = []
+    for i, j in VOIGT_PAIRS:
+        cols = []
+        for k, l in VOIGT_PAIRS:
+            cols.append(C4[..., i, j, k, l])
+        rows.append(torch.stack(cols, dim=-1))
+    return torch.stack(rows, dim=-2)
+
+
+def rotate_engineering_stiffness(C_local, orientation_matrix):
+    """Rotate a local engineering-strain stiffness matrix into global axes."""
+    Q = orientation_matrix
+    C4_local = engineering_stiffness_to_tensor(C_local)
+    C4_global = torch.einsum(
+        "...ip,...jq,...kr,...ls,...pqrs->...ijkl",
+        Q,
+        Q,
+        Q,
+        Q,
+        C4_local,
+    )
+    C_global = tensor_to_engineering_stiffness(C4_global)
+    return 0.5 * (C_global + C_global.transpose(-1, -2))
+
+
 class H8_isotropic_K:
     pass
 
@@ -21,7 +107,6 @@ class H8_anisotropic_K:
     def __init__(self, device=torch.device('cuda'), **kwargs):
         _unit_checked_material(kwargs)
         # for const number
-        _sqrt_3_5 = math.sqrt(3 / 5)
         if any(k in kwargs for k in ("Ef", "Et", "nuf", "nut")):
             warnings.warn(
                 "Legacy material keys Ef/Et/nuf/nut are mapped to explicit "
@@ -117,27 +202,63 @@ class H8_anisotropic_K:
             raise ValueError("Orthotropic constitutive matrix is not mechanically admissible.")
         self.C_inv = torch.tensor(self.C_inv_np, dtype=torch.float32, device=device)
 
-        # 3 - point Gauss integration
-        integration_point = torch.tensor([-_sqrt_3_5, 0, _sqrt_3_5],
-                                         dtype=torch.float32) / 2
-        integration_weight = torch.tensor([5 / 9, 8 / 9, 5 / 9],
-                                          dtype=torch.float32) / 2
+        # Abaqus-compatible C3D8 full integration: eight Gauss points.
+        # ``physical_B`` uses half-parent coordinates in [-0.5, 0.5], so the
+        # canonical +/-1/sqrt(3) parent coordinates are divided by two here.
+        parent_gp = 1.0 / math.sqrt(3.0)
+        self.gauss_points_parent = torch.tensor(
+            [
+                [-parent_gp, -parent_gp, -parent_gp],  # IP 1
+                [ parent_gp, -parent_gp, -parent_gp],  # IP 2
+                [-parent_gp,  parent_gp, -parent_gp],  # IP 3
+                [ parent_gp,  parent_gp, -parent_gp],  # IP 4
+                [-parent_gp, -parent_gp,  parent_gp],  # IP 5
+                [ parent_gp, -parent_gp,  parent_gp],  # IP 6
+                [-parent_gp,  parent_gp,  parent_gp],  # IP 7
+                [ parent_gp,  parent_gp,  parent_gp],  # IP 8
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
+        self.gauss_points = 0.5 * self.gauss_points_parent
+        self.int_weight = torch.full((8,), 1.0 / 8.0, dtype=torch.float32, device=device)
 
-        all_intergration_points = np.vstack(
-            np.meshgrid(integration_point, integration_point, integration_point)).reshape(3, -1).T
+        # B-matrices at all integration points.
+        B_gauss = self.physical_B(self.gauss_points, device=device)
 
-        all_intergration_weight_temp = np.vstack(
-            np.meshgrid(integration_weight, integration_weight, integration_weight)).reshape(3, -1).T
+        # B-matrix at the element centroid
+        self.NodeB = self.physical_B(
+            np.array([[0.0, 0.0, 0.0]]),
+            device=device,
+        )[0]
 
-        int_weight = all_intergration_weight_temp[:, 0] * \
-                     all_intergration_weight_temp[:, 1] * \
-                     all_intergration_weight_temp[:, 2]
-        self.int_weight = torch.tensor(int_weight, device=device)
+        # --------------------------------------------------------
+        # Mean-dilatation B-bar formulation
+        # Matches Abaqus C3D8 selective volumetric integration.
+        # --------------------------------------------------------
 
-        # B = np.einsum('i,ijk->ijk', all_intergration_weight, self.matrixB(all_intergration_points))
-        # [x,y,z,zy,zx,yx]
-        self.B = self.physical_B(all_intergration_points, device=device)
-        self.NodeB = self.physical_B(np.array([[0.0, 0.0, 0.0]]), device=device)[0]
+        volumetric_gauss = (
+            B_gauss[:, 0, :]
+            + B_gauss[:, 1, :]
+            + B_gauss[:, 2, :]
+        )
+
+        volumetric_centroid = (
+            self.NodeB[0, :]
+            + self.NodeB[1, :]
+            + self.NodeB[2, :]
+        )
+
+        volumetric_correction = (
+            volumetric_centroid.unsqueeze(0)
+            - volumetric_gauss
+        ) / 3.0
+
+        self.B = B_gauss.clone()
+
+        self.B[:, 0, :] += volumetric_correction
+        self.B[:, 1, :] += volumetric_correction
+        self.B[:, 2, :] += volumetric_correction
 
     def physical_B(self, xyz, device=None):
         device = self.C_inv.device if device is None else device
@@ -203,45 +324,17 @@ class H8_anisotropic_K:
         return np.stack(b, -1).reshape((xyz.shape[0], 6, 24))
 
     def angle2Ke(self, phi, theta, stiffness_factor, density_penal=1.0):
-        # Input convention:
-        # phi   = azimuth = atan2(y, x)
-        # theta = polar angle = acos(z)
-        #
-        # The transformation expressions below use:
-        # T = azimuth
-        # P = elevation = pi/2 - polar angle.
-        cosT = torch.cos(phi)
-        sinT = torch.sin(phi)
-        cosT2 = cosT * cosT
-        sinT2 = sinT * sinT
+        Q = orientation_frame_from_angles(phi, theta)
+        return self.orientation2Ke(Q, stiffness_factor, density_penal=density_penal)
 
-        cosP = torch.sin(theta)  # cos(pi/2 - theta)
-        sinP = torch.cos(theta)  # sin(pi/2 - theta)
-        cosP2 = cosP * cosP
-        sinP2 = sinP * sinP
-
-        o = torch.zeros_like(phi) # 0-vector
-
-        R = torch.stack((
-            cosP2 * cosT2, cosP2 * sinT2, sinP2, 2 * cosP * sinP * sinT, -2 * cosP * cosT * sinP, -2 * cosP2 * cosT * sinT,
-            sinT2, cosT2, o, o, o, 2 * cosT * sinT,
-            cosT2 * sinP2, sinP2 * sinT2, cosP2, -2 * cosP * sinP * sinT, 2 * cosP * cosT * sinP,
-            -2 * cosT * sinP2 * sinT,
-            cosT * sinP * sinT, -cosT * sinP * sinT, o, cosP * cosT, cosP * sinT, sinP * (cosT2 - sinT2),
-            cosP * cosT2 * sinP, cosP * sinP * sinT2, -cosP * sinP, -sinT * (cosP2 - sinP2),
-            cosT * (cosP2 - sinP2), -2 * cosP * cosT * sinP * sinT,
-            cosP * cosT * sinT, -cosP * cosT * sinT, o, -cosT * sinP, -sinP * sinT, cosP * (cosT2 - sinT2)
-        ), -1).reshape(phi.shape + (6, 6))
-
-        # C_inv 6x6
-        # C = R @ self.C_inv.unsqueeze(0).expand(batch_size, -1, -1) @ R.transpose(1, 2)
-
-        C = torch.einsum('bij,jk,blk->bil', R, self.C_inv, R)
-        #C_new = torch.einsum('bji,bjk->bik', R, C)
+    def orientation2Ke(self, orientation_matrix, stiffness_factor, density_penal=1.0):
+        Q = orientation_matrix.to(device=stiffness_factor.device, dtype=stiffness_factor.dtype)
+        C_local = self.C_inv.to(device=stiffness_factor.device, dtype=stiffness_factor.dtype)
+        C = rotate_engineering_stiffness(C_local.expand(Q.shape[:-2] + (6, 6)), Q)
 
         # self.B 27x6x24, C nx6x6
-        B = self.B
-        weight = self.int_weight
+        B = self.B.to(device=stiffness_factor.device, dtype=stiffness_factor.dtype)
+        weight = self.int_weight.to(device=stiffness_factor.device, dtype=stiffness_factor.dtype)
         # BT = B.transpose(1, 2)
 
         detJ = self.element_size[0] * self.element_size[1] * self.element_size[2]
@@ -250,7 +343,11 @@ class H8_anisotropic_K:
         # and the minimum stiffness ratio. Do not apply either again.
         dK = torch.einsum('i,ijk->ijk', stiffness_factor, BT_C_B)
         self.temp_C = C
-        self.T = R
+        self.orientation_matrix = Q
+        self.orientation_axis_1 = Q[..., :, 0]
+        self.orientation_axis_2 = Q[..., :, 1]
+        self.orientation_axis_3 = Q[..., :, 2]
+        self.T = Q
         return dK
 
 

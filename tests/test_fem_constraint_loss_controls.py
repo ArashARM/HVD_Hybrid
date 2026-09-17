@@ -1,4 +1,5 @@
 import torch
+import pytest
 from types import SimpleNamespace
 
 from Training.FEMControl import (
@@ -34,14 +35,75 @@ class _DummyFEM:
             displacement_load_dir_loaded_boundary=None,
         )
 
-    def __call__(self, stiffness_factor, phi, theta, penal=1.0):
+    def __call__(
+        self,
+        stiffness_factor,
+        phi,
+        theta,
+        penal=1.0,
+        orientation_matrix=None,
+    ):
         self.fe.stress_vm = stiffness_factor * self.stress_scale
         if self.displacement_mag_scale is not None:
-            self.fe.displacement_mag_elem = stiffness_factor * float(self.displacement_mag_scale)
-            self.fe.displacement_mag_loaded_boundary = self.fe.displacement_mag_elem
-        self.fe.displacement_load_dir_elem = stiffness_factor * self.displacement_scale
-        self.fe.displacement_load_dir_loaded_boundary = self.fe.displacement_load_dir_elem
+            self.fe.displacement_mag_elem = (
+                stiffness_factor * float(self.displacement_mag_scale)
+            )
+            self.fe.displacement_mag_loaded_boundary = (
+                self.fe.displacement_mag_elem
+            )
+
+        self.fe.displacement_load_dir_elem = (
+            stiffness_factor * self.displacement_scale
+        )
+        self.fe.displacement_load_dir_loaded_boundary = (
+            self.fe.displacement_load_dir_elem
+        )
         return self.fe.stress_vm, self.fe.stress_vm.sum()
+
+
+class _DummyIntegrationPointFEM:
+    def __init__(self, stress_vm_ip_active: torch.Tensor):
+        self.stress_vm_ip_active = stress_vm_ip_active
+        self.fe = SimpleNamespace(
+            stress_vm_ip_active=None,
+            stress_vm_element_max=None,
+            displacement_mag_elem=None,
+            displacement_load_dir_elem=None,
+            displacement_mag_loaded_boundary=None,
+            displacement_load_dir_loaded_boundary=None,
+        )
+
+    def __call__(
+            self,
+            stiffness_factor,
+            phi,
+            theta,
+            penal=1.0,
+            orientation_matrix=None,
+        ):
+            stress = self.stress_vm_ip_active.to(
+                device=stiffness_factor.device,
+                dtype=stiffness_factor.dtype,
+            )
+            scale = stiffness_factor.reshape(-1).mean() * 0.0 + 1.0
+
+            self.fe.stress_vm_ip_active = stress * scale
+            self.fe.stress_vm_element_max = (
+                self.fe.stress_vm_ip_active.amax(dim=1)
+            )
+            self.fe.displacement_mag_elem = torch.zeros_like(
+                stiffness_factor.reshape(-1)
+            )
+            self.fe.displacement_load_dir_elem = self.fe.displacement_mag_elem
+            self.fe.displacement_mag_loaded_boundary = self.fe.displacement_mag_elem
+            self.fe.displacement_load_dir_loaded_boundary = (
+                self.fe.displacement_mag_elem
+            )
+
+            return (
+                self.fe.stress_vm_ip_active,
+                self.fe.stress_vm_ip_active.sum(),
+            )
 
 
 def _dummy_trainer(stress_scale: float, displacement_scale: float, displacement_mag_scale: float | None = None):
@@ -49,6 +111,21 @@ def _dummy_trainer(stress_scale: float, displacement_scale: float, displacement_
     trainer.cfg = SimpleNamespace(fem_training_safety_factor=0.95)
     trainer.shell_problem = _DummyShellProblem()
     trainer.fem = _DummyFEM(stress_scale, displacement_scale, displacement_mag_scale)
+    trainer.fem_debug_history = []
+    trainer.last_fem_debug = None
+    trainer._record_invalid_fem_debug = lambda debug, reason, save: None
+    return trainer
+
+
+def _dummy_ip_trainer(stress_vm_ip_active: torch.Tensor):
+    trainer = SimpleNamespace()
+    trainer.cfg = SimpleNamespace(
+        fem_training_safety_factor=0.95,
+        fem_constraint_p_norm=12.0,
+        fem_stress_constraint_mode="hard_max",
+    )
+    trainer.shell_problem = _DummyShellProblem()
+    trainer.fem = _DummyIntegrationPointFEM(stress_vm_ip_active)
     trainer.fem_debug_history = []
     trainer.last_fem_debug = None
     trainer._record_invalid_fem_debug = lambda debug, reason, save: None
@@ -134,11 +211,116 @@ def test_fem_safety_margin_is_advisory_below_physical_limit():
 
     assert out["physical_feasible"]
     assert out["constraint_violation"].item() == 0.0
+    assert out["safety_margin_fem_loss"].item() > 0.0
+    assert out["hard_violation_fem_loss"].item() == 0.0
     assert out["stress_margin_loss"].item() > 0.0
     assert out["stress_violation_loss"].item() == 0.0
-    assert out["violation_fem_loss"].item() > 0.0
-    assert out["violation_fem_loss"].item() < 1.0e-3
+    assert out["violation_fem_loss"].item() == 0.0
 
+
+def test_fem_safety_margin_caps_at_physical_limit_and_hard_loss_is_separate():
+    fiber = torch.ones(4, 3, dtype=torch.float64)
+    margin_weight = 10.0
+    safety_factor = 0.7
+
+    near_limit_trainer = _dummy_trainer(stress_scale=10.0, displacement_scale=0.0)
+    near_limit_trainer.cfg.fem_training_safety_factor = safety_factor
+    near_limit_trainer.cfg.fem_safety_margin_weight = margin_weight
+    over_limit_trainer = _dummy_trainer(stress_scale=15.0, displacement_scale=0.0)
+    over_limit_trainer.cfg.fem_training_safety_factor = safety_factor
+    over_limit_trainer.cfg.fem_safety_margin_weight = margin_weight
+
+    near_out = Loss_FEM(near_limit_trainer).evaluate(
+        rho_surface=torch.ones(4, dtype=torch.float64, requires_grad=True),
+        fiber_surface=fiber,
+        max_displacement=10.0,
+        yield_strength=10.0,
+        constraint_weight=1000.0,
+        baseline_weight=0.0,
+        violation_power=2.0,
+        stress_density_threshold=None,
+    )
+    over_out = Loss_FEM(over_limit_trainer).evaluate(
+        rho_surface=torch.ones(4, dtype=torch.float64, requires_grad=True),
+        fiber_surface=fiber,
+        max_displacement=10.0,
+        yield_strength=10.0,
+        constraint_weight=1000.0,
+        baseline_weight=0.0,
+        violation_power=2.0,
+        stress_density_threshold=None,
+    )
+
+    expected_margin = margin_weight * (1.0 - safety_factor) ** 2
+    assert near_out["stress_margin_excess"].item() == pytest.approx(1.0 - safety_factor)
+    assert over_out["stress_margin_excess"].item() == pytest.approx(1.0 - safety_factor)
+    assert near_out["safety_margin_fem_loss"].item() == pytest.approx(expected_margin)
+    assert over_out["safety_margin_fem_loss"].item() == pytest.approx(expected_margin)
+    assert near_out["violation_fem_loss"].item() == pytest.approx(0.0)
+    assert over_out["violation_fem_loss"].item() == pytest.approx(1000.0 * 0.5**2)
+
+def test_fem_total_reconstructs_from_separate_components():
+    trainer = _dummy_trainer(
+        stress_scale=10.5,
+        displacement_scale=0.0,
+    )
+    trainer.cfg.fem_training_safety_factor = 0.9
+    trainer.cfg.fem_safety_margin_weight = 10.0
+    trainer.cfg.fem_constraint_p_norm = 12.0
+
+    rho = torch.ones(
+        4,
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    fiber = torch.ones(4, 3, dtype=torch.float64)
+
+    constraint_weight = 1000.0
+
+    out = Loss_FEM(trainer).evaluate(
+        rho_surface=rho,
+        fiber_surface=fiber,
+        max_displacement=10.0,
+        yield_strength=10.0,
+        constraint_weight=constraint_weight,
+        baseline_weight=0.001,
+        violation_power=2.0,
+        stress_density_threshold=None,
+    )
+
+    expected_total = (
+        out["baseline_fem_loss"]
+        + out["safety_margin_fem_loss"]
+        + out["hard_violation_fem_loss"]
+    )
+
+    assert out["fem_total"].item() == pytest.approx(
+        expected_total.item()
+    )
+
+    assert out["violation_fem_loss"].item() == pytest.approx(
+        out["hard_violation_fem_loss"].item()
+    )
+
+    expected_stress_constraint = (
+        out["stress_margin_loss"]
+        + constraint_weight
+        * out["stress_hard_violation_loss"]
+    )
+
+    expected_displacement_constraint = (
+        out["displacement_margin_loss"]
+        + constraint_weight
+        * out["displacement_hard_violation_loss"]
+    )
+
+    assert out["stress_constraint_loss"].item() == pytest.approx(
+        expected_stress_constraint.item()
+    )
+
+    assert out["displacement_constraint_loss"].item() == pytest.approx(
+        expected_displacement_constraint.item()
+    )
 
 def test_fem_displacement_constraint_prefers_magnitude_over_load_direction():
     trainer = _dummy_trainer(
@@ -198,7 +380,62 @@ def test_fem_violation_loss_uses_physical_max_not_diluted_p_norm():
     assert out["displacement_violation_loss"].item() > 0.0
     assert out["violation_fem_loss"].item() > 100.0
 
+def test_capped_margin_gradient_inside_margin_region():
+    ratio = torch.tensor(
+        0.95,
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    safety_factor = 0.9
 
+    margin_excess = (
+        torch.relu(ratio - safety_factor)
+        - torch.relu(ratio - 1.0)
+    )
+
+    margin_loss = 10.0 * margin_excess.pow(2.0)
+    margin_loss.backward()
+
+    assert margin_excess.item() == pytest.approx(0.05)
+    assert ratio.grad is not None
+    assert torch.isfinite(ratio.grad)
+    assert ratio.grad.item() > 0.0
+def test_capped_margin_gradient_is_zero_above_physical_limit():
+    ratio = torch.tensor(
+        1.20,
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    safety_factor = 0.9
+
+    margin_excess = (
+        torch.relu(ratio - safety_factor)
+        - torch.relu(ratio - 1.0)
+    )
+
+    margin_loss = 10.0 * margin_excess.pow(2.0)
+    margin_loss.backward()
+
+    assert margin_excess.item() == pytest.approx(0.1)
+    assert ratio.grad is not None
+    assert torch.isfinite(ratio.grad)
+    assert ratio.grad.item() == pytest.approx(0.0)
+
+def test_hard_violation_gradient_is_nonzero_above_limit():
+    ratio = torch.tensor(
+        1.20,
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+
+    hard_excess = torch.relu(ratio - 1.0)
+    hard_loss = 1000.0 * hard_excess.pow(2.0)
+    hard_loss.backward()
+
+    assert hard_excess.item() == pytest.approx(0.2)
+    assert ratio.grad is not None
+    assert torch.isfinite(ratio.grad)
+    assert ratio.grad.item() > 0.0
 def test_constraint_excess_is_zero_inside_limit_and_ratio_based():
     reference = torch.ones((), requires_grad=True)
     value = reference * 12.0
@@ -266,6 +503,58 @@ def test_physical_b_matrix_scales_by_derivative_direction():
     assert torch.allclose(B[5, 0], B.new_tensor(-0.125))  # du/dy uses 1 / hy.
     assert torch.allclose(B[5, 1], B.new_tensor(-0.25))   # dv/dx uses 1 / hx.
     assert torch.allclose(B[4, 0], B.new_tensor(-0.0625)) # du/dz uses 1 / hz.
+
+
+def test_h8_full_integration_exposes_eight_gauss_points():
+    h8 = H8_anisotropic_K(
+        device=torch.device("cpu"),
+        element_size=(1.0, 2.0, 4.0),
+        material_E1=100.0,
+        material_E2=10.0,
+        material_E3=10.0,
+        material_nu12=0.25,
+        material_nu23=0.25,
+        material_nu13=0.25,
+        material_G12=5.0,
+        material_G23=4.0,
+        material_G13=5.0,
+    )
+
+    assert h8.B.shape == (8, 6, 24)
+    assert h8.int_weight.shape == (8,)
+    assert torch.allclose(h8.int_weight.sum(), h8.int_weight.new_tensor(1.0))
+    assert torch.allclose(
+        h8.gauss_points_parent.abs().unique(),
+        h8.gauss_points_parent.new_tensor([1.0 / (3.0 ** 0.5)]),
+    )
+
+
+def test_integration_point_hard_max_governs_when_mean_p_norm_is_diluted():
+    stress_ip = torch.zeros(512, 8, dtype=torch.float64)
+    stress_ip[0, 0] = 12.0
+    trainer = _dummy_ip_trainer(stress_ip)
+    loss_fn = Loss_FEM(trainer)
+    rho = torch.ones(512, dtype=torch.float64, requires_grad=True)
+    fiber = torch.ones(512, 3, dtype=torch.float64)
+
+    out = loss_fn.evaluate(
+        rho_surface=rho,
+        fiber_surface=fiber,
+        max_displacement=10.0,
+        yield_strength=10.0,
+        baseline_weight=0.0,
+        violation_power=2.0,
+        stress_density_threshold=None,
+    )
+
+    assert torch.allclose(out["stress_max"], out["stress_max"].new_tensor(12.0))
+    assert torch.allclose(
+        out["stress_ratio_max_ip"],
+        out["stress_ratio_max_ip"].new_tensor(1.2),
+    )
+    assert out["stress_p_norm_mean_diagnostic"].item() < 10.0
+    assert not out["physical_feasible"]
+    assert out["stress_violation_loss"].item() > 0.0
 
 
 def test_invalid_fem_attempt_leaves_parameters_and_scheduler_unchanged():
