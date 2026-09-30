@@ -195,33 +195,36 @@ def test_stage2_margin_only_fem_loss_stays_feasible_design() -> None:
 
 def test_target_total_length_band_penalizes_overrun_harder_than_underrun() -> None:
     under = NN_Trainer._target_total_length_band_loss(
-        total_length=torch.tensor(90.0),
+        total_length=torch.tensor(89.0),
         target_total_length=100.0,
-        tolerance=5.0,
+        lower_tolerance=10.0,
+        upper_buffer=0.1,
         under_weight=1.0,
         over_weight=100.0,
         eps=1.0e-12,
     )
     over = NN_Trainer._target_total_length_band_loss(
-        total_length=torch.tensor(110.0),
+        total_length=torch.tensor(100.9),
         target_total_length=100.0,
-        tolerance=5.0,
+        lower_tolerance=10.0,
+        upper_buffer=0.1,
         under_weight=1.0,
         over_weight=100.0,
         eps=1.0e-12,
     )
     inside = NN_Trainer._target_total_length_band_loss(
-        total_length=torch.tensor(103.0),
+        total_length=torch.tensor(99.9),
         target_total_length=100.0,
-        tolerance=5.0,
+        lower_tolerance=10.0,
+        upper_buffer=0.1,
         under_weight=1.0,
         over_weight=100.0,
         eps=1.0e-12,
     )
 
     assert inside["penalty"].item() == pytest.approx(0.0)
-    assert under["under_violation"].item() == pytest.approx(5.0)
-    assert over["over_violation"].item() == pytest.approx(5.0)
+    assert under["under_violation"].item() == pytest.approx(1.0)
+    assert over["over_violation"].item() == pytest.approx(1.0)
     assert over["penalty"].item() == pytest.approx(100.0 * under["penalty"].item())
 
 
@@ -382,8 +385,8 @@ def test_stage2_progress_log_reports_updated_feasible_best_without_generic_best(
         "stage": 2,
         "stage_local_step": 60,
         "stage_max_steps": 500,
-        "L_train": 2.16504,
-        "design_score": 1.94624,
+        "L_total": 2.16504,
+        "primary_objective": 155.6,
         "stage_monitor_raw": 1.94624,
         "stage_monitor_mode": "design",
         "fem_total_loss": 0.1094,
@@ -421,7 +424,7 @@ def test_stage2_progress_log_reports_updated_feasible_best_without_generic_best(
     text = NN_Trainer._format_stage_progress_log(
         row=row,
         total_step_budget=650,
-        best_feasible_key=(1.94624, 50.0, 210),
+        best_feasible_key=(155.6, 0.9, 210),
         best_infeasible_key=(0.01, 2.0, 173),
     )
 
@@ -429,12 +432,12 @@ def test_stage2_progress_log_reports_updated_feasible_best_without_generic_best(
     assert "Optimization mode:" not in text
     assert "target_length_constrained_displacement" not in text
     assert (
-        "Best feasible: step=210 | design_score=1.9462e+00 | "
+        "Best feasible: step=210 | primary=1.5560e+02 | "
         "max_stress=1.016e+02 | max_disp=1.650e-02 | "
         "min_seed_dist=1.240e+00 | total_length=1.556e+02"
     ) in text
     assert "best_recovery_violation" not in text
-    assert "L_train=2.1650e+00" in text
+    assert "L_total=2.1650e+00" in text
     assert "monitor=1.9462e+00 (design)" in text
     assert "max_stress=1.016e+02" in text
     assert "max_disp=1.650e-02" in text
@@ -461,13 +464,33 @@ def test_no_obsolete_stage2_violation_only_training_objective_remains() -> None:
     assert "fem_total_loss=loss_fem" in combined_source
 
 
-def test_target_length_mode_is_stage2_only_in_training_loop() -> None:
+def test_target_length_mode_is_active_before_stage2_transition() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     source = (repo_root / "Training/MainTrain.py").read_text(encoding="utf-8")
 
-    assert "target_length_active = target_length_mode and int(stage_id) == 2" in source
+    assert "target_length_active = target_length_mode" in source
+    assert "or bool(target_length_feasible)" in source
+    assert "and bool(seed_activity_classification_feasible)" in source
+    assert "visual_partial_active_seed_count" in source
+    assert "target_length_stage1_prepare = target_length_mode and int(stage_id) == 1" in source
+    assert "if target_length_stage1_prepare and bool(target_length_uniform_cleanup_active)" in source
+    assert "target_length_uniform_cleanup_active = bool(" in source
     assert "if target_length_active else None" in source
     assert "if target_length_active" in source
+
+
+def test_target_length_stage1_uses_length_band_weight_when_default_zero() -> None:
+    cfg = TrainingConfig(
+        optimization_mode="target_length_constrained_displacement",
+        target_total_length=100.0,
+        stage1_lam_total_fiber_length=0.0,
+        stage2_lam_total_fiber_length=3.0,
+    )
+    trainer = _trainer(cfg)
+
+    settings = trainer._stage_settings_for_stage_id(1)
+
+    assert settings["lam_total_fiber_length"] == pytest.approx(3.0)
 
 
 def test_target_length_final_log_labels_feasible_key_by_displacement() -> None:
@@ -475,20 +498,21 @@ def test_target_length_final_log_labels_feasible_key_by_displacement() -> None:
     source = (repo_root / "Training/MainTrain.py").read_text(encoding="utf-8")
 
     assert "best_feasible_key_label" in source
-    assert "displacement_ratio, design_score, step" in source
+    assert "displacement_ratio, stress_ratio, raw_fiber_length, step" in source
 
 
 def test_optimization_reporting_uses_objective_terms_without_total_chart_bar() -> None:
     row = {
         "stage": 2,
         "optimization_mode": "target_length_constrained_displacement",
-        "L_train": 49.8,
+        "L_total": 49.8,
         "displacement_objective": 0.7,
         "displacement_objective_weight": 11.0,
         "fem_displacement_p_norm": 0.7,
         "fem_max_displacement": 1.0,
         "target_total_length": 100.0,
-        "target_total_length_tolerance": 5.0,
+        "target_total_length_lower": 95.0,
+        "target_total_length_upper": 99.9,
         "target_total_length_penalty": 4.0,
         "loss_total_fiber_length": 110.0,
         "target_total_length_under_violation": 0.0,
@@ -520,19 +544,19 @@ def test_optimization_reporting_uses_objective_terms_without_total_chart_bar() -
     assert row["objective_displacement_contribution"] == pytest.approx(7.7)
     assert row["objective_length_band_contribution"] == pytest.approx(40.0)
     assert not any(key == "Total" for key in chart)
-    assert chart["L-train"] == pytest.approx(49.8)
+    assert chart["L-total"] == pytest.approx(49.8)
     assert chart["Displacement x11"] == pytest.approx(7.7)
     assert not any("Displacement Lu" in key for key in chart)
     assert chart["Length band x10"] == pytest.approx(40.0)
 
 
-def test_target_mode_best_design_score_reporting_uses_checkpoint_design_score() -> None:
+def test_target_mode_best_primary_reporting_uses_checkpoint_total() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     source = (repo_root / "Training/MainTrain.py").read_text(encoding="utf-8")
 
-    assert "checkpoint_design_score(best_feasible_checkpoint)" in source
-    assert '"best_design_score": final_design_score' in source
-    assert '"best_feasible_design_score": (' in source
+    assert "checkpoint_L_total(best_feasible_checkpoint)" in source
+    assert '"best_primary_objective": final_primary_objective' in source
+    assert '"best_feasible_primary_objective": (' in source
 
 
 def test_target_length_seed_domain_lock_is_configured_and_logged() -> None:
@@ -613,28 +637,27 @@ def test_no_obsolete_raw_fiber_first_checkpoint_ranking_remains() -> None:
         )
     )
 
-    assert "return True, (fiber_length, physical_max_ratio, step)" not in combined_source
+    assert "return True, (fiber_length, physical_max_ratio, step)" in combined_source
     assert "best_feasible_checkpoint[\"best_feasible_fiber_length\"]" not in combined_source
     assert "feasible_key=(fiber_length, physical_max_ratio, step)" not in combined_source
     assert "- float(lam_cvt_step) * loss_cvt_normalized" not in combined_source
     assert "- float(lam_rep_step) * loss_rep_normalized" not in combined_source
     assert "- float(lam_l_curve_cell_step) * loss_curve_cell_normalized" not in combined_source
     assert "lam_l_seed_step" not in combined_source
-    assert "loss_seed" not in combined_source
 
 
-def test_best_feasible_key_uses_design_score_before_raw_fiber_length() -> None:
-    a = (10.0, 97.0, 1)
-    b = (8.0, 101.0, 2)
+def test_min_length_best_feasible_key_uses_raw_length_first() -> None:
+    a = (97.0, 0.8, 1)
+    b = (101.0, 0.1, 2)
 
-    assert b < a
+    assert a < b
 
 
-def test_best_feasible_key_uses_raw_fiber_length_as_design_score_tiebreak() -> None:
-    longer = (10.0, 100.0, 1)
-    shorter = (10.0, 90.0, 2)
+def test_min_length_best_feasible_key_uses_physical_ratio_tiebreak() -> None:
+    higher_ratio = (100.0, 0.9, 1)
+    lower_ratio = (100.0, 0.7, 2)
 
-    assert shorter < longer
+    assert lower_ratio < higher_ratio
 
 
 def test_best_feasible_key_uses_global_step_as_final_tiebreak() -> None:
@@ -731,7 +754,7 @@ def test_target_length_checkpoint_key_requires_length_feasibility_and_prefers_di
     assert feasible
     assert lower_displacement_feasible
     assert lower_displacement_key < key
-    assert lower_displacement_key == pytest.approx((0.5, 20.0, 5.0))
+    assert lower_displacement_key == pytest.approx((0.5, 0.95, 100.0, 5.0))
     assert not outside_length_feasible
     assert outside_length_key[0] == pytest.approx(0.4)
 

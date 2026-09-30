@@ -48,15 +48,14 @@ def test_main_stage_monitor_uses_stage2_design_terms_without_fem():
     assert torch.allclose(monitor, torch.tensor(6.0), atol=1e-12)
 
 
-def test_feasible_stage2_monitor_reuses_design_score():
+def test_feasible_stage2_monitor_uses_fiber_length_objective():
     trainer = make_trainer()
 
     monitor = trainer.calculate_stage_monitor(
         2,
         {
-            "design_score": torch.tensor(7.5),
-            "mechanical_violation": torch.tensor(0.0),
-            "physical_feasible": True,
+            "loss_total_fiber_length": torch.tensor(7.5),
+            "overall_feasible": True,
             "loss_fem_norm": torch.tensor(100.0),
             "_zero": torch.tensor(0.0),
         },
@@ -162,7 +161,6 @@ def test_legacy_joint_optimization_config_fields_are_gone():
         "lam_fem",
         "lam_cvt",
         "lam_rep",
-        "lam_seed_spacing",
         "lam_total_fiber_length",
         "lam_l_curve_cell",
     }
@@ -184,8 +182,6 @@ def test_stage_configs_include_all_stage_objective_lambdas():
     loss_names = {
         "lam_fem",
         "lam_cvt",
-        "lam_rep",
-        "lam_seed_spacing",
         "lam_total_fiber_length",
         "lam_l_curve_cell",
     }
@@ -236,7 +232,9 @@ def test_stage_local_seed_offset_scale_uses_stage_max_steps():
 
 def test_stage_scheduler_milestones_are_stage_local():
     trainer = make_trainer(
+        stage1_min_steps=10,
         stage1_max_steps=100,
+        stage2_min_steps=20,
         stage2_max_steps=200,
         stage1_scheduler_milestones=(0.5, 75),
         stage2_scheduler_milestones=(0.25, 150),
@@ -334,18 +332,17 @@ def test_next_stage_objective_selects_best_incoming_stage2_monitor_from_stored_m
         stage2_lam_fem=10.0,
         stage2_lam_total_fiber_length=2.0,
         stage2_lam_l_curve_cell=0.5,
-        stage2_lam_rep=0.0,
         stage2_lam_cvt=0.0,
         lam_seed_spacing=0.0,
     )
     runtime = StageRuntime(spec=trainer._adaptive_stage_specs()[0])
     runtime.stage_best_raw_checkpoint = {
         "valid": True,
-        "row": {"loss_total_fiber_length_norm": 4.0, "loss_fem_norm": 2.0, "loss_l_curve_cell_norm": 6.0, "loss_rep_norm": 100.0, "VolFrac": 0.5},
+        "row": {"primary_objective": 4.0, "loss_total_fiber_length_norm": 4.0, "loss_fem_norm": 2.0, "loss_l_curve_cell_norm": 6.0, "VolFrac": 0.5},
     }
     runtime.stage_last_valid_checkpoint = {
         "valid": True,
-        "row": {"loss_total_fiber_length_norm": 1.0, "loss_fem_norm": 1.0, "loss_l_curve_cell_norm": 2.0, "loss_rep_norm": 100.0, "VolFrac": 0.5},
+        "row": {"primary_objective": 3.0, "loss_total_fiber_length_norm": 1.0, "loss_fem_norm": 1.0, "loss_l_curve_cell_norm": 2.0, "VolFrac": 0.5},
     }
 
     name, checkpoint, score = trainer._select_transition_checkpoint(runtime, next_stage_id=2)

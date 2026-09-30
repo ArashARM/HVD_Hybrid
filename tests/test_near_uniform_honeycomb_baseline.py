@@ -161,6 +161,37 @@ def make_baseline(**kwargs):
     )
 
 
+def test_edge_curve_xyz_endpoint_stitching_removes_shared_node_gap():
+    baseline = make_baseline()
+    decoder = baseline.decoder
+    edge_index = torch.tensor([[0, 1], [1, 2]], dtype=torch.long)
+    graph = {"edge_index": edge_index}
+    curves_xyz = torch.tensor(
+        [
+            [[0.0, 0.0, 0.0], [0.4, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [[1.0, 0.00004012, 0.0], [1.2, 0.5, 0.0], [2.0, 0.0, 0.0]],
+        ],
+        dtype=torch.float64,
+    )
+    vertices_xyz = torch.tensor(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        dtype=torch.float64,
+    )
+
+    stitched, diagnostics = decoder.stitch_edge_curve_xyz_endpoints(
+        graph,
+        curves_xyz,
+        vertices_xyz,
+    )
+
+    before = diagnostics["endpoint_stitching"]["before"]
+    after = diagnostics["endpoint_stitching"]["after"]
+    assert before["max_edge_endpoint_gap"] == pytest.approx(4.012e-5)
+    assert before["max_edge_endpoint_gap_pair"]["edge_ids"] == [0, 1]
+    assert after["max_edge_endpoint_gap"] == pytest.approx(0.0)
+    assert torch.allclose(stitched[0, -1], stitched[1, 0])
+
+
 def test_deterministic_triangular_lattice_generation() -> None:
     baseline = make_baseline()
     a, mask_a = baseline._retained_lattice_np(0.18)

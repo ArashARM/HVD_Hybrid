@@ -257,7 +257,7 @@ def test_fem_safety_margin_caps_at_physical_limit_and_hard_loss_is_separate():
     assert near_out["safety_margin_fem_loss"].item() == pytest.approx(expected_margin)
     assert over_out["safety_margin_fem_loss"].item() == pytest.approx(expected_margin)
     assert near_out["violation_fem_loss"].item() == pytest.approx(0.0)
-    assert over_out["violation_fem_loss"].item() == pytest.approx(1000.0 * 0.5**2)
+    assert over_out["violation_fem_loss"].item() == pytest.approx(1000.0 * (0.5 + 0.5 * 0.5**2))
 
 def test_fem_total_reconstructs_from_separate_components():
     trainer = _dummy_trainer(
@@ -375,7 +375,8 @@ def test_fem_violation_loss_uses_physical_max_not_diluted_p_norm():
         out["physical_displacement_ratio"],
         out["physical_displacement_ratio"].new_tensor(1.23),
     )
-    assert out["displacement_p_norm"].item() < 1.0
+    assert out["displacement_p_norm_mean_diagnostic"].item() < 1.0
+    assert out["displacement_p_norm"].item() == pytest.approx(1.23)
     assert not out["physical_feasible"]
     assert out["displacement_violation_loss"].item() > 0.0
     assert out["violation_fem_loss"].item() > 100.0
@@ -650,7 +651,7 @@ def test_feasible_checkpoint_beats_shorter_failed_checkpoint():
 
     assert failed_feasible is False
     assert ok_feasible is True
-    assert ok_key[0] == 20.0
+    assert ok_key[0] == 2.0
 
     shorter_feasible, shorter_key = checkpoint_feasibility_key(
         physical_displacement_ratio=0.95,
@@ -943,7 +944,7 @@ def test_spacing_infeasibility_rejects_checkpoint():
     assert key == (0.25, 3.0, 0.0)
 
 
-def test_feasible_ranking_uses_design_score_not_physical_ratio():
+def test_min_length_feasible_ranking_uses_length_before_physical_ratio():
     a_feasible, a_key = checkpoint_feasibility_key(
         physical_displacement_ratio=0.99,
         physical_stress_ratio=0.99,
@@ -967,7 +968,7 @@ def test_feasible_ranking_uses_design_score_not_physical_ratio():
 
     assert a_feasible is True
     assert b_feasible is True
-    assert a_key < b_key
+    assert b_key < a_key
 
 
 def test_physical_feasible_false_rejects_candidate_even_when_ratios_pass():

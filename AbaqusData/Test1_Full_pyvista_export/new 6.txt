@@ -1,2 +1,0 @@
-conda activate VD_Imp_UB
-cd /home/arash/HVD_SeedsBase
