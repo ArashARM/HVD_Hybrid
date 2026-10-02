@@ -885,14 +885,52 @@ class CADTensorGenerator:
         Xu = np.empty((uv_raw.shape[0], 3), dtype=np.float32)
         Xv = np.empty((uv_raw.shape[0], 3), dtype=np.float32)
 
+        u_scale = (
+            self._active_u_raw_bounds[1]
+            - self._active_u_raw_bounds[0]
+        )
+
+        v_scale = (
+            self._active_v_raw_bounds[1]
+            - self._active_v_raw_bounds[0]
+        )
+
         for i, (u, v) in enumerate(uv_raw):
-            p = self._active_surface.Value(float(u), float(v))
-            props = GeomLProp_SLProps(self._active_surface, float(u), float(v), 1, metric_tol)
+
+            p = self._active_surface.Value(
+                float(u),
+                float(v),
+            )
+
+            props = GeomLProp_SLProps(
+                self._active_surface,
+                float(u),
+                float(v),
+                1,
+                metric_tol,
+            )
+
             du = props.D1U()
             dv = props.D1V()
-            xyz[i] = [p.X(), p.Y(), p.Z()]
-            Xu[i] = [du.X(), du.Y(), du.Z()]
-            Xv[i] = [dv.X(), dv.Y(), dv.Z()]
+
+            xyz[i] = [
+                p.X(),
+                p.Y(),
+                p.Z(),
+            ]
+
+            # Derivatives with respect to NORMALIZED UV
+            Xu[i] = [
+                du.X() * u_scale,
+                du.Y() * u_scale,
+                du.Z() * u_scale,
+            ]
+
+            Xv[i] = [
+                dv.X() * v_scale,
+                dv.Y() * v_scale,
+                dv.Z() * v_scale,
+            ]
 
         out_shape_3 = (*query_shape, 3)
         out_shape_2 = (*query_shape, 2)

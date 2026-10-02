@@ -101,13 +101,14 @@ def test_overall_infeasible_stage2_monitor_uses_geometric_violation():
     assert torch.allclose(monitor, torch.tensor(0.25), atol=1e-12)
 
 
-def test_stage1_monitor_uses_effective_weighted_normalized_terms():
+def test_stage1_monitor_uses_configured_weighted_terms():
     trainer = make_trainer()
 
     monitor = trainer.calculate_stage_monitor(
         1,
         {
             "loss_cvt_norm": torch.tensor(13.0),
+            "loss_total_fiber_length_norm": torch.tensor(4.0),
             "loss_fem_norm": torch.tensor(2.0),
             "loss_l_curve_cell_norm": torch.tensor(5.0),
             "loss_rep_norm": torch.tensor(7.0),
@@ -116,13 +117,14 @@ def test_stage1_monitor_uses_effective_weighted_normalized_terms():
         },
         {
             "lam_cvt": 3.0,
+            "lam_total_fiber_length": 5.0,
             "lam_l_curve_cell": 0.0,
             "lam_rep": 1.0,
             "lam_seed_spacing": 2.0,
         },
     )
 
-    assert torch.allclose(monitor, torch.tensor(68.0))
+    assert torch.allclose(monitor, torch.tensor(81.0))
 
 
 def test_removed_eval_config_fields_are_gone():
@@ -177,17 +179,18 @@ def test_legacy_joint_optimization_config_fields_are_gone():
             raise AssertionError(f"{name} should not be accepted")
 
 
-def test_stage_configs_include_all_stage_objective_lambdas():
+def test_phase_configs_include_common_objective_weights_and_stage_specific_controls():
     config_names = {field.name for field in fields(TrainingConfig)}
-    loss_names = {
-        "lam_fem",
-        "lam_cvt",
-        "lam_total_fiber_length",
-        "lam_l_curve_cell",
+    expected = {
+        "fem_enabled",
+        "cvt_weight",
+        "total_fiber_length_weight",
+        "phase2_seed_spacing_weight",
+        "phase2_min_seed_spacing",
+        "phase2_cell_edge_uniformity_weight",
     }
 
-    for stage in ("stage1", "stage2"):
-        assert {f"{stage}_{name}" for name in loss_names}.issubset(config_names)
+    assert expected.issubset(config_names)
 
 
 def test_allow_seed_outside_domain_is_stage_configurable():
@@ -329,11 +332,10 @@ def test_final_stage_selection_uses_raw_checkpoint():
 def test_next_stage_objective_selects_best_incoming_stage2_monitor_from_stored_metrics():
     trainer = make_trainer(
         stage_transition_selection="next_stage_objective",
-        stage2_lam_fem=10.0,
-        stage2_lam_total_fiber_length=2.0,
-        stage2_lam_l_curve_cell=0.5,
-        stage2_lam_cvt=0.0,
-        lam_seed_spacing=0.0,
+        total_fiber_length_weight=2.0,
+        phase2_cell_edge_uniformity_weight=0.5,
+        cvt_weight=0.0,
+        phase2_seed_spacing_weight=0.0,
     )
     runtime = StageRuntime(spec=trainer._adaptive_stage_specs()[0])
     runtime.stage_best_raw_checkpoint = {

@@ -17,6 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 from Utils.TimelapseRecorder import TimelapseRecorder
 from tqdm.auto import tqdm
 import numpy as np
+from Decoder_CLasses import Phase1VoronoiDecoder
 from Utils.DifferentiableFilters import (
     smooth_heaviside_projection,
     surface_density_filter_metric_aware,
@@ -407,7 +408,10 @@ class TrainingConfig:
     lam_cell_angle_uniform: float = 1.0
     lam_cell_radial_uniform: float = 0.5
     include_shell_in_length_loss: bool = False
-    optimization_mode: str = "constrained_displacement"
+    # minimize_length: primary design objective = total fibre/network length.
+    # minimize_displacement_at_target_length: primary design objective =
+    # displacement, with total length constrained to the target band.
+    optimization_mode: str = "minimize_length"
     constraint_control: str = "automatic"
     target_total_length: float | None = None
     target_length_lower_tolerance: float = 5.0
@@ -500,20 +504,40 @@ class TrainingConfig:
     lr_mlp: float = 2e-4
     lr_decoder: float = 2e-4
 
-    stage1_lam_fem: float = 0.0
-    stage1_enable_fem: bool = False
-    stage1_lam_cvt: float = 1.0
-    stage1_lam_total_fiber_length: float = 0.0
-    stage1_lam_l_curve_cell: float = 0.05
-    stage1_freeze_seeds: bool = True
+    fem_enabled: bool = True
+    cvt_weight: float = 0.05
+    total_fiber_length_weight: float = 1.0
     stage1_allow_seed_outside_domain: bool = True
-    stage2_lam_fem: float = 1.0
-    stage2_enable_fem: bool = True
-    stage2_lam_cvt: float = 0.0
-    stage2_lam_total_fiber_length: float = 1.0
-    stage2_lam_l_curve_cell: float = 0.05
+    phase1_point_chunk_size: int = 16
+    phase1_tau: float = 0.01
+    phase1_tube_beta: float = 0.01
+    phase1_duplicate_merge_distance_factor: float = 1.10
+    phase1_handoff_activity_threshold: float = 0.05
+    phase1_handoff_territory_ratio: float = 0.20
+    phase2_seed_spacing_weight: float = 1.0
+    phase2_min_seed_spacing: float = 0.05
+    phase2_cell_edge_uniformity_weight: float = 0.05
     stage2_freeze_seeds: bool = True
     stage2_allow_seed_outside_domain: bool = True
+    # Deprecated compatibility inputs. They are migrated in __post_init__ only;
+    # internal training code uses the common objective names above.
+    phase1_enable_fem: bool | None = None
+    phase2_enable_fem: bool | None = None
+    phase1_cvt_weight: float | None = None
+    phase2_cvt_weight: float | None = None
+    phase1_continuous_length_weight: float | None = None
+    phase2_exact_length_weight: float | None = None
+    stage1_lam_fem: float | None = None
+    stage1_enable_fem: bool | None = None
+    stage1_lam_cvt: float | None = None
+    stage1_lam_total_fiber_length: float | None = None
+    stage1_lam_l_curve_cell: float | None = None
+    stage1_freeze_seeds: bool | None = None
+    stage2_lam_fem: float | None = None
+    stage2_enable_fem: bool | None = None
+    stage2_lam_cvt: float | None = None
+    stage2_lam_total_fiber_length: float | None = None
+    stage2_lam_l_curve_cell: float | None = None
     # Adaptive stage scheduling
     stage1_min_steps: int = 150
     stage1_max_steps: int = 300
@@ -549,6 +573,8 @@ class TrainingConfig:
     save_fem_debug_history: bool = True
     grad_clip_norm: float | None = 1.0
     debug_anomaly_detection: bool = False
+    cuda_empty_cache_before_backward: bool = True
+    sanitize_nonfinite_gradients: bool = True
 
     tensorboard_enabled: bool = True
     tensorboard_log_root: str = "runs"
@@ -579,21 +605,30 @@ class TrainingConfig:
 
         self.Edge_in_losses = canonical_edge_in_losses_mode(self.Edge_in_losses)
         self.optimization_mode = str(self.optimization_mode).strip().lower()
-        if self.optimization_mode == "constrained_displacment":
-            self.optimization_mode = "constrained_displacement"
+        legacy_optimization_modes = {
+            "constrained_displacement": "minimize_length",
+            "constrained_displacment": "minimize_length",
+            "target_length_constrained_displacement": (
+                "minimize_displacement_at_target_length"
+            ),
+        }
+        self.optimization_mode = legacy_optimization_modes.get(
+            self.optimization_mode,
+            self.optimization_mode,
+        )
         if self.optimization_mode not in (
-            "constrained_displacement",
-            "target_length_constrained_displacement",
+            "minimize_length",
+            "minimize_displacement_at_target_length",
         ):
             raise ValueError(
-                "optimization_mode must be 'constrained_displacement' or "
-                f"'target_length_constrained_displacement', got {self.optimization_mode!r}"
+                "optimization_mode must be 'minimize_length' or "
+                f"'minimize_displacement_at_target_length', got {self.optimization_mode!r}"
             )
-        if self.optimization_mode == "target_length_constrained_displacement":
+        if self.optimization_mode == "minimize_displacement_at_target_length":
             if self.target_total_length is None:
                 raise ValueError(
                     "target_total_length must be set when optimization_mode is "
-                    "'target_length_constrained_displacement'"
+                    "'minimize_displacement_at_target_length'"
                 )
             if not math.isfinite(float(self.target_total_length)) or float(self.target_total_length) <= 0.0:
                 raise ValueError("target_total_length must be positive finite")
@@ -614,7 +649,7 @@ class TrainingConfig:
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and >= 0, got {value}")
         if (
-            self.optimization_mode == "target_length_constrained_displacement"
+            self.optimization_mode == "minimize_displacement_at_target_length"
             and (
                 float(self.target_length_upper_buffer) <= 0.0
                 or float(self.target_length_lower_tolerance) <= 0.0
@@ -712,10 +747,48 @@ class TrainingConfig:
             )
         if self.min_seed_spacing <= 0.0:
             raise ValueError(f"min_seed_spacing must be > 0, got {self.min_seed_spacing}")
+        if self.phase2_min_seed_spacing <= 0.0:
+            raise ValueError(
+                f"phase2_min_seed_spacing must be > 0, got {self.phase2_min_seed_spacing}"
+            )
+        if self.phase2_min_seed_spacing == 0.05 and self.min_seed_spacing != 0.05:
+            self.phase2_min_seed_spacing = float(self.min_seed_spacing)
         if self.seed_spacing_power < 1.0:
             raise ValueError(f"seed_spacing_power must be >= 1, got {self.seed_spacing_power}")
         if self.lam_seed_spacing < 0.0:
             raise ValueError(f"lam_seed_spacing must be >= 0, got {self.lam_seed_spacing}")
+        if self.phase2_seed_spacing_weight == 1.0 and self.lam_seed_spacing != 1.0:
+            self.phase2_seed_spacing_weight = float(self.lam_seed_spacing)
+        if self.phase1_enable_fem is not None:
+            self.fem_enabled = bool(self.phase1_enable_fem)
+        elif self.phase2_enable_fem is not None:
+            self.fem_enabled = bool(self.phase2_enable_fem)
+        elif self.stage1_enable_fem is not None:
+            self.fem_enabled = bool(self.stage1_enable_fem)
+        elif self.stage2_enable_fem is not None:
+            self.fem_enabled = bool(self.stage2_enable_fem)
+        elif self.stage1_lam_fem is not None:
+            self.fem_enabled = float(self.stage1_lam_fem) != 0.0
+        elif self.stage2_lam_fem is not None:
+            self.fem_enabled = float(self.stage2_lam_fem) != 0.0
+        if self.phase1_cvt_weight is not None:
+            self.cvt_weight = float(self.phase1_cvt_weight)
+        elif self.phase2_cvt_weight is not None:
+            self.cvt_weight = float(self.phase2_cvt_weight)
+        elif self.stage1_lam_cvt is not None:
+            self.cvt_weight = float(self.stage1_lam_cvt)
+        elif self.stage2_lam_cvt is not None:
+            self.cvt_weight = float(self.stage2_lam_cvt)
+        if self.phase1_continuous_length_weight is not None:
+            self.total_fiber_length_weight = float(self.phase1_continuous_length_weight)
+        elif self.phase2_exact_length_weight is not None:
+            self.total_fiber_length_weight = float(self.phase2_exact_length_weight)
+        elif self.stage1_lam_total_fiber_length is not None:
+            self.total_fiber_length_weight = float(self.stage1_lam_total_fiber_length)
+        elif self.stage2_lam_total_fiber_length is not None:
+            self.total_fiber_length_weight = float(self.stage2_lam_total_fiber_length)
+        if self.stage2_lam_l_curve_cell is not None:
+            self.phase2_cell_edge_uniformity_weight = float(self.stage2_lam_l_curve_cell)
         if not (0.0 <= self.allow_seed_outside_domain_warmup_frac <= 1.0):
             raise ValueError(
                 "allow_seed_outside_domain_warmup_frac must be in [0,1], "
@@ -855,17 +928,27 @@ class TrainingConfig:
                 f"got {self.fem_cvt_displacement_importance_floor}"
             )
         for name in (
-            "stage1_lam_fem",
-            "stage1_lam_cvt",
-            "stage1_lam_total_fiber_length",
-            "stage1_lam_l_curve_cell",
-            "stage2_lam_fem",
-            "stage2_lam_cvt",
-            "stage2_lam_total_fiber_length",
-            "stage2_lam_l_curve_cell",
+            "cvt_weight",
+            "total_fiber_length_weight",
+            "phase2_seed_spacing_weight",
+            "phase2_cell_edge_uniformity_weight",
         ):
             if float(getattr(self, name)) < 0.0:
                 raise ValueError(f"{name} must be >= 0, got {getattr(self, name)}")
+        if int(self.phase1_point_chunk_size) < 1:
+            raise ValueError(
+                f"phase1_point_chunk_size must be >= 1, got {self.phase1_point_chunk_size}"
+            )
+        for name in (
+            "phase1_tau",
+            "phase1_tube_beta",
+            "phase1_duplicate_merge_distance_factor",
+            "phase1_handoff_activity_threshold",
+            "phase1_handoff_territory_ratio",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be positive finite, got {value}")
         if self.seed_offset_scale_start is not None and self.seed_offset_scale_start <= 0.0:
             raise ValueError(
                 f"seed_offset_scale_start must be > 0, got {self.seed_offset_scale_start}"
@@ -2072,7 +2155,9 @@ class NN_Trainer:
     ):
         self.generator = generator
         self.viz = viz
-        self.decoder_cls = decoder_cls
+        self.phase1_decoder_cls = Phase1VoronoiDecoder
+        self.phase2_decoder_cls = decoder_cls
+        self.decoder_cls = self.phase2_decoder_cls
         self.ppnet_cls = ppnet_cls
         self.fem = fem
         self.shell_problem = shell_problem
@@ -3682,7 +3767,7 @@ class NN_Trainer:
             if key in clean_best_row
         }
         summary = {
-            "optimization_mode": str(clean_best_row.get("optimization_mode", getattr(self.cfg, "optimization_mode", "constrained_displacement"))),
+            "optimization_mode": str(clean_best_row.get("optimization_mode", getattr(self.cfg, "optimization_mode", "minimize_length"))),
             "optimization_mode_description": str(clean_best_row.get("optimization_mode_description", "")),
             "best_score": best_score,
             "best_score_meaning": str(best_score_meaning or clean_best_row.get("best_score_meaning", "")),
@@ -3869,10 +3954,30 @@ class NN_Trainer:
     def _timelapse_optimized_parameter_summary(self) -> str:
         cfg = self.cfg
         params = [
-            f"seed positions ({int(cfg.seed_number)})",
+            "seed positions",
             f"strut thickness={float(cfg.strut_thickness):.6g}",
         ]
         return "Optimized: " + ", ".join(params)
+
+    @staticmethod
+    def _stage_decoder_heading(stage_id: int) -> str:
+        return (
+            "STAGE 1 - IMPLICIT DECODER"
+            if int(stage_id) == 1
+            else "STAGE 2 - EXPLICIT DECODER"
+        )
+
+    @staticmethod
+    def _timelapse_header_title(
+        shape_name: str,
+        geometry_summary: str,
+        loading_case: str,
+        fem_elems: int,
+    ) -> str:
+        return (
+            f"{shape_name} ({geometry_summary}) | "
+            f"BC: {loading_case} (FEM elements: {int(fem_elems)})"
+        )
 
     @staticmethod
     def _clone_detached_tree(value):
@@ -3997,6 +4102,84 @@ class NN_Trainer:
 
         return decoder, ppnet
 
+    def _build_phase1_decoder(self, device, seed_number):
+        cfg = self.cfg
+        return self.phase1_decoder_cls(
+            n_seeds=int(seed_number),
+            use_Metric_anisotropy=False,
+            fixed_strut_radius=0.5 * float(cfg.strut_thickness),
+            fixed_height=1.0,
+            physical_tube_beta=float(getattr(cfg, "phase1_tube_beta", 0.01)),
+            duplicate_merge_sigma=(
+                float(getattr(cfg, "phase1_duplicate_merge_distance_factor", 1.10))
+                * float(cfg.strut_thickness)
+            ),
+            territory_min_ratio=float(getattr(cfg, "phase1_handoff_territory_ratio", 0.20)),
+            phase2_activity_threshold=float(getattr(cfg, "phase1_handoff_activity_threshold", 0.05)),
+            phase2_territory_ratio=float(getattr(cfg, "phase1_handoff_territory_ratio", 0.20)),
+            continuous_length_calibration=1.0,
+            use_boundary_attachment=True,
+            point_chunk_size=int(getattr(cfg, "phase1_point_chunk_size", 32)),
+            boundary_attach_width=2e-5,
+            boundary_attach_beta=1e-5,
+            boundary_attach_alpha=1.0,
+            density_projection_strength=0.0,
+            eps=float(cfg.decoder_eps),
+        ).to(device)
+
+    def _build_phase2_decoder(
+        self,
+        device,
+        seed_number,
+        u_periodic,
+        v_periodic,
+        boundary_solid_idx=None,
+        face_tensor=None,
+    ):
+        return self.decoder_cls(
+            **self._decoder_init_kwargs(
+                device=device,
+                seed_number=seed_number,
+                u_periodic=u_periodic,
+                v_periodic=v_periodic,
+                boundary_solid_idx=boundary_solid_idx,
+                face_tensor=face_tensor,
+            )
+        ).to(device)
+
+    def _decoder_for_checkpoint_stage(
+        self,
+        checkpoint: dict[str, Any],
+        *,
+        device,
+        face_tensor: dict[str, Any],
+    ):
+        stage_id = int(checkpoint.get("stage_id", 0))
+        pred_list = checkpoint.get("pred_list", [])
+        if pred_list and isinstance(pred_list[0], dict) and isinstance(pred_list[0].get("seeds_raw"), torch.Tensor):
+            seed_number = int(pred_list[0]["seeds_raw"].shape[0])
+        else:
+            seeds = checkpoint.get("seeds", [])
+            seed_number = int(seeds[0].shape[0]) if seeds and isinstance(seeds[0], torch.Tensor) else int(self.cfg.seed_number)
+
+        if stage_id == 1 or checkpoint.get("decoder_representation") == "phase1_implicit":
+            decoder = self._build_phase1_decoder(device, seed_number)
+        else:
+            decoder = self._build_phase2_decoder(
+                device=device,
+                seed_number=seed_number,
+                u_periodic=face_tensor.get("u_periodic", False),
+                v_periodic=face_tensor.get("v_periodic", False),
+                boundary_solid_idx=self._true_open_boundary_idx(face_tensor),
+                face_tensor=face_tensor,
+            )
+
+        state = checkpoint.get("decoder_state_dict", None)
+        if isinstance(state, dict):
+            decoder.load_state_dict(state, strict=False)
+        decoder.eval()
+        return decoder
+
     def _decoder_face_mesh_for_face(self, face_tensor):
         if self.face_mesh is None:
             return face_tensor
@@ -4043,15 +4226,133 @@ class NN_Trainer:
             "rho_min": float(self.cfg.rho_min),
         }
 
+    @staticmethod
+    def _face_tensor_optional(ft: dict[str, Any], key: str):
+        value = ft.get(key, None)
+        return value if isinstance(value, torch.Tensor) else None
+
+    @staticmethod
+    def _phase1_physical_boundary_curve_length(ft: dict[str, Any]):
+        value = ft.get("boundary_curve_length", None)
+        if not isinstance(value, torch.Tensor):
+            return None
+
+        explicit_flag = ft.get("boundary_curve_length_is_physical", None)
+        if isinstance(explicit_flag, torch.Tensor):
+            explicit_flag = bool(explicit_flag.detach().reshape(-1)[0].item())
+        if explicit_flag is True:
+            return value
+
+        units = str(ft.get("boundary_curve_length_units", "")).strip().lower()
+        physical_units = {
+            "physical",
+            "physical_cad",
+            "cad",
+            "cad_units",
+            "model",
+            "model_units",
+            "xyz",
+            "xyz_units",
+        }
+        if units in physical_units:
+            return value
+
+        source = str(ft.get("boundary_curve_length_source", "")).strip().lower()
+        if source in physical_units:
+            return value
+
+        return None
+
+    def _phase1_decoder_forward(
+        self,
+        decoder,
+        ft: dict[str, Any],
+        seeds_raw: torch.Tensor,
+        surface_area_weights: torch.Tensor,
+    ) -> dict[str, Any]:
+        w_raw = torch.zeros(
+            (int(seeds_raw.shape[0]), int(seeds_raw.shape[0])),
+            dtype=seeds_raw.dtype,
+            device=seeds_raw.device,
+        )
+        points_uv = ft["uv"]
+        points_face_id = self._face_tensor_optional(ft, "points_face_id")
+        if points_face_id is None:
+            face_id = self._face_id_key(ft.get("face_id", 0))
+            points_face_id = torch.full(
+                (int(points_uv.shape[0]),),
+                face_id,
+                dtype=torch.long,
+                device=points_uv.device,
+            )
+        boundary_uv = self._face_tensor_optional(ft, "boundary_curve_uv")
+        boundary_face_id = self._face_tensor_optional(ft, "boundary_face_id")
+        if boundary_uv is not None and boundary_face_id is None:
+            face_id = self._face_id_key(ft.get("face_id", 0))
+            boundary_face_id = torch.full(
+                (int(boundary_uv.shape[0]),),
+                face_id,
+                dtype=torch.long,
+                device=boundary_uv.device,
+            )
+        return decoder(
+            points_uv=points_uv,
+            points_3d=ft.get("points_xyz", None),
+            Xu=ft["Xu"],
+            Xv=ft["Xv"],
+            tau=float(getattr(self.cfg, "phase1_tau", 0.01)),
+            seeds_raw=seeds_raw,
+            w_raw=w_raw,
+            h_raw=None,
+            points_face_id=points_face_id,
+            boundary_uv=boundary_uv,
+            boundary_face_id=boundary_face_id,
+            boundary_curve_offsets=self._face_tensor_optional(ft, "boundary_curve_offsets"),
+            boundary_curve_xyz=self._face_tensor_optional(ft, "boundary_curve_xyz"),
+            boundary_curve_length=self._phase1_physical_boundary_curve_length(ft),
+            seed_domain_mask=self._face_tensor_optional(ft, "seed_domain_mask_grid"),
+            seed_domain_mask_threshold=float(self.cfg.seed_domain_mask_threshold),
+            seed_domain_temp=float(self.cfg.seed_domain_temp),
+            surface_area_weights=surface_area_weights,
+        )
+
+    def _run_active_decoder(
+        self,
+        decoder,
+        ft: dict[str, Any],
+        seeds_raw: torch.Tensor,
+        surface_area_weights: torch.Tensor,
+        stage_id: int,
+        generate_density_fiber: bool,
+    ) -> dict[str, Any]:
+        if int(stage_id) == 1:
+            return self._phase1_decoder_forward(
+                decoder,
+                ft=ft,
+                seeds_raw=seeds_raw,
+                surface_area_weights=surface_area_weights,
+            )
+        return decoder(
+            seeds_uv=seeds_raw,
+            generate_density_fiber=generate_density_fiber,
+        )
+
     def _build_face_model(self, face_tensor, device):
-        return self._build_single_face_models(
+        phase1_decoder = self._build_phase1_decoder(
             device=device,
             seed_number=self.cfg.seed_number,
-            u_periodic=face_tensor.get("u_periodic", False),
-            v_periodic=face_tensor.get("v_periodic", False),
-            boundary_solid_idx=self._true_open_boundary_idx(face_tensor),
-            face_tensor=face_tensor,
         )
+        ppnet = self.ppnet_cls(
+            n_seeds=self.cfg.seed_number,
+            allow_seed_outside_domain=(
+                bool(getattr(self.cfg, "stage1_allow_seed_outside_domain", self.cfg.allow_seed_outside_domain))
+                and float(self.cfg.allow_seed_outside_domain_warmup_frac) <= 0.0
+            ),
+            seed_domain_margin=self.cfg.seed_domain_margin,
+            use_independent_seed_offsets=self.cfg.use_independent_seed_offsets,
+            independent_seed_offset_max=self.cfg.independent_seed_offset_max,
+        ).to(device)
+        return phase1_decoder, ppnet
 
     def _save_optimized_shell_function(
         self,
@@ -4516,27 +4817,33 @@ class NN_Trainer:
 
     def _stage_settings_for_stage_id(self, stage_id: int) -> dict[str, float | bool | int]:
         cfg = self.cfg
-        prefix = "stage1" if int(stage_id) == 1 else "stage2"
-        settings = {
-            "stage": 1 if int(stage_id) == 1 else 2,
-            "freeze_seeds": bool(getattr(cfg, f"{prefix}_freeze_seeds")),
-            "allow_seed_outside_domain": bool(getattr(cfg, f"{prefix}_allow_seed_outside_domain")),
-            "lam_fem": float(getattr(cfg, f"{prefix}_lam_fem")),
-            "enable_fem": bool(getattr(cfg, f"{prefix}_enable_fem", int(stage_id) >= 2)),
-            "lam_cvt": float(getattr(cfg, f"{prefix}_lam_cvt")),
-            "lam_total_fiber_length": float(getattr(cfg, f"{prefix}_lam_total_fiber_length")),
-            "lam_l_curve_cell": float(getattr(cfg, f"{prefix}_lam_l_curve_cell")),
+        if int(stage_id) == 1:
+            return {
+                "stage": 1,
+                "freeze_seeds": False,
+                "allow_seed_outside_domain": bool(getattr(cfg, "stage1_allow_seed_outside_domain", True)),
+                "lam_fem": 1.0 if bool(getattr(cfg, "fem_enabled", True)) else 0.0,
+                "enable_fem": bool(getattr(cfg, "fem_enabled", True)),
+                "lam_cvt": float(getattr(cfg, "cvt_weight", 0.05)),
+                "lam_total_fiber_length": float(
+                    getattr(cfg, "total_fiber_length_weight", 1.0)
+                ),
+                "lam_l_curve_cell": 0.0,
+                "lam_seed_spacing": 0.0,
+                "min_seed_spacing": float(getattr(cfg, "phase2_min_seed_spacing", cfg.min_seed_spacing)),
+            }
+        return {
+            "stage": 2,
+            "freeze_seeds": bool(getattr(cfg, "stage2_freeze_seeds", True)),
+            "allow_seed_outside_domain": bool(getattr(cfg, "stage2_allow_seed_outside_domain", True)),
+            "lam_fem": 1.0 if bool(getattr(cfg, "fem_enabled", True)) else 0.0,
+            "enable_fem": bool(getattr(cfg, "fem_enabled", True)),
+            "lam_cvt": float(getattr(cfg, "cvt_weight", 0.05)),
+            "lam_total_fiber_length": float(getattr(cfg, "total_fiber_length_weight", 1.0)),
+            "lam_l_curve_cell": float(getattr(cfg, "phase2_cell_edge_uniformity_weight", 0.05)),
+            "lam_seed_spacing": float(getattr(cfg, "phase2_seed_spacing_weight", 1.0)),
+            "min_seed_spacing": float(getattr(cfg, "phase2_min_seed_spacing", cfg.min_seed_spacing)),
         }
-        if (
-            int(stage_id) == 1
-            and str(getattr(cfg, "optimization_mode", "")).strip().lower()
-            == "target_length_constrained_displacement"
-            and float(settings["lam_total_fiber_length"]) == 0.0
-        ):
-            settings["lam_total_fiber_length"] = float(
-                getattr(cfg, "stage2_lam_total_fiber_length", 1.0)
-            )
-        return settings
 
     def _first_physical_stage_id(self, stage_specs: list[StageSpec] | None = None) -> int:
         stage_ids = (
@@ -4544,10 +4851,9 @@ class NN_Trainer:
             if stage_specs
             else [1, 2]
         )
-        for stage_id in sorted(set(stage_ids)):
-            settings = self._stage_settings_for_stage_id(stage_id)
-            if bool(settings.get("enable_fem", False)):
-                return int(stage_id)
+        explicit_graph_stages = [stage_id for stage_id in stage_ids if int(stage_id) >= 2]
+        if explicit_graph_stages:
+            return min(explicit_graph_stages)
         return min(stage_ids) if stage_ids else 1
 
     def _adaptive_stage_specs(self) -> list[StageSpec]:
@@ -4609,39 +4915,26 @@ class NN_Trainer:
             return torch.tensor(float(value), dtype=dtype, device=device)
 
         terms: list[torch.Tensor] = []
-        if int(stage_id) == 1:
-            if "primary_objective" in loss_values:
-                return tensor_value("primary_objective")
-            for lam_name, loss_name in (
-                ("lam_cvt", "loss_cvt_norm"),
-                ("lam_rep", "loss_rep_norm"),
-                ("lam_l_curve_cell", "loss_l_curve_cell_norm"),
-                ("lam_seed_spacing", "loss_seed_spacing"),
-            ):
-                lam = float(effective_lambdas.get(lam_name, 0.0))
-                if lam != 0.0:
-                    terms.append(tensor_value(loss_name) * lam)
-        else:
-            if bool(loss_values.get("overall_feasible", False)):
-                mode_name = str(loss_values.get("optimization_mode", "")).strip().lower()
-                if mode_name == "target_length_constrained_displacement":
-                    return tensor_value("physical_displacement_ratio")
-                return tensor_value("loss_total_fiber_length")
-            if "overall_constraint_violation" in loss_values:
-                return tensor_value("overall_constraint_violation")
-            if "mechanical_violation" in loss_values:
-                return tensor_value("mechanical_violation")
-            if "primary_objective" in loss_values:
-                return tensor_value("primary_objective")
-            for lam_name, loss_name in (
-                ("lam_total_fiber_length", "loss_total_fiber_length_norm"),
-                ("lam_cvt", "loss_cvt_norm"),
-                ("lam_l_curve_cell", "loss_l_curve_cell_norm"),
-                ("lam_seed_spacing", "loss_seed_spacing"),
-            ):
-                lam = float(effective_lambdas.get(lam_name, 0.0))
-                if lam != 0.0:
-                    terms.append(tensor_value(loss_name) * lam)
+        if bool(loss_values.get("overall_feasible", False)):
+            mode_name = str(loss_values.get("optimization_mode", "")).strip().lower()
+            if mode_name == "minimize_displacement_at_target_length":
+                return tensor_value("physical_displacement_ratio")
+            return tensor_value("loss_total_fiber_length")
+        if "overall_constraint_violation" in loss_values:
+            return tensor_value("overall_constraint_violation")
+        if "mechanical_violation" in loss_values:
+            return tensor_value("mechanical_violation")
+        if "primary_objective" in loss_values:
+            return tensor_value("primary_objective")
+        for lam_name, loss_name in (
+            ("lam_total_fiber_length", "loss_total_fiber_length_norm"),
+            ("lam_cvt", "loss_cvt_norm"),
+            ("lam_l_curve_cell", "loss_l_curve_cell_norm"),
+            ("lam_seed_spacing", "loss_seed_spacing"),
+        ):
+            lam = float(effective_lambdas.get(lam_name, 0.0))
+            if lam != 0.0:
+                terms.append(tensor_value(loss_name) * lam)
         if not terms:
             return tensor_value("L_total")
         monitor = sum(terms[1:], terms[0])
@@ -4708,7 +5001,7 @@ class NN_Trainer:
         loss_rep_normalized: torch.Tensor | None = None,
         displacement_objective: torch.Tensor | None = None,
         target_length_penalty: torch.Tensor | None = None,
-        optimization_mode: str = "constrained_displacement",
+        optimization_mode: str = "minimize_length",
         lam_fem_step: float,
         lam_total_fiber_length_step: float,
         lam_cvt_step: float,
@@ -4717,9 +5010,7 @@ class NN_Trainer:
         displacement_objective_weight: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, str]:
         mode_name = str(optimization_mode).strip().lower()
-        if mode_name == "constrained_displacment":
-            mode_name = "constrained_displacement"
-        if mode_name == "target_length_constrained_displacement":
+        if mode_name == "minimize_displacement_at_target_length":
             length_term = (
                 target_length_penalty
                 if isinstance(target_length_penalty, torch.Tensor)
@@ -4760,7 +5051,7 @@ class NN_Trainer:
         fem_feasible = bool(torch.as_tensor(fem_violation_loss.detach()).reshape(()).item() == 0.0)
         if not fem_feasible:
             mode = "infeasible_recovery"
-        elif mode_name == "target_length_constrained_displacement":
+        elif mode_name == "minimize_displacement_at_target_length":
             mode = "target_length_feasible_displacement_design"
         else:
             mode = "feasible_design"
@@ -4966,11 +5257,13 @@ class NN_Trainer:
         total_step_budget: int,
         best_feasible_key,
         best_feasible_checkpoint=None,
+        best_feasible_stage1_checkpoint=None,
+        best_feasible_stage2_checkpoint=None,
         best_infeasible_key=None,
         best_infeasible_checkpoint=None,
         verbose: bool = False,
     ) -> str:
-        if str(row.get("optimization_mode", "")).strip().lower() == "target_length_constrained_displacement":
+        if str(row.get("optimization_mode", "")).strip().lower() == "minimize_displacement_at_target_length":
             best_feasible_primary = checkpoint_L_total(best_feasible_checkpoint)
         else:
             best_feasible_primary = cls._best_feasible_primary_value(best_feasible_key)
@@ -4993,6 +5286,32 @@ class NN_Trainer:
             if best_feasible_step >= 0 and math.isfinite(float(best_feasible_primary))
             else "none"
         )
+        def _best_stage_text(checkpoint):
+            if not isinstance(checkpoint, dict):
+                return "none"
+            metrics = checkpoint.get("raw_metrics", checkpoint.get("row", {}))
+            if not isinstance(metrics, dict):
+                metrics = {}
+            step = int(checkpoint.get("global_step", metrics.get("step", -1)))
+            primary = float(metrics.get("primary_objective", checkpoint.get("primary_objective", float("nan"))))
+            if step < 0 or not math.isfinite(primary):
+                return "none"
+            text = (
+                f"step={step} | "
+                f"primary={cls._console_float(primary, precision=4)} | "
+                f"max_stress={cls._console_float(metrics.get('stress_max', checkpoint.get('stress_max', float('nan'))))} | "
+                f"max_disp={cls._console_float(metrics.get('disp_max', checkpoint.get('disp_max', float('nan'))))} | "
+                f"total_length={cls._console_float(metrics.get('loss_total_fiber_length', checkpoint.get('loss_total_fiber_length', float('nan'))))}"
+            )
+            if math.isfinite(float(metrics.get("phase1_voronoi_length", checkpoint.get("phase1_voronoi_length", float("nan"))))):
+                text += (
+                    f" | voronoi_length={cls._console_float(metrics.get('phase1_voronoi_length', checkpoint.get('phase1_voronoi_length', float('nan'))))}"
+                    f" | boundary_length={cls._console_float(metrics.get('phase1_boundary_length', checkpoint.get('phase1_boundary_length', float('nan'))))}"
+                )
+            return text
+
+        best_stage1_text = _best_stage_text(best_feasible_stage1_checkpoint)
+        best_stage2_text = _best_stage_text(best_feasible_stage2_checkpoint)
 
         terms = [term for term in row.get("objective_terms") or [] if bool(term.get("active", False))]
         contribution_sum = float(sum(float(term.get("contribution", 0.0)) for term in terms))
@@ -5008,7 +5327,7 @@ class NN_Trainer:
         fem_active = bool(row.get("fem_constraints_active", False))
         fem_evaluated = bool(row.get("fem_was_evaluated", False))
         fem_valid = bool(row.get("fem_valid", False))
-        mechanical_not_evaluated = stage_id == 1 and not fem_evaluated
+        mechanical_not_evaluated = fem_active and not fem_evaluated
         fem_invalid = fem_active and fem_evaluated and not fem_valid
         stress_status = (
             "NOT EVALUATED"
@@ -5033,7 +5352,10 @@ class NN_Trainer:
             row.get("target_total_length_feasible", False),
             inactive=not target_length_active,
         )
-        spacing_status = cls._pass_fail(row.get("seed_spacing_feasible", False))
+        spacing_status = cls._pass_fail(
+            row.get("seed_spacing_feasible", False),
+            inactive=stage_id != 2,
+        )
         overall_status = (
             "NOT EVALUATED"
             if mechanical_not_evaluated or (fem_active and not fem_evaluated)
@@ -5051,7 +5373,7 @@ class NN_Trainer:
             f"length={length_limit} | "
             f"max_disp<={cls._console_limit(row.get('fem_max_displacement', float('nan')))} | "
             f"max_stress<={cls._console_limit(row.get('fem_yield_strength', float('nan')))} | "
-            f"min_seed_dist>={cls._console_limit(row.get('min_seed_spacing', float('nan')))}"
+            f"min_seed_dist>={cls._console_limit(row.get('min_seed_spacing', float('nan'))) if stage_id == 2 else 'INACTIVE'}"
         )
 
         fem_status = "NOT EVALUATED" if mechanical_not_evaluated else "INACTIVE"
@@ -5126,6 +5448,16 @@ class NN_Trainer:
             if fem_evaluated
             else float("nan")
         )
+        if math.isfinite(float(row.get("phase1_voronoi_length", float("nan")))):
+            length_summary = (
+                f"voronoi_length={cls._console_float(row.get('phase1_voronoi_length', row.get('loss_total_fiber_length', float('nan'))))} | "
+                f"boundary_length={cls._console_float(row.get('phase1_boundary_length', 0.0))} | "
+                f"total_length={cls._console_float(row.get('loss_total_fiber_length', float('nan')))}"
+            )
+        else:
+            length_summary = (
+                f"total_length={cls._console_float(row.get('loss_total_fiber_length', float('nan')))}"
+            )
         return (
             "\n"
             f"{separator}\n"
@@ -5140,14 +5472,16 @@ class NN_Trainer:
             f"max_stress={cls._console_float(main_stress)} | "
             f"max_disp={cls._console_float(main_displacement)} | "
             f"min_seed_dist={cls._console_float(row.get('min_seed_distance', row.get('minimum_seed_distance', float('nan'))))} | "
-            f"total_length={cls._console_float(row.get('loss_total_fiber_length', float('nan')))}\n\n"
+            f"{length_summary}\n\n"
             f"{cls._format_objective_terms_for_console(row)}\n\n"
             "Constraints: "
             f"stress={stress_status} | displacement={displacement_status} | "
             f"spacing={spacing_status} | length_band={length_status} | "
             f"overall={overall_status}\n"
             f"Hard limits: {hard_limits}\n"
-            f"Best feasible: {best_feasible_text}\n\n"
+            f"Best feasible: {best_feasible_text}\n"
+            f"Best feasible Stage 1: {best_stage1_text}\n"
+            f"Best feasible Stage 2: {best_stage2_text if best_stage2_text != 'none' else best_feasible_text}\n\n"
             f"Diagnostics: {' | '.join(diagnostics)}\n"
             f"{separator}"
             )
@@ -5223,6 +5557,12 @@ class NN_Trainer:
             "uv_anchor": uv_anchor.detach().clone(),
             "global_step": int(row.get("step", -1)),
             "stage_id": int(row.get("stage", 0)),
+            "decoder_representation": (
+                "phase1_implicit"
+                if int(row.get("stage", 0)) == 1
+                else "phase2_explicit"
+            ),
+            "decoder_class": decoder.__class__.__name__,
             "stage_local_step": int(row.get("stage_local_step", 0)),
             "row": _cpu_detached_tree(dict(row)),
             "raw_metrics": _cpu_detached_tree(dict(row)),
@@ -5237,6 +5577,13 @@ class NN_Trainer:
             "effective_lambdas": dict(effective_lambdas),
             "total_seed_count": float(row.get("total_seed_count", float("nan"))),
             "volume_fraction": float(row.get("VolFrac", float("nan"))),
+            "stress_max": float(row.get("stress_max", float("nan"))),
+            "disp_max": float(row.get("disp_max", float("nan"))),
+            "loss_total_fiber_length": float(row.get("loss_total_fiber_length", float("nan"))),
+            "phase1_voronoi_length": float(row.get("phase1_voronoi_length", float("nan"))),
+            "phase1_boundary_length": float(row.get("phase1_boundary_length", float("nan"))),
+            "primary_objective": float(row.get("primary_objective", float("nan"))),
+            "displacement_objective": float(row.get("displacement_objective", float("nan"))),
             "selected_checkpoint_stage_loss": float(row.get("L_total", float("nan"))),
             "valid": True,
         }
@@ -5397,26 +5744,29 @@ class NN_Trainer:
 
     @staticmethod
     def _stage_lambda_summary(row: dict[str, Any]) -> str:
+        stage = int(row.get("stage", 0))
+        fem = "on" if float(row.get("lam_fem_eff", 0.0)) != 0.0 else "off"
+        if stage == 1:
+            return (
+                f"P1(fem={fem}, "
+                f"cvt={float(row.get('lam_cvt_eff', 0.0)):.2g}, "
+                f"cont_len={float(row.get('lam_total_fiber_length_eff', 0.0)):.2g})"
+            )
         return (
-            f"S{int(row.get('stage', 0))} "
-            f"(fem={float(row.get('lam_fem_eff', 0.0)):.2g}, "
+            f"P2(fem={fem}, "
             f"cvt={float(row.get('lam_cvt_eff', 0.0)):.2g}, "
-            f"fiber={float(row.get('lam_total_fiber_length_eff', 0.0)):.2g}, "
-            f"cell={float(row.get('lam_l_curve_cell_eff', 0.0)):.2g}, "
+            f"exact_len={float(row.get('lam_total_fiber_length_eff', 0.0)):.2g}, "
             f"spacing={float(row.get('lam_seed_spacing_eff', 0.0)):.2g}, "
+            f"cell={float(row.get('lam_l_curve_cell_eff', 0.0)):.2g}, "
             ")"
         )
 
     @staticmethod
     def _optimization_mode_description(mode: str, stage_id: int) -> str:
-        mode = str(mode or "constrained_displacement").strip().lower()
-        if int(stage_id) == 1:
-            if mode == "target_length_constrained_displacement":
-                return "Stage 1 target length/topology preparation"
-            return "Stage 1 geometry/topology preparation"
-        if mode == "target_length_constrained_displacement":
-            return "Minimize displacement within the target length band"
-        return "Minimize fibre length under mechanical constraints"
+        mode = str(mode or "minimize_length").strip().lower()
+        if mode == "minimize_displacement_at_target_length":
+            return "Displacement Minimization at Target Length"
+        return "Length Minimization"
 
     @staticmethod
     def _objective_term_report(row: dict[str, Any]) -> list[dict[str, Any]]:
@@ -5450,9 +5800,8 @@ class NN_Trainer:
                 "details": str(details or ""),
             }
 
-        stage_id = int(row.get("stage", 0))
-        mode = str(row.get("optimization_mode", "constrained_displacement")).strip().lower()
-        target_mode = mode == "target_length_constrained_displacement"
+        mode = str(row.get("optimization_mode", "minimize_length")).strip().lower()
+        target_mode = mode == "minimize_displacement_at_target_length"
         fem_active = bool(row.get("fem_constraints_active", False))
         length_active = float(row.get("lam_total_fiber_length_eff", 0.0)) != 0.0
         cvt_active = float(row.get("lam_cvt_eff", 0.0)) != 0.0
@@ -5461,19 +5810,18 @@ class NN_Trainer:
 
         terms: list[dict[str, Any]] = []
         if target_mode:
-            if stage_id == 2:
-                terms.append(
-                    term(
-                        "displacement",
-                        "Displacement Lu",
-                        f("displacement_objective"),
-                        f("displacement_objective_weight", 1.0),
-                        active=True,
-                        raw=f("fem_displacement_p_norm", f("fem_displacement_max")),
-                        reference=f("fem_max_displacement", 1.0),
-                        details=f"mode={row.get('displacement_objective_mode', 'p_norm')}",
-                    )
+            terms.append(
+                term(
+                    "displacement",
+                    "Displacement Lu",
+                    f("displacement_objective"),
+                    f("displacement_objective_weight", 1.0),
+                    active=True,
+                    raw=f("fem_displacement_p_norm", f("fem_displacement_max")),
+                    reference=f("fem_max_displacement", 1.0),
+                    details=f"mode={row.get('displacement_objective_mode', 'p_norm')}",
                 )
+            )
             lower = f("target_total_length_lower")
             upper = f("target_total_length_upper")
             terms.append(
@@ -5485,7 +5833,9 @@ class NN_Trainer:
                     active=length_active,
                     raw=f("loss_total_fiber_length"),
                     details=(
-                        f"length={f('loss_total_fiber_length'):.6g}, "
+                        f"raw_total={f('loss_total_fiber_length'):.6g}, "
+                        f"voronoi={f('phase1_voronoi_length'):.6g}, "
+                        f"boundary={f('phase1_boundary_length'):.6g}, "
                         f"allowed=[{lower:.6g}, {upper:.6g}], "
                         f"under={f('target_total_length_under_violation'):.6g}, "
                         f"over={f('target_total_length_over_violation'):.6g}, "
@@ -5504,6 +5854,10 @@ class NN_Trainer:
                     active=length_active,
                     raw=f("loss_total_fiber_length"),
                     reference=f("loss_total_fiber_length_reference", 1.0),
+                    details=(
+                        f"voronoi={f('phase1_voronoi_length'):.6g}, "
+                        f"boundary={f('phase1_boundary_length'):.6g}"
+                    ),
                 )
             )
 
@@ -5561,30 +5915,29 @@ class NN_Trainer:
             ]
         )
 
-        if stage_id == 2:
-            terms.append(
-                term(
-                    "fem",
-                    "FEM",
-                    f("fem_total_loss", f("loss_fem")),
-                    f("lam_fem_eff"),
-                    active=fem_active,
-                    details=(
-                        f"baseline={f('fem_baseline_loss'):.6g}, "
-                        f"safety_margin={f('fem_safety_margin_loss'):.6g}, "
-                        f"hard_violation={f('fem_hard_violation_loss'):.6g}, "
-                        f"stress_margin={f('fem_stress_margin_loss'):.6g}, "
-                        f"disp_margin={f('fem_displacement_margin_loss'):.6g}, "
-                        f"hard_weight={f('fem_constraint_weight'):.6g}, "
-                        f"adaptive_multiplier={f('adaptive_lambda_fem', 1.0):.6g}"
-                    )
+        terms.append(
+            term(
+                "fem",
+                "FEM",
+                f("fem_total_loss", f("loss_fem")),
+                f("lam_fem_eff"),
+                active=fem_active,
+                details=(
+                    f"baseline={f('fem_baseline_loss'):.6g}, "
+                    f"safety_margin={f('fem_safety_margin_loss'):.6g}, "
+                    f"hard_violation={f('fem_hard_violation_loss'):.6g}, "
+                    f"stress_margin={f('fem_stress_margin_loss'):.6g}, "
+                    f"disp_margin={f('fem_displacement_margin_loss'):.6g}, "
+                    f"hard_weight={f('fem_constraint_weight'):.6g}, "
+                    f"adaptive_multiplier={f('adaptive_lambda_fem', 1.0):.6g}"
                 )
             )
+        )
         return terms
 
     @classmethod
     def _attach_objective_report(cls, row: dict[str, Any]) -> None:
-        mode = str(row.get("optimization_mode", "constrained_displacement")).strip().lower()
+        mode = str(row.get("optimization_mode", "minimize_length")).strip().lower()
         stage_id = int(row.get("stage", 0))
         row["optimization_mode_description"] = cls._optimization_mode_description(mode, stage_id)
         terms = cls._objective_term_report(row)
@@ -5772,6 +6125,20 @@ class NN_Trainer:
         return bad
 
     @classmethod
+    def _sanitize_nonfinite_grads(cls, modules) -> int:
+        replaced = 0
+        for _mi, _pn, p in cls._named_trainable_params(modules):
+            g = p.grad
+            if g is None:
+                continue
+            finite = torch.isfinite(g)
+            if bool(finite.all().detach().cpu().item()):
+                continue
+            replaced += int((~finite).sum().detach().cpu().item())
+            g.data = torch.nan_to_num(g.data, nan=0.0, posinf=0.0, neginf=0.0)
+        return replaced
+
+    @classmethod
     def _nonfinite_grad_cause_summary(
         cls,
         modules,
@@ -5897,6 +6264,103 @@ class NN_Trainer:
             )
 
         return keep_count
+
+    @staticmethod
+    def _rebase_ppnet_to_seed_positions(ppnet, seeds_uv: torch.Tensor) -> None:
+        seeds_uv = seeds_uv.detach().clone()
+        with torch.no_grad():
+            delta_head = getattr(ppnet, "delta_head", None)
+            if isinstance(delta_head, torch.nn.Module):
+                for parameter in delta_head.parameters():
+                    parameter.zero_()
+            independent_seed_offsets = getattr(ppnet, "independent_seed_offsets", None)
+            if isinstance(independent_seed_offsets, torch.nn.Parameter):
+                independent_seed_offsets.zero_()
+        ppnet.n_seeds = int(seeds_uv.shape[0])
+
+    def _phase1_handoff_from_decoder_output(
+        self,
+        decoder_out: dict[str, Any],
+        old_seed_count: int,
+        min_seed_count: int = 3,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        handoff_mask = decoder_out.get("phase2_seed_mask", None)
+        handoff_seeds = decoder_out.get("phase2_seeds_uv", None)
+        if not isinstance(handoff_mask, torch.Tensor) or handoff_mask.dtype != torch.bool:
+            raise ValueError("Phase-1 handoff requires bool tensor phase2_seed_mask.")
+        handoff_mask = handoff_mask.detach().reshape(-1)
+        if int(handoff_mask.numel()) != int(old_seed_count):
+            raise ValueError(
+                "Phase-1 handoff mask shape mismatch: "
+                f"got {tuple(handoff_mask.shape)}, expected [{int(old_seed_count)}]."
+            )
+        if not isinstance(handoff_seeds, torch.Tensor):
+            raise ValueError("Phase-1 handoff requires tensor phase2_seeds_uv.")
+        handoff_seeds = handoff_seeds.detach().clone()
+        new_seed_count = int(handoff_mask.sum().item())
+        if handoff_seeds.ndim != 2 or int(handoff_seeds.shape[1]) != 2:
+            raise ValueError(
+                "phase2_seeds_uv must have shape [new_seed_count, 2], "
+                f"got {tuple(handoff_seeds.shape)}."
+            )
+        if int(handoff_seeds.shape[0]) != new_seed_count:
+            raise ValueError(
+                "Phase-1 handoff seed count mismatch: "
+                f"mask keeps {new_seed_count}, phase2_seeds_uv has {int(handoff_seeds.shape[0])}."
+            )
+        if new_seed_count < int(min_seed_count):
+            raise ValueError(
+                "Phase-1 handoff would leave too few seeds for the explicit decoder: "
+                f"{new_seed_count} < {int(min_seed_count)}."
+            )
+        if not torch.isfinite(handoff_seeds).all():
+            raise ValueError("Phase-1 handoff seeds contain non-finite values.")
+        handoff_xyz = decoder_out.get("phase2_seeds_xyz", None)
+        if isinstance(handoff_xyz, torch.Tensor) and int(handoff_xyz.shape[0]) == new_seed_count:
+            if new_seed_count > 1:
+                d = torch.cdist(handoff_xyz.detach(), handoff_xyz.detach())
+                d = d.masked_fill(
+                    torch.eye(new_seed_count, device=d.device, dtype=torch.bool),
+                    float("inf"),
+                )
+                min_dist = float(d.min().detach().cpu().item())
+            else:
+                min_dist = float("inf")
+            decoder_out["minimum_handoff_seed_distance_3d"] = min_dist
+            threshold = (
+                float(getattr(self.cfg, "phase1_duplicate_merge_distance_factor", 1.10))
+                * float(self.cfg.strut_thickness)
+            )
+            if min_dist < threshold:
+                raise ValueError(
+                    "Phase-1 handoff retained physically duplicated seeds: "
+                    f"minimum_handoff_seed_distance_3d={min_dist:.6g} < {threshold:.6g}."
+                )
+        return handoff_mask, handoff_seeds
+
+    def _evaluate_phase1_handoff(
+        self,
+        phase1_decoder,
+        ppnet,
+        face_tensor: dict[str, Any],
+        uv_anchor: torch.Tensor,
+        surface_area_weights: torch.Tensor,
+        offset_scale: float,
+    ) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor]:
+        with torch.no_grad():
+            pred = ppnet(uv_anchor, offset_scale=offset_scale)
+            phase1_out = self._phase1_decoder_forward(
+                phase1_decoder,
+                ft=face_tensor,
+                seeds_raw=pred["seeds_raw"],
+                surface_area_weights=surface_area_weights,
+            )
+            handoff_mask, handoff_seeds = self._phase1_handoff_from_decoder_output(
+                phase1_out,
+                old_seed_count=int(pred["seeds_raw"].shape[0]),
+                min_seed_count=int(getattr(self.cfg, "min_seed_count_after_target_length_prune", 3)),
+            )
+        return phase1_out, handoff_mask, handoff_seeds
 
     def _print_fem_failure(self, step: int):
         print(f"\n=== FEM FAILURE AT STEP {step} ===")
@@ -6175,11 +6639,44 @@ class NN_Trainer:
         return cache
 
     def evaluate_cached_face_fields(self, render_cache, decoder, pred):
-        decoder_out = decoder(
-            seeds_uv=pred["seeds_raw"],
-            generate_density_fiber=getattr(self.cfg, "generate_decoder_density_fiber", True),
-        )
-        if getattr(self.cfg, "generate_decoder_density_fiber", True):
+        generate_density_fiber = getattr(self.cfg, "generate_decoder_density_fiber", True)
+        with torch.no_grad():
+            if isinstance(decoder, self.phase1_decoder_cls):
+                seeds_raw = pred["seeds_raw"]
+                w_raw = torch.zeros(
+                    (int(seeds_raw.shape[0]), int(seeds_raw.shape[0])),
+                    dtype=seeds_raw.dtype,
+                    device=seeds_raw.device,
+                )
+                points_uv = render_cache["uv_dense"]
+                face_id = self._face_id_key(render_cache.get("face_id", 0))
+                points_face_id = torch.full(
+                    (int(points_uv.shape[0]),),
+                    face_id,
+                    dtype=torch.long,
+                    device=points_uv.device,
+                )
+                decoder_out = decoder(
+                    points_uv=points_uv,
+                    points_3d=render_cache.get("xyz_dense", render_cache.get("points_xyz", None)),
+                    Xu=render_cache["Xu_dense"],
+                    Xv=render_cache["Xv_dense"],
+                    tau=float(getattr(self.cfg, "phase1_tau", 0.01)),
+                    seeds_raw=seeds_raw,
+                    w_raw=w_raw,
+                    h_raw=None,
+                    points_face_id=points_face_id,
+                    seed_domain_mask=render_cache.get("seed_domain_mask", None),
+                    seed_domain_mask_threshold=float(self.cfg.seed_domain_mask_threshold),
+                    seed_domain_temp=float(self.cfg.seed_domain_temp),
+                    surface_area_weights=None,
+                )
+            else:
+                decoder_out = decoder(
+                    seeds_uv=pred["seeds_raw"],
+                    generate_density_fiber=generate_density_fiber,
+                )
+        if generate_density_fiber:
             decoder_out = apply_density_postprocess_to_output(
                 decoder_out,
                 render_cache,
@@ -6221,6 +6718,184 @@ class NN_Trainer:
         }
         fields.update(curve_length_fields)
         return fields
+
+    def _decoder_handoff_metrics(
+        self,
+        *,
+        label: str,
+        decoder_out: dict[str, Any],
+        seeds_uv: torch.Tensor,
+        fallback_row: dict[str, Any] | None = None,
+        active_count: int | None = None,
+        inactive_count: int | None = None,
+        surface_area_weights: torch.Tensor | None = None,
+    ) -> dict[str, float | str]:
+        fallback_row = fallback_row or {}
+        length_fields = curve_length_fields_from_decoder_output(decoder_out)
+
+        def scalar(*keys, default=float("nan")):
+            for key in keys:
+                value = decoder_out.get(key, length_fields.get(key, fallback_row.get(key, None)))
+                if isinstance(value, torch.Tensor):
+                    if value.numel() == 0:
+                        continue
+                    value = value.detach().reshape(-1)[0]
+                try:
+                    out = float(value)
+                except Exception:
+                    continue
+                if math.isfinite(out):
+                    return out
+            return float(default)
+
+        rho = decoder_out.get("rho", None)
+        if isinstance(rho, torch.Tensor) and rho.numel() > 0:
+            rho_flat = rho.detach().reshape(-1)
+            if isinstance(surface_area_weights, torch.Tensor) and surface_area_weights.numel() == rho_flat.numel():
+                w = surface_area_weights.detach().to(device=rho_flat.device, dtype=rho_flat.dtype).reshape(-1)
+                volume_fraction = float((rho_flat * w).sum().div(w.sum().clamp_min(1.0e-12)).item())
+            else:
+                volume_fraction = float(rho_flat.mean().item())
+        else:
+            volume_fraction = scalar("VolFrac")
+
+        seeds_xyz = decoder_out.get("phase2_seeds_xyz", decoder_out.get("seeds_xyz", None))
+        min_seed_distance = float("nan")
+        if isinstance(seeds_xyz, torch.Tensor) and seeds_xyz.ndim == 2 and seeds_xyz.shape[0] >= 2:
+            xyz = seeds_xyz.detach()
+            if torch.isfinite(xyz).all():
+                d = torch.cdist(xyz, xyz)
+                d = d.clone()
+                d.fill_diagonal_(float("inf"))
+                min_seed_distance = float(d.amin().item())
+
+        total_length = scalar(
+            "continuous_total_curve_length",
+            "total_curve_length",
+            "loss_total_fiber_length",
+        )
+        interior_length = scalar(
+            "continuous_voronoi_length",
+            "total_voronoi_curve_length",
+            "phase1_voronoi_length",
+            default=total_length,
+        )
+        boundary_length = scalar("boundary_curve_length", "phase1_boundary_length", default=0.0)
+        return {
+            "label": str(label),
+            "seeds": float(int(seeds_uv.shape[0])),
+            "active": float(active_count if active_count is not None else int(seeds_uv.shape[0])),
+            "inactive": float(inactive_count if inactive_count is not None else 0),
+            "total_length": float(total_length),
+            "interior_length": float(interior_length),
+            "boundary_length": float(boundary_length),
+            "volume_fraction": float(volume_fraction),
+            "max_stress": scalar("stress_max"),
+            "max_displacement": scalar("disp_max"),
+            "displacement_objective": scalar("displacement_objective"),
+            "stress_ratio": scalar("physical_stress_ratio"),
+            "displacement_ratio": scalar("physical_displacement_ratio"),
+            "minimum_physical_seed_distance": float(min_seed_distance),
+        }
+
+    @classmethod
+    def _format_handoff_metrics_block(cls, title: str, metrics: dict[str, Any]) -> str:
+        return (
+            f"{title}\n"
+            "----------------------------------------------------------------------\n"
+            f"seeds                         : {cls._console_count(metrics.get('seeds'))}\n"
+            f"active                        : {cls._console_count(metrics.get('active'))}\n"
+            f"inactive                      : {cls._console_count(metrics.get('inactive'))}\n"
+            f"total length                  : {cls._console_float(metrics.get('total_length'))}\n"
+            f"interior/Voronoi length       : {cls._console_float(metrics.get('interior_length'))}\n"
+            f"boundary length               : {cls._console_float(metrics.get('boundary_length'))}\n"
+            f"volume fraction               : {cls._console_float(metrics.get('volume_fraction'))}\n"
+            f"max stress                    : {cls._console_float(metrics.get('max_stress'))}\n"
+            f"max displacement              : {cls._console_float(metrics.get('max_displacement'))}\n"
+            f"displacement objective        : {cls._console_float(metrics.get('displacement_objective'))}\n"
+            f"stress ratio                  : {cls._console_float(metrics.get('stress_ratio'))}\n"
+            f"displacement ratio            : {cls._console_float(metrics.get('displacement_ratio'))}\n"
+            f"minimum physical seed distance: {cls._console_float(metrics.get('minimum_physical_seed_distance'))}"
+        )
+
+    @staticmethod
+    def _relative_delta(new_value: float, old_value: float) -> float:
+        try:
+            new_value = float(new_value)
+            old_value = float(old_value)
+        except Exception:
+            return float("nan")
+        if not math.isfinite(new_value) or not math.isfinite(old_value) or abs(old_value) <= 1.0e-12:
+            return float("nan")
+        return 100.0 * (new_value - old_value) / abs(old_value)
+
+    def _render_handoff_comparison_frame(
+        self,
+        *,
+        first_cache,
+        phase1_full_out,
+        phase2_out,
+        all_seeds,
+        survivor_mask,
+        survivor_seeds,
+        phase2_decoder,
+        summary_lines: list[str],
+    ):
+        pred_phase1 = {
+            "seeds_uv": all_seeds,
+            "seeds_raw": all_seeds,
+            "seed_visual_inactive_mask": (~survivor_mask.detach().bool()).to(device=all_seeds.device),
+        }
+        left = self._render_first_face_density_2d(
+            cache_i=first_cache,
+            out_i={
+                "rho_dense": phase1_full_out.get("rho", None),
+                "seeds_uv": all_seeds,
+                "topology_seeds_uv": all_seeds,
+            },
+            seeds_i=all_seeds,
+            pred_i=pred_phase1,
+            window_size=(760, 760),
+            show_scipy_voronoi=False,
+            show_core_curves=False,
+        )
+        right = self._render_first_face_generated_graph_2d(
+            decoder=phase2_decoder,
+            out_i=phase2_out,
+            seeds_i=survivor_seeds,
+            window_size=(760, 760),
+            show_node_ids=False,
+            show_edge_ids=False,
+        )
+        left = self._add_panel_border(self._add_image_title(left, "Stage 1 — Implicit | UV Density"))
+        right = self._add_panel_border(self._add_image_title(right, "Stage 2 — Explicit | Connectivity Graph"))
+        top = self._stack_row_with_gaps([left, right], gap=28)
+        text_h = 260
+        text_img = np.full((text_h, top.shape[1], 3), 255, dtype=np.uint8)
+        cv2.putText(
+            text_img,
+            "PHASE 1 -> PHASE 2 HANDOFF",
+            (24, 44),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.05,
+            (17, 24, 39),
+            3,
+            cv2.LINE_AA,
+        )
+        y = 86
+        for line in summary_lines[:7]:
+            cv2.putText(
+                text_img,
+                str(line),
+                (28, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.62,
+                (55, 65, 81),
+                2,
+                cv2.LINE_AA,
+            )
+            y += 30
+        return np.vstack([text_img, top])
 
     @staticmethod
     def _concat_polydata(meshes, scalar_name=None):
@@ -6645,6 +7320,7 @@ class NN_Trainer:
         first_face_voronoi_img = None
         first_face_graph_img = None
         first_face_core_curves_img = None
+        stage_is_implicit = False
         if render_cache:
             first_cache = render_cache[0]
             first_face_id = first_cache["face_id"]
@@ -6653,6 +7329,8 @@ class NN_Trainer:
                 dec_by_face_id[first_face_id],
                 pred_by_face_id[first_face_id],
             )
+            graph_i = first_out.get("graph", None)
+            stage_is_implicit = torch.is_tensor(first_out.get("continuous_voronoi_length", None)) or not isinstance(graph_i, dict)
             first_seed_idx = 0
             for idx, ft in enumerate(self.current_face_tensors):
                 if self._face_id_key(ft.get("face_id", 0)) == first_face_id:
@@ -6664,17 +7342,18 @@ class NN_Trainer:
                 seeds_i=first_out.get("seeds_uv", seeds_list[first_seed_idx]),
                 pred_i=pred_by_face_id[first_face_id],
                 window_size=(1050, 1050),
-                show_scipy_voronoi=True,
+                show_scipy_voronoi=not stage_is_implicit,
                 show_core_curves=False,
             )
-            first_face_graph_img = self._render_first_face_generated_graph_2d(
-                decoder=dec_by_face_id[first_face_id],
-                out_i=first_out,
-                seeds_i=first_out.get("seeds_uv", seeds_list[first_seed_idx]),
-                window_size=(1050, 1050),
-                show_node_ids=False,
-                show_edge_ids=False,
-            )
+            if not stage_is_implicit:
+                first_face_graph_img = self._render_first_face_generated_graph_2d(
+                    decoder=dec_by_face_id[first_face_id],
+                    out_i=first_out,
+                    seeds_i=first_out.get("seeds_uv", seeds_list[first_seed_idx]),
+                    window_size=(1050, 1050),
+                    show_node_ids=False,
+                    show_edge_ids=False,
+                )
             first_face_core_curves_img = self._render_first_face_density_2d(
                 cache_i=first_cache,
                 out_i=first_out,
@@ -6813,7 +7492,11 @@ class NN_Trainer:
                 self._add_panel_border(
                     self._add_image_title(
                         first_face_voronoi_img,
-                        "Exact SciPy Voronoi"
+                        (
+                            "UV Implicit Density + Seeds"
+                            if stage_is_implicit
+                            else "Stage 2 - Explicit Decoder | Exact SciPy Voronoi"
+                        )
                         )
                 )
             )
@@ -6822,7 +7505,7 @@ class NN_Trainer:
                 self._add_panel_border(
                     self._add_image_title(
                         first_face_graph_img,
-                        "Connectivity Graph"
+                        "Stage 2 - Explicit Decoder | Connectivity Graph"
                     )
                 )
             )
@@ -6831,7 +7514,7 @@ class NN_Trainer:
                 self._add_panel_border(
                     self._add_image_title(
                         first_face_core_curves_img,
-                        "Core Curves UV"
+                        "Implicit UV Curves + Seeds" if stage_is_implicit else "Core Curves UV"
                         )
                 )
             )
@@ -6882,6 +7565,13 @@ class NN_Trainer:
         first_face_voronoi_img = None
         first_face_graph_img = None
         first_face_core_curves_img = None
+        current_stage_id = 0
+        if history_rows:
+            try:
+                current_stage_id = int((list(history_rows)[-1] or {}).get("stage", 0))
+            except Exception:
+                current_stage_id = 0
+        stage_is_implicit = current_stage_id == 1
 
         for face_i, (decoder, pred, cache) in enumerate(zip(decoders, pred_list, render_cache)):
             fields = self.evaluate_cached_face_fields(cache, decoder, pred)
@@ -6893,17 +7583,18 @@ class NN_Trainer:
                     seeds_i=fields.get("seeds_uv", seeds_list[face_i]),
                     pred_i=pred,
                     window_size=(650, 650),
-                    show_scipy_voronoi=True,
+                    show_scipy_voronoi=not stage_is_implicit,
                     show_core_curves=False,
                 )
-                first_face_graph_img = self._render_first_face_generated_graph_2d(
-                    decoder=decoder,
-                    out_i=fields,
-                    seeds_i=fields.get("seeds_uv", seeds_list[face_i]),
-                    window_size=(650, 650),
-                    show_node_ids=False,
-                    show_edge_ids=False,
-                )
+                if not stage_is_implicit:
+                    first_face_graph_img = self._render_first_face_generated_graph_2d(
+                        decoder=decoder,
+                        out_i=fields,
+                        seeds_i=fields.get("seeds_uv", seeds_list[face_i]),
+                        window_size=(650, 650),
+                        show_node_ids=False,
+                        show_edge_ids=False,
+                    )
                 first_face_core_curves_img = self._render_first_face_density_2d(
                     cache_i=cache,
                     out_i=fields,
@@ -6913,6 +7604,9 @@ class NN_Trainer:
                     show_scipy_voronoi=False,
                     show_core_curves=True,
                 )
+
+            if stage_is_implicit:
+                continue
 
             curves = fields.get("edge_curves_xyz", None)
             if curves is None:
@@ -7009,44 +7703,46 @@ class NN_Trainer:
             if seed_mesh.n_points > 0:
                 inactive_seed_meshes.append(seed_mesh)
 
-        plotter = pv.Plotter(off_screen=True, window_size=(900, 650))
-        plotter.set_background("white")
+        tube_img = None
+        if not stage_is_implicit:
+            plotter = pv.Plotter(off_screen=True, window_size=(900, 650))
+            plotter.set_background("white")
 
-        for mesh, color in tube_meshes:
-            if mesh.n_points > 0:
-                plotter.add_mesh(mesh, color=color, smooth_shading=True)
+            for mesh, color in tube_meshes:
+                if mesh.n_points > 0:
+                    plotter.add_mesh(mesh, color=color, smooth_shading=True)
 
-        for sm in active_seed_meshes:
-            if sm.n_points > 0:
-                plotter.add_mesh(
-                    sm,
-                    color="red",
-                    point_size=8,
-                    render_points_as_spheres=True,
+            for sm in active_seed_meshes:
+                if sm.n_points > 0:
+                    plotter.add_mesh(
+                        sm,
+                        color="red",
+                        point_size=8,
+                        render_points_as_spheres=True,
+                    )
+            for sm in inactive_seed_meshes:
+                if sm.n_points > 0:
+                    plotter.add_mesh(
+                        sm,
+                        color="#2563eb",
+                        point_size=10,
+                        render_points_as_spheres=True,
+                    )
+
+            if not tube_meshes and not active_seed_meshes and not inactive_seed_meshes:
+                plotter.add_text("No 3D tube curves", color="black", font_size=14)
+
+            plotter.view_isometric()
+            plotter.reset_camera()
+            img = plotter.screenshot(return_img=True)
+            plotter.close()
+
+            tube_img = self._add_panel_border(
+                self._add_image_title(
+                    self._composite_to_white(img),
+                    "3D Voronoi Tube Curves",
                 )
-        for sm in inactive_seed_meshes:
-            if sm.n_points > 0:
-                plotter.add_mesh(
-                    sm,
-                    color="#2563eb",
-                    point_size=10,
-                    render_points_as_spheres=True,
-                )
-
-        if not tube_meshes and not active_seed_meshes and not inactive_seed_meshes:
-            plotter.add_text("No 3D tube curves", color="black", font_size=14)
-
-        plotter.view_isometric()
-        plotter.reset_camera()
-        img = plotter.screenshot(return_img=True)
-        plotter.close()
-
-        tube_img = self._add_panel_border(
-            self._add_image_title(
-                self._composite_to_white(img),
-                "3D Voronoi Tube Curves",
             )
-        )
 
         def _field_to_vtk_cell_order(field):
             if field is None or self.shell_problem is None:
@@ -7324,6 +8020,29 @@ class NN_Trainer:
                     plot_row["L_total_norm"] = value / total_loss_baseline
             normalized_history_rows.append(plot_row)
 
+        displacement_baseline = None
+        for row in list(history_rows or []):
+            for key in ("displacement_objective", "fem_displacement_p_norm", "disp_max"):
+                try:
+                    value = float(row.get(key, float("nan")))
+                except (TypeError, ValueError):
+                    value = float("nan")
+                if math.isfinite(value) and value > 0.0:
+                    displacement_baseline = value
+                    break
+            if displacement_baseline is not None:
+                break
+        if displacement_baseline is not None:
+            for plot_row in normalized_history_rows:
+                for key in ("displacement_objective", "fem_displacement_p_norm", "disp_max"):
+                    try:
+                        value = float(plot_row.get(key, float("nan")))
+                    except (TypeError, ValueError):
+                        value = float("nan")
+                    if math.isfinite(value):
+                        plot_row["displacement_history_norm"] = value / displacement_baseline
+                        break
+
         total_loss_hist_img = _render_history_plot(
             normalized_history_rows,
             keys=["L_total_norm"],
@@ -7334,9 +8053,9 @@ class NN_Trainer:
         )
         fem_hist_img = _render_history_plot(
             normalized_history_rows,
-            keys=["L_FEM_norm"],
-            title="Normalized FEM Loss History",
-            ylabel="Normalized FEM Loss",
+            keys=["displacement_history_norm"],
+            title="Normalized Displacement History",
+            ylabel="Normalized Displacement",
             colors=["#2563eb"],
             ylim=[0.0, 2.0],
         )
@@ -7349,26 +8068,38 @@ class NN_Trainer:
             ylim=[0.0, 2.0],
         )
 
-        if first_face_voronoi_img is None or first_face_graph_img is None or first_face_core_curves_img is None:
+        if first_face_voronoi_img is None or (not stage_is_implicit and first_face_graph_img is None) or first_face_core_curves_img is None:
             panels = [p for p in [loading_img, tube_img, density_img, stress_img, displacement_img] if p is not None]
             return self._stack_row_with_gaps(panels, gap=22) if panels else tube_img
 
         voronoi_img = self._add_panel_border(
             self._add_image_title(
                 first_face_voronoi_img,
-                "Exact SciPy Voronoi",
+                (
+                    "UV Implicit Density + Seeds"
+                    if stage_is_implicit
+                    else "Stage 2 - Explicit Decoder | Exact SciPy Voronoi"
+                ),
             )
         )
-        graph_img = self._add_panel_border(
-            self._add_image_title(
-                first_face_graph_img,
-                "Connectivity Graph",
+        graph_img = (
+            self._add_panel_border(
+                self._add_image_title(
+                    first_face_graph_img,
+                    "Stage 2 - Explicit Decoder | Connectivity Graph",
+                )
             )
+            if first_face_graph_img is not None
+            else None
         )
         core_curves_img = self._add_panel_border(
             self._add_image_title(
                 first_face_core_curves_img,
-                "Core Curves UV",
+                (
+                    "Implicit UV Curves + Seeds"
+                    if stage_is_implicit
+                    else "Core Curves UV"
+                ),
             )
         )
         def _fit_panel_to_box(img, width, height):
@@ -7398,13 +8129,15 @@ class NN_Trainer:
                     self._add_image_title(loading_panel, "Loading And Boundary Conditions")
                 )
             )
-        if generate_density_fiber:
+        if stage_is_implicit:
+            top_panels.extend([p for p in [voronoi_img, core_curves_img] if p is not None])
+        elif generate_density_fiber:
             if loading_img is not None:
-                top_panels.extend([graph_img, tube_img])
+                top_panels.extend([p for p in [graph_img, tube_img] if p is not None])
             else:
-                top_panels.extend([voronoi_img, graph_img, tube_img])
+                top_panels.extend([p for p in [voronoi_img, graph_img, tube_img] if p is not None])
         else:
-            top_panels.extend([voronoi_img, graph_img])
+            top_panels.extend([p for p in [voronoi_img, graph_img] if p is not None])
         top_panels = top_panels[:3]
 
         if generate_density_fiber:
@@ -7459,6 +8192,12 @@ class NN_Trainer:
         width, height = int(window_size[0]), int(window_size[1])
         uv = cache_i["uv_dense"].detach().cpu().numpy().astype(np.float64)
         faces = cache_i["faces_ijk"].detach().cpu().numpy().astype(np.int64)
+        rho_t = out_i.get("rho_dense", out_i.get("rho", None))
+        rho = None
+        if isinstance(rho_t, torch.Tensor):
+            rho = rho_t.detach().cpu().numpy().astype(np.float64).reshape(-1)
+        elif rho_t is not None:
+            rho = np.asarray(rho_t, dtype=np.float64).reshape(-1)
         raw_seeds_t = pred_i.get("seeds_uv", seeds_i)
         seeds = raw_seeds_t.detach().cpu().numpy().astype(np.float64)
         topology_seeds_t = out_i.get("topology_seeds_uv", None)
@@ -7475,14 +8214,61 @@ class NN_Trainer:
         fig = plt.figure(figsize=(width / 100.0, height / 100.0), dpi=100, facecolor="white")
         ax = fig.add_axes([0.08, 0.08, 0.88, 0.84])
 
+        if rho is not None and rho.shape[0] == uv.shape[0] and np.isfinite(rho).any():
+            try:
+                if faces.size > 0:
+                    tri = ax.tricontourf(
+                        uv[:, 0],
+                        uv[:, 1],
+                        faces,
+                        rho,
+                        levels=np.linspace(0.0, 1.0, 16),
+                        cmap="viridis",
+                        vmin=0.0,
+                        vmax=1.0,
+                        alpha=0.92,
+                        zorder=0,
+                    )
+                    if np.nanmin(rho) <= 0.5 <= np.nanmax(rho):
+                        ax.tricontour(
+                            uv[:, 0],
+                            uv[:, 1],
+                            faces,
+                            rho,
+                            levels=[0.5],
+                            colors="black",
+                            linewidths=1.15,
+                            alpha=0.9,
+                            zorder=3,
+                        )
+                else:
+                    tri = ax.scatter(
+                        uv[:, 0],
+                        uv[:, 1],
+                        c=rho,
+                        cmap="viridis",
+                        vmin=0.0,
+                        vmax=1.0,
+                        s=9,
+                        linewidths=0,
+                        alpha=0.92,
+                        zorder=0,
+                    )
+                cbar = fig.colorbar(tri, ax=ax, fraction=0.046, pad=0.02)
+                cbar.set_label("rho", fontsize=9)
+                cbar.ax.tick_params(labelsize=8)
+            except Exception:
+                rho = None
+
         if faces.size > 0:
             ax.triplot(
                 uv[:, 0],
                 uv[:, 1],
                 faces,
-                color="#d1d5db",
-                linewidth=0.35,
-                alpha=0.5,
+                color="#d1d5db" if rho is None else "#f3f4f6",
+                linewidth=0.35 if rho is None else 0.22,
+                alpha=0.5 if rho is None else 0.25,
+                zorder=1,
             )
         else:
             ax.scatter(
@@ -7561,6 +8347,7 @@ class NN_Trainer:
                     c="#ef4444",
                     edgecolors="white",
                     linewidths=1.6,
+                    label="Active seed",
                     zorder=6,
                 )
             if np.any(inactive_mask):
@@ -7571,7 +8358,18 @@ class NN_Trainer:
                     c="#2563eb",
                     edgecolors="white",
                     linewidths=1.8,
+                    label="Inactive seed",
                     zorder=7,
+                )
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:
+                by_label = dict(zip(labels, handles))
+                ax.legend(
+                    by_label.values(),
+                    by_label.keys(),
+                    fontsize=8,
+                    loc="upper right",
+                    framealpha=0.86,
                 )
 
         if show_core_curves and curves_uv is not None and curves_uv.ndim == 3:
@@ -8712,6 +9510,10 @@ class NN_Trainer:
         stage_end_summaries: list[dict[str, Any]] = []
         best_feasible_checkpoint = None
         best_feasible_key = (float("inf"), float("inf"), float("inf"))
+        best_feasible_stage1_checkpoint = None
+        best_feasible_stage1_key = (float("inf"), float("inf"), float("inf"))
+        best_feasible_stage2_checkpoint = None
+        best_feasible_stage2_key = (float("inf"), float("inf"), float("inf"))
         best_infeasible_checkpoint = None
         best_infeasible_key = (float("inf"), float("inf"), float("inf"))
         last_valid_checkpoint = None
@@ -8723,7 +9525,7 @@ class NN_Trainer:
         stage1_transition_checkpoint_source = None
         physical_checkpoint_trackers_reset = first_physical_stage <= 1
         startup_optimization_mode = str(
-            getattr(cfg, "optimization_mode", "constrained_displacement")
+            getattr(cfg, "optimization_mode", "minimize_length")
         ).strip().lower()
         tqdm.write(f"Optimization mode: {startup_optimization_mode}")
         tqdm.write(
@@ -8789,22 +9591,19 @@ class NN_Trainer:
                 fem_elems = 0
             
 
-            load_value = (
-            float(getattr(self.shell_problem, "Load_magnitude", 0.0))
-            if self.shell_problem is not None
-            else 0.0
-        )
             geometry_summary = self._timelapse_geometry_summary(face_tensors)
             recorder = TimelapseRecorder(
                 out_dir=frame_out_dir,
                 video_path=video_path,
                 fps=8,
-                header_title=(
-                    f"{shape_path.name} ({geometry_summary}) | "
-                    f"BC: {cfg.LoadingCase} (F = {load_value:.3f} , FEM elements: {fem_elems})"
+                header_title=self._timelapse_header_title(
+                    shape_name=shape_path.name,
+                    geometry_summary=geometry_summary,
+                    loading_case=cfg.LoadingCase,
+                    fem_elems=fem_elems,
                 ),
                 header_subtitle=(
-                    f"Mode: {startup_optimization_mode} | "
+                    f"Mode: {self._optimization_mode_description(startup_optimization_mode, 2)} | "
                     f"Objective: {self._optimization_mode_description(startup_optimization_mode, 2)}. | "
                     f"{self._timelapse_optimized_parameter_summary()}"
                 ),
@@ -8855,7 +9654,7 @@ class NN_Trainer:
             getattr(
                 cfg,
                 "fem_lambda_initial",
-                max(float(getattr(cfg, "stage2_lam_fem", 1.0)), 1.0),
+                1.0 if bool(getattr(cfg, "fem_enabled", True)) else 0.0,
             )
         )
         # ------------------------------------------------------------
@@ -8982,14 +9781,18 @@ class NN_Trainer:
                 stage_id = int(stage_settings["stage"])
                 stage_local_step = int(current_stage_runtime.local_step)
                 stage_max_steps = int(current_stage_runtime.spec.max_steps)
+                is_stage_first_step = stage_local_step == 0
+                if is_stage_first_step:
+                    should_log = True
+                    should_record_timelapse = bool(cfg.MakeTimelaps)
                 optimization_mode = str(
-                    getattr(cfg, "optimization_mode", "constrained_displacement")
+                    getattr(cfg, "optimization_mode", "minimize_length")
                 ).strip().lower()
                 target_length_mode = (
-                    optimization_mode == "target_length_constrained_displacement"
+                    optimization_mode == "minimize_displacement_at_target_length"
                 )
                 target_length_active = target_length_mode
-                target_length_stage1_prepare = target_length_mode and int(stage_id) == 1
+                target_length_stage1_prepare = False
                 target_length_lock_enabled = (
                     target_length_active
                     and (
@@ -9056,6 +9859,8 @@ class NN_Trainer:
                 cvt_terms = []
                 cvt_inputs = []
                 total_fiber_length_terms = []
+                phase1_voronoi_length_terms = []
+                phase1_boundary_length_terms = []
                 curve_length_values = []
                 l_curve_cell_terms = []
                 cell_area_values = []
@@ -9070,6 +9875,9 @@ class NN_Trainer:
                 visual_partial_active_seed_count_total = 0
                 visual_inactive_seed_records = []
                 visual_partial_active_seed_records = []
+                phase1_soft_active_seed_count_total = 0.0
+                phase1_duplicate_suppressed_count_total = 0.0
+                phase1_handoff_candidate_count_total = 0.0
 
                 # Activate losses based on the current stage lambdas. If a lambda is
                 # zero, the corresponding loss is not computed and remains zero.
@@ -9117,13 +9925,19 @@ class NN_Trainer:
                     reset_physical_checkpoint_trackers(first_physical_stage)
 
 
+                stage_uses_phase1_decoder = int(stage_id) == 1
                 compute_cvt_loss = lam_cvt_step != 0.0
-                compute_seed_spacing_loss = float(cfg.lam_seed_spacing) != 0.0
+                compute_seed_spacing_loss = (
+                    float(stage_settings.get("lam_seed_spacing", 0.0)) != 0.0
+                )
                 compute_total_fiber_length_loss = (
                     lam_total_fiber_length_step != 0.0
                     or target_length_active
                 )
-                compute_l_curve_cell_loss = lam_l_curve_cell_step != 0.0
+                compute_l_curve_cell_loss = (
+                    (not stage_uses_phase1_decoder)
+                    and lam_l_curve_cell_step != 0.0
+                )
                 fem_constraints_active = fem_stage_enabled and bool(cfg.generate_decoder_density_fiber)
                 cvt_uses_fem_displacement = (
                     compute_cvt_loss
@@ -9133,12 +9947,15 @@ class NN_Trainer:
                 cvt_importance_mode = "displacement_pending" if cvt_uses_fem_displacement else "uniform"
                 # Checkpoint rows feed adaptive topology control and final timelapse
                 # summaries, so keep topology diagnostics available on every step.
-                collect_topology_metrics = True
+                collect_topology_metrics = not stage_uses_phase1_decoder
                 collect_curve_metrics = (
-                    should_log
-                    or should_record_timelapse
-                    or compute_total_fiber_length_loss
-                    or collect_topology_metrics
+                    (not stage_uses_phase1_decoder)
+                    and (
+                        should_log
+                        or should_record_timelapse
+                        or compute_total_fiber_length_loss
+                        or collect_topology_metrics
+                    )
                 )
 
                 # Determine whether to update seed anchors based on the configuration and current step, seed anchors are reference points used in the training process.
@@ -9165,11 +9982,13 @@ class NN_Trainer:
                     if freeze_seed_motion_step:
                         seeds_raw_i = seeds_raw_i.detach()
                         pred_i["seeds_raw"] = seeds_raw_i
-                    Gen_den_fiber= getattr(cfg, "generate_decoder_density_fiber", True)
-                    if(current_stage_runtime.spec.stage_id==1):
-                        Gen_den_fiber =False
-                    decoder_out = decoder(
-                        seeds_uv=seeds_raw_i,
+                    Gen_den_fiber = getattr(cfg, "generate_decoder_density_fiber", True)
+                    decoder_out = self._run_active_decoder(
+                        decoder,
+                        ft=ft,
+                        seeds_raw=seeds_raw_i,
+                        surface_area_weights=A_local,
+                        stage_id=stage_id,
                         generate_density_fiber=Gen_den_fiber,
                     )
                     self._require_decoder_keys(
@@ -9182,6 +10001,16 @@ class NN_Trainer:
                     seed_visual_inactive_ids_i = decoder_out.get("seed_visual_inactive_ids", None)
                     seed_visual_outside_domain_mask_i = decoder_out.get("seed_visual_outside_domain_mask", None)
                     seed_visual_participates_mask_i = decoder_out.get("seed_visual_participates_in_domain_vd_mask", None)
+                    if stage_uses_phase1_decoder:
+                        phase1_soft_active_seed_count_total += self._finite_or_default(
+                            decoder_out.get("soft_active_seed_count", 0.0)
+                        )
+                        phase1_duplicate_suppressed_count_total += self._finite_or_default(
+                            decoder_out.get("phase1_duplicate_suppressed_count", 0.0)
+                        )
+                        phase1_handoff_candidate_count_total += self._finite_or_default(
+                            decoder_out.get("phase2_handoff_seed_count", 0.0)
+                        )
                     seed_spacing_valid_mask_i = None
                     if (
                         isinstance(seed_visual_outside_domain_mask_i, torch.Tensor)
@@ -9191,11 +10020,14 @@ class NN_Trainer:
                             device=seeds_raw_i.device,
                             dtype=torch.bool,
                         ).reshape(-1).detach()
-                    need_curve_geometry = needs_shared_curve_geometry(
-                        compute_total_fiber_length_loss=compute_total_fiber_length_loss,
-                        compute_l_curve_cell_loss=compute_l_curve_cell_loss,
-                        collect_curve_metrics=collect_curve_metrics,
-                        collect_topology_metrics=collect_topology_metrics,
+                    need_curve_geometry = (
+                        (not stage_uses_phase1_decoder)
+                        and needs_shared_curve_geometry(
+                            compute_total_fiber_length_loss=compute_total_fiber_length_loss,
+                            compute_l_curve_cell_loss=compute_l_curve_cell_loss,
+                            collect_curve_metrics=collect_curve_metrics,
+                            collect_topology_metrics=collect_topology_metrics,
+                        )
                     )
                     # Builds a shared geometry container containing all edge-curve data,
                     # including edge lengths, graph connectivity, and validity masks,
@@ -9229,7 +10061,26 @@ class NN_Trainer:
                         cell_areas_i, _ = self.cell_boundary_areas(curve_geometry_i)
                         if cell_areas_i.numel() > 0:
                             cell_area_values.append(cell_areas_i.detach())
-                    if compute_total_fiber_length_loss:
+                    if compute_total_fiber_length_loss and stage_uses_phase1_decoder:
+                        voronoi_length_i = decoder_out.get("continuous_voronoi_length", None)
+                        total_length_i = decoder_out.get("continuous_total_curve_length", None)
+                        boundary_length_i = decoder_out.get("boundary_curve_length", None)
+                        if not isinstance(voronoi_length_i, torch.Tensor):
+                            raise ValueError(
+                                "Phase-1 decoder output must contain tensor "
+                                "continuous_voronoi_length for Stage-1 length losses."
+                            )
+                        if not isinstance(total_length_i, torch.Tensor):
+                            raise ValueError(
+                                "Phase-1 decoder output must contain tensor "
+                                "continuous_total_curve_length for Stage-1 length budgets."
+                            )
+                        if not isinstance(boundary_length_i, torch.Tensor):
+                            boundary_length_i = total_length_i - voronoi_length_i
+                        phase1_voronoi_length_terms.append(voronoi_length_i.reshape(()))
+                        phase1_boundary_length_terms.append(boundary_length_i.reshape(()))
+                        total_fiber_length_terms.append(total_length_i.reshape(()))
+                    elif compute_total_fiber_length_loss:
                         total_fiber_length_terms.append(
                             self.curve_network_length_loss(curve_geometry_i)
                         )
@@ -9241,7 +10092,12 @@ class NN_Trainer:
                     if compute_seed_spacing_loss:
                         separation_i, separation_components_i = seed_separation_loss(
                             seed_xyz_validity,
-                            min_seed_spacing=float(cfg.min_seed_spacing),
+                            min_seed_spacing=float(
+                                stage_settings.get(
+                                    "min_seed_spacing",
+                                    cfg.min_seed_spacing,
+                                )
+                            ),
                             valid_seed_mask=seed_spacing_valid_mask_i,
                             spacing_power=float(cfg.seed_spacing_power),
                             safety_factor=float(cfg.seed_spacing_safety_factor),
@@ -9476,8 +10332,18 @@ class NN_Trainer:
 
 
                 loss_total_fiber_length = (
-                    total_fiber_length_terms[0]
+                    torch.stack(total_fiber_length_terms).sum()
                     if compute_total_fiber_length_loss and total_fiber_length_terms
+                    else zero
+                )
+                phase1_voronoi_length = (
+                    torch.stack(phase1_voronoi_length_terms).sum()
+                    if stage_uses_phase1_decoder and phase1_voronoi_length_terms
+                    else loss_total_fiber_length
+                )
+                phase1_boundary_length = (
+                    torch.stack(phase1_boundary_length_terms).sum()
+                    if stage_uses_phase1_decoder and phase1_boundary_length_terms
                     else zero
                 )
                 loss_l_curve_cell = (
@@ -9585,7 +10451,11 @@ class NN_Trainer:
                     )
                     stress_margin_weight_step = automatic_constraints.get("stress") * 0.05
                     displacement_margin_weight_step = automatic_constraints.get("displacement") * 0.05
-                    seed_spacing_weight_step = automatic_constraints.get("seed_spacing")
+                    seed_spacing_weight_step = (
+                        automatic_constraints.get("seed_spacing")
+                        if compute_seed_spacing_loss
+                        else 0.0
+                    )
                     length_under_weight_step = automatic_constraints.get("length_under")
                     length_over_weight_step = automatic_constraints.get("length_over")
                 else:
@@ -9599,7 +10469,11 @@ class NN_Trainer:
                     )
                     stress_margin_weight_step = float(cfg.stress_margin_weight)
                     displacement_margin_weight_step = float(cfg.displacement_margin_weight)
-                    seed_spacing_weight_step = float(cfg.lam_seed_spacing)
+                    seed_spacing_weight_step = (
+                        float(stage_settings.get("lam_seed_spacing", 0.0))
+                        if compute_seed_spacing_loss
+                        else 0.0
+                    )
                     length_under_weight_step = float(cfg.target_length_under_weight)
                     length_over_weight_step = float(cfg.target_length_over_weight)
                 if fem_constraints_active:
@@ -9854,6 +10728,11 @@ class NN_Trainer:
                     n_total_fiber_length,
                     cfg.eps,
                 )
+                loss_phase1_voronoi_length_normalized = self._fixed_reference_normalized(
+                    phase1_voronoi_length,
+                    n_total_fiber_length,
+                    cfg.eps,
+                )
                 loss_l_curve_cell_normalized = self._fixed_reference_normalized(
                     loss_l_curve_cell,
                     n_l_curve_cell,
@@ -9902,50 +10781,24 @@ class NN_Trainer:
                 # ----------------------------------------------------
                 # Total loss
                 # ----------------------------------------------------
-                primary_objective = (
-                    zero
-                    + lam_total_fiber_length_step * loss_total_fiber_length_normalized
-                    + lam_cvt_step * loss_cvt_normalized
-                    + lam_l_curve_cell_step * loss_l_curve_cell_normalized
-                    + validity_loss
+                L_total, primary_objective, stage2_objective_mode = self._assemble_feasibility_first_stage2_loss(
+                    fem_total_loss=loss_fem,
+                    fem_violation_loss=fem_violation_loss,
+                    loss_total_fiber_length_stage2_norm=loss_total_fiber_length_normalized,
+                    loss_cvt_normalized=loss_cvt_normalized,
+                    validity_loss=validity_loss,
+                    loss_curve_cell_normalized=loss_l_curve_cell_normalized,
+                    displacement_objective=displacement_objective,
+                    target_length_penalty=target_length_penalty,
+                    optimization_mode=optimization_mode,
+                    lam_fem_step=lam_fem_step,
+                    lam_total_fiber_length_step=lam_total_fiber_length_step,
+                    lam_cvt_step=lam_cvt_step,
+                    lam_l_curve_cell_step=lam_l_curve_cell_step,
+                    displacement_objective_weight=float(
+                        getattr(cfg, "displacement_objective_weight", 1.0)
+                    ),
                 )
-                stage2_objective_mode = "design_only"
-                if int(stage_id) == 2:
-                    L_total, primary_objective, stage2_objective_mode = self._assemble_feasibility_first_stage2_loss(
-                        fem_total_loss=loss_fem,
-                        fem_violation_loss=fem_violation_loss,
-                        loss_total_fiber_length_stage2_norm=loss_total_fiber_length_normalized,
-                        loss_cvt_normalized=loss_cvt_normalized,
-                        validity_loss=validity_loss,
-                        loss_curve_cell_normalized=loss_l_curve_cell_normalized,
-                        displacement_objective=displacement_objective,
-                        target_length_penalty=target_length_penalty,
-                        optimization_mode=optimization_mode,
-                        lam_fem_step=lam_fem_step,
-                        lam_total_fiber_length_step=lam_total_fiber_length_step,
-                        lam_cvt_step=lam_cvt_step,
-                        lam_l_curve_cell_step=lam_l_curve_cell_step,
-                        displacement_objective_weight=float(
-                            getattr(cfg, "displacement_objective_weight", 1.0)
-                        ),
-                    )
-
-                else:
-                    # Stage 1 or a stage without FEM.
-                    length_objective = (
-                        target_length_penalty
-                        if target_length_active
-                        else loss_total_fiber_length_normalized
-                    )
-                    L_total = (
-                        zero
-                        + lam_cvt_step * loss_cvt_normalized
-                        + validity_loss
-                        + lam_total_fiber_length_step * length_objective
-                        + lam_l_curve_cell_step
-                        * loss_l_curve_cell_normalized
-                    )
-                    primary_objective = L_total
 
                 fem_constraint_violation = fem_out.get("constraint_violation", zero)
                 target_length_feasible = bool(
@@ -9972,9 +10825,14 @@ class NN_Trainer:
                     target_length_seed_prune_applied = False
                     target_length_uniform_cleanup_active = False
                     target_length_domain_lock_active = False
+                seed_spacing_feasibility_active = int(stage_id) == 2
                 overall_constraint_violation = (
                     fem_constraint_violation.reshape(())
-                    + spacing_violation.reshape(())
+                    + (
+                        spacing_violation.reshape(())
+                        if seed_spacing_feasibility_active
+                        else zero.reshape(())
+                    )
                     + (
                         target_length_penalty.reshape(())
                         if target_length_active
@@ -9991,7 +10849,8 @@ class NN_Trainer:
                 )
                 seed_spacing_feasible = bool(
                     float(raw_min_seed_distance_t.detach().item())
-                    >= float(cfg.min_seed_spacing) - float(cfg.fem_constraint_tolerance)
+                    >= float(stage_settings.get("min_seed_spacing", cfg.min_seed_spacing))
+                    - float(cfg.fem_constraint_tolerance)
                 )
                 seed_activity_classification_feasible = bool(
                     visual_partial_active_seed_count_total == 0
@@ -10002,15 +10861,31 @@ class NN_Trainer:
                         and target_length_feasible
                         and seed_activity_classification_feasible
                     )
-                overall_feasible = bool(
-                    physical_feasible
+                mechanical_feasible = bool(physical_feasible)
+                length_feasible = bool(target_length_feasible)
+                phase1_feasible = bool(
+                    mechanical_feasible
+                    and length_feasible
+                )
+                phase2_feasible = bool(
+                    mechanical_feasible
+                    and length_feasible
                     and seed_spacing_feasible
-                    and seed_activity_classification_feasible
-                    and target_length_feasible
+                )
+                overall_feasible = bool(
+                    (
+                        mechanical_feasible
+                        and length_feasible
+                        and (
+                            seed_spacing_feasible
+                            if seed_spacing_feasibility_active
+                            else True
+                        )
+                    )
                 )
                 stage_monitor_mode = (
                     "design"
-                    if (int(stage_id) != 2 or overall_feasible)
+                    if overall_feasible
                     else "recovery"
                 )
 
@@ -10094,11 +10969,15 @@ class NN_Trainer:
                             retain_graph=True,
                             eps=float(cfg.eps),
                         ),
-                        "seed_spacing": self._autograd_grad_norm(
-                            seed_spacing_calibration_loss,
-                            trainable_modules,
-                            retain_graph=True,
-                            eps=float(cfg.eps),
+                        "seed_spacing": (
+                            self._autograd_grad_norm(
+                                seed_spacing_calibration_loss,
+                                trainable_modules,
+                                retain_graph=True,
+                                eps=float(cfg.eps),
+                            )
+                            if compute_seed_spacing_loss
+                            else 0.0
                         ),
                         "length_under": self._autograd_grad_norm(
                             target_length_under_calibration_loss,
@@ -10135,7 +11014,11 @@ class NN_Trainer:
                             "displacement": self._finite_or_default(
                                 displacement_constraint_calibration_loss
                             ),
-                            "seed_spacing": self._finite_or_default(spacing_violation),
+                            "seed_spacing": (
+                                self._finite_or_default(spacing_violation)
+                                if compute_seed_spacing_loss
+                                else 0.0
+                            ),
                             "length_under": self._finite_or_default(
                                 target_length_under_calibration_loss
                             ),
@@ -10146,12 +11029,19 @@ class NN_Trainer:
                         objective_grad_norm=automatic_primary_grad_scale,
                         constraint_grad_norms=automatic_constraint_grad_scales,
                     )
+                    if not compute_seed_spacing_loss:
+                        automatic_constraints.penalties["seed_spacing"] = (
+                            automatic_penalties_before.get("seed_spacing", 1.0)
+                        )
                     active_recovery_scales = [
                         automatic_constraint_grad_scales[name]
                         for name, violation in (
                             ("stress", stress_constraint_calibration_loss),
                             ("displacement", displacement_constraint_calibration_loss),
-                            ("seed_spacing", spacing_violation),
+                            (
+                                "seed_spacing",
+                                spacing_violation if compute_seed_spacing_loss else zero,
+                            ),
                             ("length_under", target_length_under_calibration_loss),
                             ("length_over", target_length_over_calibration_loss),
                         )
@@ -10221,11 +11111,50 @@ class NN_Trainer:
                         f"lr={lr_text}."
                     )
                 elif total_is_finite:
-                    L_total.backward()
+                    if (
+                        bool(getattr(cfg, "cuda_empty_cache_before_backward", True))
+                        and isinstance(L_total, torch.Tensor)
+                        and L_total.is_cuda
+                    ):
+                        torch.cuda.empty_cache()
+                    try:
+                        L_total.backward()
+                    except RuntimeError as exc:
+                        is_cuda_oom = (
+                            isinstance(exc, torch.cuda.OutOfMemoryError)
+                            or "out of memory" in str(exc).lower()
+                        )
+                        if not is_cuda_oom:
+                            raise
+                        consecutive_invalid_fem_steps += 1
+                        for _mi, _pn, p in self._named_trainable_params(trainable_modules):
+                            if p.grad is not None:
+                                p.grad = None
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        chunk_note = ""
+                        if int(stage_id) == 1:
+                            old_chunk = max(
+                                1,
+                                int(getattr(cfg, "phase1_point_chunk_size", 16)),
+                            )
+                            new_chunk = max(1, old_chunk // 2)
+                            cfg.phase1_point_chunk_size = new_chunk
+                            if hasattr(decoder, "point_chunk_size"):
+                                decoder.point_chunk_size = int(new_chunk)
+                            chunk_note = (
+                                f"; phase1_point_chunk_size {old_chunk}->{new_chunk}"
+                            )
+                        tqdm.write(
+                            f"[step {step}] CUDA OOM during backward; optimizer step "
+                            f"skipped and cache cleared{chunk_note}. "
+                            "The next iteration will rebuild the graph with the "
+                            "updated memory setting."
+                        )
+                        continue
 
                     bad_grad_info = self._nonfinite_grad_info(trainable_modules)
                     if bad_grad_info:
-                        consecutive_invalid_fem_steps += 1
                         cause_desc = self._nonfinite_grad_cause_summary(
                             trainable_modules,
                             bad_grad_info,
@@ -10233,24 +11162,33 @@ class NN_Trainer:
                             fem_is_valid=fem_is_valid,
                             fem_failure_reason=fem_failure_reason,
                         )
-                        tqdm.write(
-                            f"[step {step}] Non-finite gradients detected; optimizer step skipped. "
-                            f"{cause_desc}."
-                        )
-                        for _mi, _pn, p in self._named_trainable_params(trainable_modules):
-                            if p.grad is not None:
-                                p.grad = None
-                        if consecutive_invalid_fem_steps >= int(cfg.invalid_fem_patience):
-                            lr_changes = self._reduce_optimizer_lr(
-                                opt,
-                                factor=float(cfg.invalid_lr_factor),
-                                minimum_lr=float(cfg.minimum_learning_rate),
-                            )
+                        if bool(getattr(cfg, "sanitize_nonfinite_gradients", True)):
+                            replaced_count = self._sanitize_nonfinite_grads(trainable_modules)
                             tqdm.write(
-                                f"[step {step}] Reduced learning rate after invalid gradients: "
-                                + ", ".join(f"{old:.3e}->{new:.3e}" for old, new in lr_changes)
+                                f"[step {step}] Non-finite gradients detected and sanitized "
+                                f"({replaced_count} entries set to 0). {cause_desc}."
                             )
-                    else:
+                            bad_grad_info = self._nonfinite_grad_info(trainable_modules)
+                        if bad_grad_info:
+                            consecutive_invalid_fem_steps += 1
+                            tqdm.write(
+                                f"[step {step}] Non-finite gradients detected; optimizer step skipped. "
+                                f"{cause_desc}."
+                            )
+                            for _mi, _pn, p in self._named_trainable_params(trainable_modules):
+                                if p.grad is not None:
+                                    p.grad = None
+                            if consecutive_invalid_fem_steps >= int(cfg.invalid_fem_patience):
+                                lr_changes = self._reduce_optimizer_lr(
+                                    opt,
+                                    factor=float(cfg.invalid_lr_factor),
+                                    minimum_lr=float(cfg.minimum_learning_rate),
+                                )
+                                tqdm.write(
+                                    f"[step {step}] Reduced learning rate after invalid gradients: "
+                                    + ", ".join(f"{old:.3e}->{new:.3e}" for old, new in lr_changes)
+                                )
+                    if not bad_grad_info:
                         pre_step_snapshot = {
                             p: p.detach().clone()
                             for _mi, _pn, p in self._named_trainable_params(trainable_modules)
@@ -10267,7 +11205,6 @@ class NN_Trainer:
 
                         bad_grad_info = self._nonfinite_grad_info(trainable_modules)
                         if bad_grad_info:
-                            consecutive_invalid_fem_steps += 1
                             cause_desc = self._nonfinite_grad_cause_summary(
                                 trainable_modules,
                                 bad_grad_info,
@@ -10275,24 +11212,33 @@ class NN_Trainer:
                                 fem_is_valid=fem_is_valid,
                                 fem_failure_reason=fem_failure_reason,
                             )
-                            tqdm.write(
-                                f"[step {step}] Non-finite gradients remained after clipping, "
-                                f"optimizer step skipped. {cause_desc}."
-                            )
-                            for _mi, _pn, p in self._named_trainable_params(trainable_modules):
-                                if p.grad is not None:
-                                    p.grad = None
-                            if consecutive_invalid_fem_steps >= int(cfg.invalid_fem_patience):
-                                lr_changes = self._reduce_optimizer_lr(
-                                    opt,
-                                    factor=float(cfg.invalid_lr_factor),
-                                    minimum_lr=float(cfg.minimum_learning_rate),
-                                )
+                            if bool(getattr(cfg, "sanitize_nonfinite_gradients", True)):
+                                replaced_count = self._sanitize_nonfinite_grads(trainable_modules)
                                 tqdm.write(
-                                    f"[step {step}] Reduced learning rate after clipped-gradient failure: "
-                                    + ", ".join(f"{old:.3e}->{new:.3e}" for old, new in lr_changes)
+                                    f"[step {step}] Non-finite gradients after clipping sanitized "
+                                    f"({replaced_count} entries set to 0). {cause_desc}."
                                 )
-                        else:
+                                bad_grad_info = self._nonfinite_grad_info(trainable_modules)
+                            if bad_grad_info:
+                                consecutive_invalid_fem_steps += 1
+                                tqdm.write(
+                                    f"[step {step}] Non-finite gradients remained after clipping, "
+                                    f"optimizer step skipped. {cause_desc}."
+                                )
+                                for _mi, _pn, p in self._named_trainable_params(trainable_modules):
+                                    if p.grad is not None:
+                                        p.grad = None
+                                if consecutive_invalid_fem_steps >= int(cfg.invalid_fem_patience):
+                                    lr_changes = self._reduce_optimizer_lr(
+                                        opt,
+                                        factor=float(cfg.invalid_lr_factor),
+                                        minimum_lr=float(cfg.minimum_learning_rate),
+                                    )
+                                    tqdm.write(
+                                        f"[step {step}] Reduced learning rate after clipped-gradient failure: "
+                                        + ", ".join(f"{old:.3e}->{new:.3e}" for old, new in lr_changes)
+                                    )
+                        if not bad_grad_info:
                             opt.step()
 
                             bad_param_info = self._nonfinite_param_info(trainable_modules)
@@ -10566,7 +11512,10 @@ class NN_Trainer:
                         "loss_cvt_norm": loss_cvt_normalized.detach(),
                         "loss_l_curve_cell_norm": loss_l_curve_cell_normalized.detach(),
                         "loss_total_fiber_length_norm": loss_total_fiber_length_normalized.detach(),
+                        "loss_phase1_voronoi_length_norm": loss_phase1_voronoi_length_normalized.detach(),
                         "loss_total_fiber_length": loss_total_fiber_length.detach(),
+                        "phase1_voronoi_length": phase1_voronoi_length.detach(),
+                        "phase1_boundary_length": phase1_boundary_length.detach(),
                         "target_total_length_penalty": target_length_penalty.detach(),
                         "target_total_length_range_violation": target_length_range_violation.detach(),
                         "loss_seed_spacing": loss_seed_spacing.detach(),
@@ -10580,6 +11529,10 @@ class NN_Trainer:
                         "overall_constraint_violation": overall_constraint_violation.detach(),
                         "physical_feasible": bool(physical_feasible),
                         "seed_spacing_feasible": bool(seed_spacing_feasible),
+                        "mechanical_feasible": bool(mechanical_feasible),
+                        "length_feasible": bool(length_feasible),
+                        "phase1_feasible": bool(phase1_feasible),
+                        "phase2_feasible": bool(phase2_feasible),
                         "overall_feasible": overall_feasible,
                         "_zero": zero.detach(),
                     }
@@ -10666,6 +11619,7 @@ class NN_Trainer:
                         "loss_fem_norm": self._finite_or_default(monitor_loss_values["loss_fem_norm"]),
                         "loss_cvt_norm": self._finite_or_default(monitor_loss_values["loss_cvt_norm"]),
                         "loss_total_fiber_length_norm": self._finite_or_default(monitor_loss_values["loss_total_fiber_length_norm"]),
+                        "loss_phase1_voronoi_length_norm": self._finite_or_default(monitor_loss_values["loss_phase1_voronoi_length_norm"]),
    
                         "loss_seed_spacing": self._finite_or_default(
                             loss_seed_spacing
@@ -10701,6 +11655,11 @@ class NN_Trainer:
                         "loss_fem_reference": 1.0,
                         "loss_cvt": self._finite_or_default(loss_cvt),
                         "cvt_importance_mode": cvt_importance_mode,
+                        "phase1_voronoi_length": self._finite_or_default(phase1_voronoi_length),
+                        "phase1_boundary_length": self._finite_or_default(phase1_boundary_length),
+                        "continuous_voronoi_length": self._finite_or_default(phase1_voronoi_length),
+                        "boundary_curve_length": self._finite_or_default(phase1_boundary_length),
+                        "continuous_total_curve_length": self._finite_or_default(loss_total_fiber_length),
                         "loss_total_fiber_length": self._finite_or_default(loss_total_fiber_length),
                         "optimization_mode": optimization_mode,
                         "target_total_length": (
@@ -10847,11 +11806,17 @@ class NN_Trainer:
                             if cfg.fem_yield_strength is not None
                             else float("nan")
                         ),
-                        "min_seed_spacing": float(cfg.min_seed_spacing),
+                        "min_seed_spacing": float(
+                            stage_settings.get("min_seed_spacing", cfg.min_seed_spacing)
+                        ),
                         "training_feasible": bool(fem_out.get("training_feasible", False)),
                         "safety_margin_satisfied": bool(fem_out.get("safety_margin_satisfied", False)),
                         "physical_feasible": bool(physical_feasible),
                         "seed_spacing_feasible": bool(seed_spacing_feasible),
+                        "mechanical_feasible": bool(mechanical_feasible),
+                        "length_feasible": bool(length_feasible),
+                        "phase1_feasible": bool(phase1_feasible),
+                        "phase2_feasible": bool(phase2_feasible),
                         "overall_feasible": bool(overall_feasible),
                         "fem_constraint_violation": self._finite_or_default(fem_constraint_violation),
                         "spacing_violation": self._finite_or_default(spacing_violation),
@@ -10927,6 +11892,15 @@ class NN_Trainer:
                         "seed_activity_classification_feasible": bool(
                             seed_activity_classification_feasible
                         ),
+                        "phase1_soft_active_seed_count": float(
+                            phase1_soft_active_seed_count_total
+                        ),
+                        "phase1_duplicate_suppressed_count": float(
+                            phase1_duplicate_suppressed_count_total
+                        ),
+                        "phase1_handoff_candidate_count": float(
+                            phase1_handoff_candidate_count_total
+                        ),
                         "anchor_update_allowed": 1.0 if anchor_update_allowed else 0.0,
                     }
                     self._attach_objective_report(row)
@@ -10992,6 +11966,22 @@ class NN_Trainer:
                             stage_monitor_raw=stage_monitor_raw,
                             effective_lambdas=effective_lambdas,
                         )
+                        if bool(row.get("overall_feasible", False)):
+                            persistent_key = (
+                                float(row.get("primary_objective", row.get("L_total", float("inf")))),
+                                float(row.get("loss_total_fiber_length", float("inf"))),
+                                float(step),
+                            )
+                            if int(stage_id) == 1 and persistent_key < best_feasible_stage1_key:
+                                best_feasible_stage1_key = persistent_key
+                                best_feasible_stage1_checkpoint = dict(last_valid_checkpoint)
+                                best_feasible_stage1_checkpoint["source"] = "best_feasible_stage1"
+                                best_feasible_stage1_checkpoint["best_feasible_key"] = tuple(persistent_key)
+                            elif int(stage_id) == 2 and persistent_key < best_feasible_stage2_key:
+                                best_feasible_stage2_key = persistent_key
+                                best_feasible_stage2_checkpoint = dict(last_valid_checkpoint)
+                                best_feasible_stage2_checkpoint["source"] = "best_feasible_stage2"
+                                best_feasible_stage2_checkpoint["best_feasible_key"] = tuple(persistent_key)
                         if self._is_stage2_physical_checkpoint_candidate(
                             stage_id=stage_id,
                             first_physical_stage=first_physical_stage,
@@ -11014,7 +12004,7 @@ class NN_Trainer:
                                 global_step=int(step),
                                 total_loss_is_finite=bool(total_is_finite),
                                 fem_is_valid=bool(row.get("fem_valid", False)),
-                                optimization_mode=str(row.get("optimization_mode", "constrained_displacement")),
+                                optimization_mode=str(row.get("optimization_mode", "minimize_length")),
                                 target_length_feasible=bool(
                                     row.get("target_total_length_feasible", True)
                                 ),
@@ -11103,6 +12093,43 @@ class NN_Trainer:
                             meaningful_improvement=meaningful,
                             stage_id=stage_id,
                         )
+                        stage_best_ckpt = current_stage_runtime.stage_best_raw_checkpoint
+                        if isinstance(stage_best_ckpt, dict):
+                            stage_best_row = stage_best_ckpt.get("row", {})
+                            if not isinstance(stage_best_row, dict):
+                                stage_best_row = {}
+                            row["stage_best_raw_step"] = int(
+                                stage_best_ckpt.get("global_step", -1)
+                            )
+                            row["stage_best_raw_local_step"] = int(
+                                stage_best_ckpt.get("stage_local_step", -1)
+                            )
+                            row["stage_best_raw_monitor"] = float(
+                                stage_best_ckpt.get(
+                                    "stage_monitor_raw",
+                                    stage_best_row.get("stage_monitor_raw", float("nan")),
+                                )
+                            )
+                            row["stage_best_raw_voronoi_length"] = float(
+                                stage_best_row.get("phase1_voronoi_length", float("nan"))
+                            )
+                            row["stage_best_raw_boundary_length"] = float(
+                                stage_best_row.get("phase1_boundary_length", float("nan"))
+                            )
+                            row["stage_best_raw_total_length"] = float(
+                                stage_best_row.get("loss_total_fiber_length", float("nan"))
+                            )
+                            if int(stage_id) == 1:
+                                row["best_step"] = row["stage_best_raw_step"]
+                                row["best_L_total_step"] = row["stage_best_raw_step"]
+                                row["best_L_total"] = row["stage_best_raw_monitor"]
+                        else:
+                            row["stage_best_raw_step"] = -1
+                            row["stage_best_raw_local_step"] = -1
+                            row["stage_best_raw_monitor"] = float("nan")
+                            row["stage_best_raw_voronoi_length"] = float("nan")
+                            row["stage_best_raw_boundary_length"] = float("nan")
+                            row["stage_best_raw_total_length"] = float("nan")
 
                     if not optimizer_step_skipped:
                         self.update_adaptive_stage_controller(
@@ -11121,6 +12148,7 @@ class NN_Trainer:
                         row["target_length_seed_prune_skipped_reason"] = ""
                         if (
                             target_length_prune_enabled
+                            and int(stage_id) > 1
                             and bool(target_length_seed_domain_locked)
                             and bool(seed_activity_classification_feasible)
                             and not bool(target_length_seed_prune_applied)
@@ -11336,13 +12364,20 @@ class NN_Trainer:
                             cad_img=cad_img,
                             loss_dict=self._timelapse_loss_chart_dict(row),
                             title_text=(
-                                f"S{int(row['stage'])} | "
+                                (
+                                    "Stage 1 - Implicit Decoder | "
+                                    if int(row["stage"]) == 1
+                                    else "Stage 2 - Explicit Decoder | "
+                                )
+                                +
                                 f"L_total={float(row.get('L_total', float('nan'))):.3e} | "
                                 f"Best Step={int(row['best_step'])} | "
                                 f"{self._timelapse_geometry_summary_text(row)}"
                             ),
                             chart_title="Weighted Objective Contributions",
                             stage=row["stage"],
+                            stage_heading=self._stage_decoder_heading(int(row["stage"])),
+                            seed_count=row.get("total_seed_count", None),
                         )
 
                     self._tb_log_step(
@@ -11364,6 +12399,8 @@ class NN_Trainer:
                                 total_step_budget=total_step_budget,
                                 best_feasible_key=best_feasible_key,
                                 best_feasible_checkpoint=best_feasible_checkpoint,
+                                best_feasible_stage1_checkpoint=best_feasible_stage1_checkpoint,
+                                best_feasible_stage2_checkpoint=best_feasible_stage2_checkpoint,
                                 best_infeasible_key=best_infeasible_key,
                                 best_infeasible_checkpoint=best_infeasible_checkpoint,
                                 verbose=bool(
@@ -11379,8 +12416,12 @@ class NN_Trainer:
 
                     anchor_update_allowed = (
                         vol_eff_value >= float(cfg.anchor_guard_vol_eff_min)
-                        and min_seed_dist_value
-                        >= float(cfg.seed_spacing_safety_factor) * float(cfg.min_seed_spacing)
+                        and (
+                            int(stage_id) == 1
+                            or min_seed_dist_value
+                            >= float(cfg.seed_spacing_safety_factor)
+                            * float(stage_settings.get("min_seed_spacing", cfg.min_seed_spacing))
+                        )
                     )
 
                     if not optimizer_step_skipped:
@@ -11455,6 +12496,9 @@ class NN_Trainer:
                                 "optimizer_reset": bool(cfg.reset_optimizer_between_stages),
                             }
                             stage_end_summaries.append(stage_summary)
+                            row.update(stage_summary)
+                            if history:
+                                history[-1].update(stage_summary)
                             tqdm.write(
                                 f"Stage {spec.stage_id} completed | reason={stage_end_reason} | "
                                 f"local_steps={stage_summary['local_steps']} | "
@@ -11466,6 +12510,75 @@ class NN_Trainer:
                                 f"transition_score={transition_score:.6e} | "
                                 f"optimizer_reset={bool(cfg.reset_optimizer_between_stages)}"
                             )
+
+                            if bool(cfg.MakeTimelaps) and recorder is not None and not should_record_timelapse:
+                                try:
+                                    if getattr(cfg, "timelapse_show_3d_tubes", True):
+                                        cad_img = self._render_current_3d_tube_frame_cached(
+                                            seeds_list=seeds_list,
+                                            decoders=decoders,
+                                            pred_list=pred_list,
+                                            render_cache=render_cache,
+                                            loading_img=self.timelapse_loading_img,
+                                            fem_density_field=fem_density_field,
+                                            fem_stress_field=fem_stress_field,
+                                            fem_displacement_field=fem_displacement_field,
+                                            history_rows=history,
+                                        )
+                                    else:
+                                        cad_img = self._render_current_cad_frame_cached(
+                                            seeds_list=seeds_list,
+                                            decoders=decoders,
+                                            pred_list=pred_list,
+                                            render_cache=render_cache,
+                                            thr=getattr(cfg, "vis_thr", cfg.TM_laps_Thr),
+                                            loading_img=self.timelapse_loading_img,
+                                        )
+                                    recorder.add_frame(
+                                        step=step,
+                                        cad_img=cad_img,
+                                        loss_dict=self._timelapse_loss_chart_dict(row),
+                                        title_text=(
+                                            (
+                                                "Stage 1 - Implicit Decoder | "
+                                                if int(row["stage"]) == 1
+                                                else "Stage 2 - Explicit Decoder | "
+                                            )
+                                            +
+                                            f"L_total={float(row.get('L_total', float('nan'))):.3e} | "
+                                            f"Best Step={int(row['best_step'])} | "
+                                            f"{self._timelapse_geometry_summary_text(row)}"
+                                        ),
+                                        chart_title="Weighted Objective Contributions",
+                                        stage=row["stage"],
+                                        stage_heading=self._stage_decoder_heading(int(row["stage"])),
+                                        seed_count=row.get("total_seed_count", None),
+                                    )
+                                except Exception as exc:
+                                    tqdm.write(
+                                        "[Timelapse stage-final frame failed] "
+                                        f"stage={int(spec.stage_id)} step={int(step)} | "
+                                        f"{type(exc).__name__}: {exc}"
+                                    )
+
+                            if not should_log:
+                                tqdm.write(
+                                    self._format_stage_progress_log(
+                                        row=row,
+                                        total_step_budget=total_step_budget,
+                                        best_feasible_key=best_feasible_key,
+                                        best_feasible_checkpoint=best_feasible_checkpoint,
+                                        best_feasible_stage1_checkpoint=best_feasible_stage1_checkpoint,
+                                        best_feasible_stage2_checkpoint=best_feasible_stage2_checkpoint,
+                                        best_infeasible_key=best_infeasible_key,
+                                        best_infeasible_checkpoint=best_infeasible_checkpoint,
+                                        verbose=bool(
+                                            getattr(cfg, "debug_stage_controller", False)
+                                            or getattr(cfg, "debug_fem_integrity", False)
+                                            or getattr(cfg, "debug_anomaly_detection", False)
+                                        ),
+                                    )
+                                )
 
                             if current_stage_index + 1 >= len(stage_specs):
                                 break
@@ -11497,6 +12610,283 @@ class NN_Trainer:
                                 int(spec.stage_id) < int(first_physical_stage)
                                 and int(next_stage_id) >= int(first_physical_stage)
                             )
+                            if int(spec.stage_id) == 1 and int(next_stage_id) == 2:
+                                phase1_decoder = decoder
+                                handoff_local_step = (
+                                    int(selected_transition_checkpoint.get("stage_local_step", stage_local_step))
+                                    if selected_transition_checkpoint is not None
+                                    else int(stage_local_step)
+                                )
+                                handoff_offset_scale = self.seed_offset_scale_for_step(
+                                    handoff_local_step,
+                                    int(spec.max_steps),
+                                )
+                                phase1_handoff_out, handoff_mask, handoff_seeds = (
+                                    self._evaluate_phase1_handoff(
+                                        phase1_decoder,
+                                        ppnet,
+                                        face_tensor,
+                                        uv_anchor,
+                                        A_local,
+                                        offset_scale=handoff_offset_scale,
+                                    )
+                                )
+                                old_seed_count = int(handoff_mask.numel())
+                                new_seed_count = int(handoff_seeds.shape[0])
+                                if new_seed_count != old_seed_count:
+                                    self._prune_ppnet_seed_slots(
+                                        ppnet,
+                                        handoff_mask.to(device=uv_anchor.device),
+                                    )
+                                handoff_seeds = handoff_seeds.to(
+                                    device=uv_anchor.device,
+                                    dtype=uv_anchor.dtype,
+                                )
+                                self._rebase_ppnet_to_seed_positions(ppnet, handoff_seeds)
+                                uv_anchor = handoff_seeds.detach().clone()
+                                uv_init = uv_anchor.detach().clone()
+                                uv_init_list = [uv_init]
+                                cfg.seed_number = new_seed_count
+                                decoder = self._build_phase2_decoder(
+                                    device=device,
+                                    seed_number=new_seed_count,
+                                    u_periodic=face_tensor.get("u_periodic", False),
+                                    v_periodic=face_tensor.get("v_periodic", False),
+                                    boundary_solid_idx=self._true_open_boundary_idx(face_tensor),
+                                    face_tensor=face_tensor,
+                                )
+                                decoders = [decoder]
+                                named_trainable_modules = [("ppnet", ppnet), ("decoder", decoder)]
+                                trainable_modules = [module for _, module in named_trainable_modules]
+                                first_stage2_pred = ppnet(uv_anchor, offset_scale=0.0)
+                                if not torch.allclose(
+                                    first_stage2_pred["seeds_raw"].detach(),
+                                    handoff_seeds.detach(),
+                                    atol=1.0e-6,
+                                    rtol=1.0e-5,
+                                ):
+                                    raise RuntimeError(
+                                        "Stage-2 PPNet did not reproduce Phase-1 "
+                                        "handoff seeds after rebasing."
+                                    )
+                                same_handoff_coordinates = bool(
+                                    torch.allclose(
+                                        first_stage2_pred["seeds_raw"].detach(),
+                                        handoff_seeds.detach(),
+                                        atol=1.0e-6,
+                                        rtol=1.0e-5,
+                                    )
+                                )
+                                with torch.no_grad():
+                                    phase1_pruned_seed_state = self._decoder_seed_state_for_pred(
+                                        phase1_decoder,
+                                        {"seeds_raw": handoff_seeds},
+                                        device,
+                                    )
+                                    try:
+                                        phase1_pruned_out = self._phase1_decoder_forward(
+                                            phase1_decoder,
+                                            ft=face_tensor,
+                                            seeds_raw=handoff_seeds,
+                                            surface_area_weights=A_local,
+                                        )
+                                    finally:
+                                        self._restore_decoder_seed_state(
+                                            phase1_decoder,
+                                            phase1_pruned_seed_state,
+                                        )
+                                    phase2_initial_out = decoder(
+                                        seeds_uv=handoff_seeds,
+                                        generate_density_fiber=bool(
+                                            getattr(cfg, "generate_decoder_density_fiber", True)
+                                        ),
+                                    )
+                                handoff_row = (
+                                    selected_transition_checkpoint.get("row", {})
+                                    if isinstance(selected_transition_checkpoint, dict)
+                                    else row
+                                )
+                                phase1_full_metrics = self._decoder_handoff_metrics(
+                                    label="PHASE-1 FULL",
+                                    decoder_out=phase1_handoff_out,
+                                    seeds_uv=phase1_handoff_out.get("seeds_uv", uv_anchor),
+                                    fallback_row=handoff_row,
+                                    active_count=new_seed_count,
+                                    inactive_count=old_seed_count - new_seed_count,
+                                    surface_area_weights=A_local,
+                                )
+                                phase1_pruned_metrics = self._decoder_handoff_metrics(
+                                    label="PHASE-1 PRUNED",
+                                    decoder_out=phase1_pruned_out,
+                                    seeds_uv=handoff_seeds,
+                                    fallback_row=handoff_row,
+                                    active_count=new_seed_count,
+                                    inactive_count=0,
+                                    surface_area_weights=A_local,
+                                )
+                                phase2_initial_metrics = self._decoder_handoff_metrics(
+                                    label="PHASE-2 INITIAL",
+                                    decoder_out=phase2_initial_out,
+                                    seeds_uv=handoff_seeds,
+                                    fallback_row=handoff_row,
+                                    active_count=new_seed_count,
+                                    inactive_count=0,
+                                    surface_area_weights=A_local,
+                                )
+                                pruning_delta = {
+                                    "seeds": phase1_pruned_metrics["seeds"] - phase1_full_metrics["seeds"],
+                                    "total_length": phase1_pruned_metrics["total_length"] - phase1_full_metrics["total_length"],
+                                    "volume_fraction": phase1_pruned_metrics["volume_fraction"] - phase1_full_metrics["volume_fraction"],
+                                    "max_displacement": phase1_pruned_metrics["max_displacement"] - phase1_full_metrics["max_displacement"],
+                                    "max_stress": phase1_pruned_metrics["max_stress"] - phase1_full_metrics["max_stress"],
+                                }
+                                decoder_delta = {
+                                    "total_length": phase2_initial_metrics["total_length"] - phase1_pruned_metrics["total_length"],
+                                    "volume_fraction": phase2_initial_metrics["volume_fraction"] - phase1_pruned_metrics["volume_fraction"],
+                                    "max_displacement": phase2_initial_metrics["max_displacement"] - phase1_pruned_metrics["max_displacement"],
+                                    "max_stress": phase2_initial_metrics["max_stress"] - phase1_pruned_metrics["max_stress"],
+                                    "rel_length": self._relative_delta(phase2_initial_metrics["total_length"], phase1_pruned_metrics["total_length"]),
+                                    "rel_volume": self._relative_delta(phase2_initial_metrics["volume_fraction"], phase1_pruned_metrics["volume_fraction"]),
+                                    "rel_displacement": self._relative_delta(phase2_initial_metrics["max_displacement"], phase1_pruned_metrics["max_displacement"]),
+                                    "rel_stress": self._relative_delta(phase2_initial_metrics["max_stress"], phase1_pruned_metrics["max_stress"]),
+                                }
+                                duplicate_threshold = (
+                                    float(getattr(cfg, "phase1_duplicate_merge_distance_factor", 1.10))
+                                    * float(cfg.strut_thickness)
+                                )
+                                handoff_report = (
+                                    "\n======================================================================\n"
+                                    "PHASE 1 -> PHASE 2 HANDOFF\n"
+                                    "======================================================================\n\n"
+                                    "Transition checkpoint:\n"
+                                    f"    source              : {transition_name}\n"
+                                    f"    global step         : {int(handoff_row.get('step', row.get('step', -1)))}\n\n"
+                                    "Seed selection:\n"
+                                    f"    Phase-1 seeds       : {old_seed_count}\n"
+                                    f"    active survivors    : {new_seed_count}\n"
+                                    f"    removed/inactive    : {old_seed_count - new_seed_count}\n"
+                                    f"    activity threshold  : {float(getattr(cfg, 'phase1_handoff_activity_threshold', 0.05)):.6g}\n"
+                                    f"    territory threshold : {float(getattr(cfg, 'phase1_handoff_territory_ratio', 0.20)):.6g}\n"
+                                    f"    duplicate threshold : {duplicate_threshold:.6g} physical units\n\n"
+                                    + self._format_handoff_metrics_block("A. PHASE-1 FULL", phase1_full_metrics)
+                                    + "\n\n"
+                                    + self._format_handoff_metrics_block("B. PHASE-1 PRUNED", phase1_pruned_metrics)
+                                    + "\n\n"
+                                    + self._format_handoff_metrics_block("C. PHASE-2 INITIAL", phase2_initial_metrics)
+                                    + "\n\nPRUNING EFFECT\n"
+                                    f"    delta seeds            : {self._console_float(pruning_delta['seeds'])}\n"
+                                    f"    delta total length     : {self._console_float(pruning_delta['total_length'])}\n"
+                                    f"    delta volume fraction  : {self._console_float(pruning_delta['volume_fraction'])}\n"
+                                    f"    delta max displacement : {self._console_float(pruning_delta['max_displacement'])}\n"
+                                    f"    delta max stress       : {self._console_float(pruning_delta['max_stress'])}\n\n"
+                                    "DECODER EFFECT\n"
+                                    f"    delta total length     : {self._console_float(decoder_delta['total_length'])}\n"
+                                    f"    relative length %      : {self._console_float(decoder_delta['rel_length'])}\n"
+                                    f"    delta volume fraction  : {self._console_float(decoder_delta['volume_fraction'])}\n"
+                                    f"    relative volume %      : {self._console_float(decoder_delta['rel_volume'])}\n"
+                                    f"    delta max displacement : {self._console_float(decoder_delta['max_displacement'])}\n"
+                                    f"    relative displacement %: {self._console_float(decoder_delta['rel_displacement'])}\n"
+                                    f"    delta max stress       : {self._console_float(decoder_delta['max_stress'])}\n"
+                                    f"    relative stress %      : {self._console_float(decoder_delta['rel_stress'])}\n\n"
+                                    "Same handoff coordinates P1-pruned / P2:\n"
+                                    f"    {'PASS' if same_handoff_coordinates else 'FAIL'}\n"
+                                    "======================================================================"
+                                )
+                                tqdm.write(handoff_report)
+                                if bool(cfg.MakeTimelaps) and recorder is not None and render_cache:
+                                    try:
+                                        first_cache = render_cache[0]
+                                        phase2_initial_fields = self.evaluate_cached_face_fields(
+                                            first_cache,
+                                            decoder,
+                                            {"seeds_raw": handoff_seeds, "seeds_uv": handoff_seeds},
+                                        )
+                                        handoff_img = self._render_handoff_comparison_frame(
+                                            first_cache=first_cache,
+                                            phase1_full_out=phase1_handoff_out,
+                                            phase2_out=phase2_initial_fields,
+                                            all_seeds=phase1_handoff_out.get("seeds_uv", uv_anchor),
+                                            survivor_mask=handoff_mask.to(device=uv_anchor.device),
+                                            survivor_seeds=handoff_seeds,
+                                            phase2_decoder=decoder,
+                                            summary_lines=[
+                                                f"Seeds: {old_seed_count} -> {new_seed_count}",
+                                                f"Length: P1 full={self._console_float(phase1_full_metrics['total_length'])} | P1 pruned={self._console_float(phase1_pruned_metrics['total_length'])} | P2 exact={self._console_float(phase2_initial_metrics['total_length'])}",
+                                                f"Max disp: P1 full={self._console_float(phase1_full_metrics['max_displacement'])} | P1 pruned={self._console_float(phase1_pruned_metrics['max_displacement'])} | P2={self._console_float(phase2_initial_metrics['max_displacement'])}",
+                                                f"Max stress: P1 full={self._console_float(phase1_full_metrics['max_stress'])} | P1 pruned={self._console_float(phase1_pruned_metrics['max_stress'])} | P2={self._console_float(phase2_initial_metrics['max_stress'])}",
+                                                f"Same handoff coordinates: {'PASS' if same_handoff_coordinates else 'FAIL'}",
+                                            ],
+                                        )
+                                        recorder.add_frame(
+                                            step=int(row.get("step", step)) * 1000 + 500,
+                                            cad_img=handoff_img,
+                                            loss_dict=self._timelapse_loss_chart_dict(row),
+                                            title_text=(
+                                                "PHASE 1 -> PHASE 2 HANDOFF | "
+                                                f"Seeds={old_seed_count}->{new_seed_count} | "
+                                                f"P1_full_length={phase1_full_metrics['total_length']:.3e} | "
+                                                f"P1_pruned_length={phase1_pruned_metrics['total_length']:.3e} | "
+                                                f"P2_length={phase2_initial_metrics['total_length']:.3e}"
+                                            ),
+                                            chart_title="Handoff Objective Snapshot",
+                                            stage=1,
+                                            stage_heading="PHASE 1 -> PHASE 2 HANDOFF",
+                                            seed_count=new_seed_count,
+                                        )
+                                    except Exception as exc:
+                                        tqdm.write(
+                                            "[Timelapse handoff frame failed] "
+                                            f"{type(exc).__name__}: {exc}"
+                                        )
+                                handoff_seed_ids = torch.nonzero(
+                                    handoff_mask.detach().cpu(),
+                                    as_tuple=False,
+                                ).flatten().to(torch.long)
+                                stage_summary.update(
+                                    {
+                                        "phase1_raw_seed_count": old_seed_count,
+                                        "phase2_handoff_seed_count": new_seed_count,
+                                        "phase2_handoff_seed_ids": [
+                                            int(v) for v in handoff_seed_ids.tolist()
+                                        ],
+                                        "phase2_handoff_activity_threshold": float(
+                                            getattr(
+                                                cfg,
+                                                "phase1_handoff_activity_threshold",
+                                                0.05,
+                                            )
+                                        ),
+                                        "phase1_seed_count": int(old_seed_count),
+                                        "phase1_duplicate_suppressed_count": int(
+                                            self._finite_or_default(
+                                                phase1_handoff_out.get(
+                                                    "phase1_duplicate_suppressed_count",
+                                                    0,
+                                                )
+                                            )
+                                        ),
+                                        "minimum_handoff_seed_distance_3d": float(
+                                            phase1_handoff_out.get(
+                                                "minimum_handoff_seed_distance_3d",
+                                                float("nan"),
+                                            )
+                                        ),
+                                        "phase2_handoff_seeds_uv": (
+                                            handoff_seeds.detach().cpu().tolist()
+                                        ),
+                                    }
+                                )
+                                if history:
+                                    history[-1].update(stage_summary)
+                                latest_valid_model_state = self._clone_modules_state_dict(
+                                    trainable_modules
+                                )
+                                latest_valid_optimizer_state = None
+                                tqdm.write(
+                                    "[Stage transition] Phase-1 -> Phase-2 handoff: "
+                                    f"seeds={old_seed_count}->{new_seed_count}; "
+                                    "rebuilt ContinuousVoronoiDecoder."
+                                )
                             if entering_first_physical_stage:
                                 if selected_transition_checkpoint is not None:
                                     stage1_transition_step = int(
@@ -11679,7 +13069,7 @@ class NN_Trainer:
             best_feasible_key_label = (
                 "displacement_ratio, stress_ratio, raw_fiber_length, step"
                 if str(selected_row_for_log.get("optimization_mode", "")).strip().lower()
-                == "target_length_constrained_displacement"
+                == "minimize_displacement_at_target_length"
                 else "raw_fiber_length, physical_max_ratio, step"
             )
             tqdm.write(
@@ -12016,36 +13406,46 @@ class NN_Trainer:
                     row = checkpoint.get("row", {})
                     total_seed_slots = int(pred_list_for_frame[0]["seeds_raw"].shape[0])
                     title_parts = [
-                        f"S{int(row.get('stage', checkpoint.get('stage_id', 0)))}",
+                        (
+                            "Stage 1 - Implicit Decoder"
+                            if int(row.get("stage", checkpoint.get("stage_id", 0))) == 1
+                            else "Stage 2 - Explicit Decoder"
+                        ),
                         f"L_total={float(row.get('L_total', float('nan'))):.3e}",
                         f"best_step={int(checkpoint.get('global_step', frame_step))}",
                         self._timelapse_geometry_summary_text(row),
                     ]
-                    decoder_seed_state = self._decoder_seed_state_for_pred(decoder, pred_list_for_frame[0], device)
+                    render_decoder = self._decoder_for_checkpoint_stage(
+                        checkpoint,
+                        device=device,
+                        face_tensor=face_tensor,
+                    )
+                    render_decoders = [render_decoder for _ in pred_list_for_frame]
+                    decoder_seed_state = self._decoder_seed_state_for_pred(render_decoder, pred_list_for_frame[0], device)
                     try:
                         if getattr(cfg, "timelapse_show_3d_tubes", True):
                             cad_img = self._render_current_3d_tube_frame_cached(
                                 seeds_list=seeds_for_frame,
-                                decoders=decoders,
+                                decoders=render_decoders,
                                 pred_list=pred_list_for_frame,
                                 render_cache=render_cache,
                                 loading_img=self.timelapse_loading_img,
                                 fem_density_field=checkpoint.get("fem_density_field", None),
                                 fem_stress_field=checkpoint.get("fem_stress_field", None),
                                 fem_displacement_field=checkpoint.get("fem_displacement_field", None),
-                                history_rows=history,
+                                history_rows=[row],
                             )
                         else:
                             cad_img = self._render_current_cad_frame_cached(
                                 seeds_list=seeds_for_frame,
-                                decoders=decoders,
+                                decoders=render_decoders,
                                 pred_list=pred_list_for_frame,
                                 render_cache=render_cache,
                                 thr=getattr(cfg, "vis_thr", cfg.TM_laps_Thr),
                                 loading_img=self.timelapse_loading_img,
                             )
                     finally:
-                        self._restore_decoder_seed_state(decoder, decoder_seed_state)
+                        self._restore_decoder_seed_state(render_decoder, decoder_seed_state)
 
                     frame_path = recorder.add_frame(
                         step=frame_step,
@@ -12059,6 +13459,10 @@ class NN_Trainer:
                         results_title="Results",
                         results_text=_checkpoint_results_text(row),
                         stage=row.get("stage", checkpoint.get("stage_id", None)),
+                        stage_heading=self._stage_decoder_heading(
+                            int(row.get("stage", checkpoint.get("stage_id", 0)))
+                        ),
+                        seed_count=total_seed_slots,
                     )
                     if timelapse_output_folder and output_filename:
                         shutil.copy2(frame_path, os.path.join(timelapse_output_folder, output_filename))
@@ -12080,17 +13484,38 @@ class NN_Trainer:
                         summary_title="Stage Best Parameters",
                     )
 
-                best_checkpoint_for_frame = {
-                    "row": best_row or {},
-                    "pred_list": best_pred,
-                    "seeds": best_seeds,
-                    "stage_id": int(best_row.get("stage", 0)) if best_row is not None else 0,
-                    "global_step": int(best_step),
-                    "total_seed_count": float(best_seed_count or 0.0),
-                    "fem_density_field": best_fem_density_field,
-                    "fem_stress_field": best_fem_stress_field,
-                    "fem_displacement_field": best_fem_displacement_field,
-                }
+                for stage_id_for_frame, stage_ckpt in (
+                    (1, best_feasible_stage1_checkpoint),
+                    (2, best_feasible_stage2_checkpoint),
+                ):
+                    if stage_ckpt is None:
+                        continue
+                    _render_checkpoint_timelapse_frame(
+                        checkpoint=stage_ckpt,
+                        pred_list_for_frame=stage_ckpt.get("pred_list", []),
+                        seeds_for_frame=stage_ckpt.get("seeds", []),
+                        frame_step=int(total_step_budget) + 10 + stage_id_for_frame,
+                        score=float(stage_ckpt.get("stage_monitor_raw", float("inf"))),
+                        output_filename=f"stage{stage_id_for_frame}_best_feasible_frame.png",
+                        chart_title=f"Stage {stage_id_for_frame} Best Feasible Losses",
+                        summary_title="Stage Best Feasible Parameters",
+                    )
+
+                best_checkpoint_for_frame = (
+                    dict(selected_final_checkpoint)
+                    if isinstance(selected_final_checkpoint, dict)
+                    else {
+                        "row": best_row or {},
+                        "pred_list": best_pred,
+                        "seeds": best_seeds,
+                        "stage_id": int(best_row.get("stage", 0)) if best_row is not None else 0,
+                        "global_step": int(best_step),
+                        "total_seed_count": float(best_seed_count or 0.0),
+                        "fem_density_field": best_fem_density_field,
+                        "fem_stress_field": best_fem_stress_field,
+                        "fem_displacement_field": best_fem_displacement_field,
+                    }
+                )
                 best_frame_path = _render_checkpoint_timelapse_frame(
                     checkpoint=best_checkpoint_for_frame,
                     pred_list_for_frame=best_pred,

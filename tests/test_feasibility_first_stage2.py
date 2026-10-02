@@ -16,6 +16,112 @@ def _trainer(cfg: TrainingConfig | None = None) -> NN_Trainer:
     return trainer
 
 
+def test_timelapse_stage_heading_uses_ascii_hyphen() -> None:
+    heading = NN_Trainer._stage_decoder_heading(1)
+
+    assert heading == "STAGE 1 - IMPLICIT DECODER"
+    assert "-" in heading
+    assert "\u2014" not in heading
+
+
+def test_timelapse_header_omits_force_and_keeps_fem_elements() -> None:
+    header = NN_Trainer._timelapse_header_title(
+        shape_name="Planar.stp",
+        geometry_summary="BBox: 10 x 10 x 2e-07, SurfacePts=12920",
+        loading_case="New2stage",
+        fem_elems=25350,
+    )
+
+    assert "F =" not in header
+    assert "FEM elements:" in header
+    assert header == (
+        "Planar.stp (BBox: 10 x 10 x 2e-07, SurfacePts=12920) | "
+        "BC: New2stage (FEM elements: 25350)"
+    )
+
+
+@pytest.mark.parametrize(
+    ("legacy_mode", "target_total_length", "expected_mode"),
+    [
+        ("constrained_displacement", None, "minimize_length"),
+        ("constrained_displacment", None, "minimize_length"),
+        (
+            "target_length_constrained_displacement",
+            100.0,
+            "minimize_displacement_at_target_length",
+        ),
+    ],
+)
+def test_legacy_optimization_modes_migrate_in_post_init_only(
+    legacy_mode: str,
+    target_total_length: float | None,
+    expected_mode: str,
+) -> None:
+    cfg = TrainingConfig(
+        optimization_mode=legacy_mode,
+        target_total_length=target_total_length,
+    )
+
+    assert cfg.optimization_mode == expected_mode
+    assert cfg.optimization_mode in {
+        "minimize_length",
+        "minimize_displacement_at_target_length",
+    }
+
+
+@pytest.mark.parametrize(
+    ("mode", "target_total_length"),
+    [
+        ("minimize_length", None),
+        ("minimize_displacement_at_target_length", 100.0),
+    ],
+)
+def test_canonical_optimization_modes_validate_and_stay_canonical(
+    mode: str,
+    target_total_length: float | None,
+) -> None:
+    cfg = TrainingConfig(
+        optimization_mode=mode,
+        target_total_length=target_total_length,
+    )
+
+    assert cfg.optimization_mode == mode
+
+
+def test_optimization_mode_display_labels_are_clear() -> None:
+    assert (
+        NN_Trainer._optimization_mode_description("minimize_length", 2)
+        == "Length Minimization"
+    )
+    assert (
+        NN_Trainer._optimization_mode_description(
+            "minimize_displacement_at_target_length",
+            2,
+        )
+        == "Displacement Minimization at Target Length"
+    )
+
+
+def test_production_branches_do_not_depend_on_legacy_optimization_mode_names() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    main_source = (repo_root / "Training/MainTrain.py").read_text(encoding="utf-8")
+    fem_source = (repo_root / "Training/FEMControl.py").read_text(encoding="utf-8")
+
+    post_init_start = main_source.index("    def __post_init__(self):")
+    post_init_end = main_source.index("        self.constraint_control", post_init_start)
+    post_init_source = main_source[post_init_start:post_init_end]
+    production_source = main_source[:post_init_start] + main_source[post_init_end:]
+
+    for legacy_mode in (
+        "constrained_displacement",
+        "constrained_displacment",
+        "target_length_constrained_displacement",
+    ):
+        assert legacy_mode in post_init_source
+        assert legacy_mode not in production_source
+        assert legacy_mode not in fem_source
+
+
 def test_stage2_fiber_reference_normalization_keeps_current_gradient() -> None:
     raw_start = torch.tensor(80.0, requires_grad=True)
     raw_current = torch.tensor(60.0, requires_grad=True)
@@ -239,7 +345,7 @@ def test_target_length_stage2_objective_uses_displacement_and_length_penalty() -
         loss_curve_cell_normalized=torch.tensor(0.3),
         displacement_objective=torch.tensor(0.7),
         target_length_penalty=torch.tensor(4.0),
-        optimization_mode="target_length_constrained_displacement",
+        optimization_mode="minimize_displacement_at_target_length",
         lam_fem_step=2.0,
         lam_total_fiber_length_step=10.0,
         lam_cvt_step=3.0,
@@ -430,7 +536,7 @@ def test_stage2_progress_log_reports_updated_feasible_best_without_generic_best(
 
     assert "[best=" not in text
     assert "Optimization mode:" not in text
-    assert "target_length_constrained_displacement" not in text
+    assert "minimize_displacement_at_target_length" not in text
     assert (
         "Best feasible: step=210 | primary=1.5560e+02 | "
         "max_stress=1.016e+02 | max_disp=1.650e-02 | "
@@ -464,33 +570,30 @@ def test_no_obsolete_stage2_violation_only_training_objective_remains() -> None:
     assert "fem_total_loss=loss_fem" in combined_source
 
 
-def test_target_length_mode_is_active_before_stage2_transition() -> None:
+def test_target_length_mode_has_no_stage1_topology_pruning_fallback() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     source = (repo_root / "Training/MainTrain.py").read_text(encoding="utf-8")
 
     assert "target_length_active = target_length_mode" in source
-    assert "or bool(target_length_feasible)" in source
-    assert "and bool(seed_activity_classification_feasible)" in source
     assert "visual_partial_active_seed_count" in source
-    assert "target_length_stage1_prepare = target_length_mode and int(stage_id) == 1" in source
-    assert "if target_length_stage1_prepare and bool(target_length_uniform_cleanup_active)" in source
-    assert "target_length_uniform_cleanup_active = bool(" in source
+    assert "target_length_stage1_prepare = False" in source
+    assert "target_length_stage1_prepare = target_length_mode and int(stage_id) == 1" not in source
+    assert "getattr(cfg, \"stage2_lam_total_fiber_length\", 1.0)" not in source
     assert "if target_length_active else None" in source
     assert "if target_length_active" in source
 
 
-def test_target_length_stage1_uses_length_band_weight_when_default_zero() -> None:
+def test_target_length_stage1_uses_common_length_weight() -> None:
     cfg = TrainingConfig(
-        optimization_mode="target_length_constrained_displacement",
+        optimization_mode="minimize_displacement_at_target_length",
         target_total_length=100.0,
-        stage1_lam_total_fiber_length=0.0,
-        stage2_lam_total_fiber_length=3.0,
+        total_fiber_length_weight=0.0,
     )
     trainer = _trainer(cfg)
 
     settings = trainer._stage_settings_for_stage_id(1)
 
-    assert settings["lam_total_fiber_length"] == pytest.approx(3.0)
+    assert settings["lam_total_fiber_length"] == pytest.approx(0.0)
 
 
 def test_target_length_final_log_labels_feasible_key_by_displacement() -> None:
@@ -501,10 +604,11 @@ def test_target_length_final_log_labels_feasible_key_by_displacement() -> None:
     assert "displacement_ratio, stress_ratio, raw_fiber_length, step" in source
 
 
-def test_optimization_reporting_uses_objective_terms_without_total_chart_bar() -> None:
+@pytest.mark.parametrize("stage_id", [1, 2])
+def test_optimization_reporting_uses_objective_terms_without_total_chart_bar(stage_id: int) -> None:
     row = {
-        "stage": 2,
-        "optimization_mode": "target_length_constrained_displacement",
+        "stage": stage_id,
+        "optimization_mode": "minimize_displacement_at_target_length",
         "L_total": 49.8,
         "displacement_objective": 0.7,
         "displacement_objective_weight": 11.0,
@@ -541,8 +645,10 @@ def test_optimization_reporting_uses_objective_terms_without_total_chart_bar() -
     assert "objective_terms_text" in row
     assert "Displacement Lu: 0.7" in row["objective_terms_text"]
     assert "Length band: 4" in row["objective_terms_text"]
+    assert "FEM: 0.25" in row["objective_terms_text"]
     assert row["objective_displacement_contribution"] == pytest.approx(7.7)
     assert row["objective_length_band_contribution"] == pytest.approx(40.0)
+    assert row["objective_fem_contribution"] == pytest.approx(0.5)
     assert not any(key == "Total" for key in chart)
     assert chart["L-total"] == pytest.approx(49.8)
     assert chart["Displacement x11"] == pytest.approx(7.7)
@@ -571,7 +677,7 @@ def test_target_length_seed_domain_lock_is_configured_and_logged() -> None:
 
 def test_target_length_displacement_objective_uses_smooth_p_norm_by_default() -> None:
     cfg = TrainingConfig(
-        optimization_mode="target_length_constrained_displacement",
+        optimization_mode="minimize_displacement_at_target_length",
         target_total_length=100.0,
     )
     repo_root = Path(__file__).resolve().parents[1]
@@ -719,7 +825,7 @@ def test_target_length_checkpoint_key_requires_length_feasibility_and_prefers_di
         total_loss_is_finite=True,
         fem_is_valid=True,
         global_step=4,
-        optimization_mode="target_length_constrained_displacement",
+        optimization_mode="minimize_displacement_at_target_length",
         target_length_feasible=True,
     )
     lower_displacement_feasible, lower_displacement_key = checkpoint_feasibility_key(
@@ -733,7 +839,7 @@ def test_target_length_checkpoint_key_requires_length_feasibility_and_prefers_di
         total_loss_is_finite=True,
         fem_is_valid=True,
         global_step=5,
-        optimization_mode="target_length_constrained_displacement",
+        optimization_mode="minimize_displacement_at_target_length",
         target_length_feasible=True,
     )
     outside_length_feasible, outside_length_key = checkpoint_feasibility_key(
@@ -747,7 +853,7 @@ def test_target_length_checkpoint_key_requires_length_feasibility_and_prefers_di
         total_loss_is_finite=True,
         fem_is_valid=True,
         global_step=6,
-        optimization_mode="target_length_constrained_displacement",
+        optimization_mode="minimize_displacement_at_target_length",
         target_length_feasible=False,
     )
 
@@ -798,28 +904,26 @@ def test_live_best_feasible_metadata_uses_stage_monitor(tmp_path) -> None:
     assert all(token not in json.dumps(metadata) for token in removed_tokens)
 
 
-def test_stage1_monitor_ignores_stage2_terms() -> None:
+def test_stage1_monitor_uses_same_configured_terms() -> None:
     trainer = _trainer()
     monitor = trainer.calculate_stage_monitor(
         1,
         {
             "loss_seed_spacing": torch.tensor(2.0),
             "loss_cvt_norm": torch.tensor(3.0),
-            "loss_rep_norm": torch.tensor(5.0),
             "loss_l_curve_cell_norm": torch.tensor(7.0),
-            "loss_total_fiber_length_stage2_norm": torch.tensor(100.0),
+            "loss_total_fiber_length_norm": torch.tensor(4.0),
             "loss_topology_validity": torch.tensor(100.0),
             "loss_fem": torch.tensor(100.0),
         },
         {
             "lam_seed_spacing": 11.0,
             "lam_cvt": 13.0,
-            "lam_rep": 17.0,
             "lam_l_curve_cell": 19.0,
             "lam_total_fiber_length": 23.0,
             "lam_fem": 29.0,
         },
     )
 
-    expected = 11.0 * 2.0 + 13.0 * 3.0 + 17.0 * 5.0 + 19.0 * 7.0
+    expected = 11.0 * 2.0 + 13.0 * 3.0 + 19.0 * 7.0 + 23.0 * 4.0
     assert monitor.item() == pytest.approx(expected)

@@ -533,6 +533,8 @@ class TimelapseRecorder:
         results_title=None,
         results_text="",
         stage=None,
+        stage_heading=None,
+        seed_count=None,
     ):
         if cad_img is None:
             raise ValueError("cad_img is None")
@@ -598,8 +600,34 @@ class TimelapseRecorder:
             )
 
         header_h = self._draw_header(canvas, highlight_best=highlight_best)
+        stage_band_h = 0
+        if stage_heading:
+            stage_band_h = 64
+            y_top = header_h
+            bg = (255, 255, 255)
+            accent = (37, 99, 235)
+            if int(stage or 0) == 2:
+                accent = (217, 119, 6)
+            cv2.rectangle(canvas, (0, y_top), (self.frame_width, y_top + stage_band_h), bg, thickness=-1)
+            cv2.rectangle(canvas, (44, y_top + stage_band_h - 6), (self.frame_width - 44, y_top + stage_band_h - 2), accent, thickness=-1)
+            label = str(stage_heading)
+            if seed_count is not None:
+                try:
+                    label = f"{label}    Seeds: {int(round(float(seed_count)))}"
+                except Exception:
+                    label = f"{label}    Seeds: {seed_count}"
+            cv2.putText(
+                canvas,
+                label,
+                (44, y_top + 43),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.05,
+                (17, 24, 39),
+                3,
+                cv2.LINE_AA,
+            )
         bottom_pad = 28
-        content_top = header_h + (24 if header_h else 20)
+        content_top = header_h + stage_band_h + (24 if header_h or stage_band_h else 20)
         content_h = max(self.frame_height - content_top - bottom_pad, 1)
 
         scale = min(

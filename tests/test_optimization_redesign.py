@@ -1,6 +1,8 @@
 import pytest
 import torch
 
+from Decoder_CLasses import ContinuousVoronoiDecoder, Phase1VoronoiDecoder
+from Pred_NN_Classes.ppnet import PPNet
 from Training.FEMControl import (
     AutomaticConstraintController,
     checkpoint_feasibility_key,
@@ -8,6 +10,58 @@ from Training.FEMControl import (
 from Training.Loss_FEM import Loss_FEM
 from Training.Loss_SeedValidity import minimum_seed_spacing_loss, seed_separation_loss
 from Training.MainTrain import NN_Trainer, TrainingConfig
+
+
+def make_flat_face_tensor(n: int = 8):
+    u = torch.linspace(0.0, 1.0, n)
+    v = torch.linspace(0.0, 1.0, n)
+    U, V = torch.meshgrid(u, v, indexing="ij")
+    uv = torch.stack([U.reshape(-1), V.reshape(-1)], dim=1)
+    count = uv.shape[0]
+    return {
+        "face_id": 0,
+        "uv": uv,
+        "Xu": torch.tensor([1.0, 0.0, 0.0]).expand(count, 3).clone(),
+        "Xv": torch.tensor([0.0, 1.0, 0.0]).expand(count, 3).clone(),
+        "points_xyz": torch.cat([uv, torch.zeros((count, 1))], dim=1),
+        "faces_ijk": torch.empty((0, 3), dtype=torch.long),
+        "face_areas": torch.empty((0,), dtype=uv.dtype),
+        "global_vertex_idx": torch.arange(count, dtype=torch.long),
+        "u_periodic": False,
+        "v_periodic": False,
+        "boundary_curve_uv": torch.tensor(
+            [
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [1.0, 0.0],
+                [1.0, 1.0],
+                [1.0, 1.0],
+                [0.0, 1.0],
+                [0.0, 1.0],
+                [0.0, 0.0],
+            ],
+            dtype=uv.dtype,
+        ),
+        "boundary_curve_offsets": torch.tensor([0, 2, 4, 6, 8], dtype=torch.long),
+    }
+
+
+def make_phase_trainer(seed_number: int = 8):
+    trainer = NN_Trainer.__new__(NN_Trainer)
+    trainer.cfg = TrainingConfig(
+        seed_number=seed_number,
+        phase1_point_chunk_size=32,
+        phase1_tau=0.01,
+        strut_thickness=0.08,
+        use_independent_seed_offsets=True,
+        stage2_freeze_seeds=False,
+    )
+    trainer.phase1_decoder_cls = Phase1VoronoiDecoder
+    trainer.phase2_decoder_cls = ContinuousVoronoiDecoder
+    trainer.decoder_cls = ContinuousVoronoiDecoder
+    trainer.Cad_domain = None
+    trainer.face_mesh = None
+    return trainer
 
 
 class _ScalarParam(torch.nn.Module):
@@ -42,7 +96,7 @@ def test_asymmetric_target_length_band_is_below_target():
 
 def test_target_length_band_endpoints_are_exactly_feasible():
     cfg = TrainingConfig(
-        optimization_mode="target_length_constrained_displacement",
+        optimization_mode="minimize_displacement_at_target_length",
         target_total_length=100.0,
         target_length_lower_tolerance=10.0,
         target_length_upper_buffer=0.1,
@@ -68,18 +122,137 @@ def test_target_length_band_endpoints_are_exactly_feasible():
 def test_target_length_band_rejects_invalid_interval():
     with pytest.raises(ValueError):
         TrainingConfig(
-            optimization_mode="target_length_constrained_displacement",
+            optimization_mode="minimize_displacement_at_target_length",
             target_total_length=100.0,
             target_length_lower_tolerance=0.1,
             target_length_upper_buffer=0.1,
         )
     with pytest.raises(ValueError):
         TrainingConfig(
-            optimization_mode="target_length_constrained_displacement",
+            optimization_mode="minimize_displacement_at_target_length",
             target_total_length=10.0,
             target_length_lower_tolerance=10.0,
             target_length_upper_buffer=0.1,
         )
+
+
+def test_trainer_phase1_to_phase2_handoff_rebuilds_decoder_and_optimizer():
+    trainer = make_phase_trainer(seed_number=8)
+    face_tensor = make_flat_face_tensor(n=7)
+    device = face_tensor["uv"].device
+    phase1_decoder = trainer._build_phase1_decoder(device=device, seed_number=8)
+    ppnet = PPNet(
+        n_seeds=8,
+        use_independent_seed_offsets=True,
+        allow_seed_outside_domain=True,
+    )
+    uv_anchor = torch.tensor(
+        [
+            [0.12, 0.12],
+            [0.35, 0.15],
+            [0.60, 0.16],
+            [0.84, 0.18],
+            [0.18, 0.72],
+            [0.42, 0.78],
+            [0.66, 0.82],
+            [0.88, 0.86],
+        ],
+        dtype=face_tensor["uv"].dtype,
+    )
+    A = torch.full((face_tensor["uv"].shape[0],), 1.0 / face_tensor["uv"].shape[0])
+
+    out, handoff_mask, handoff_seeds = trainer._evaluate_phase1_handoff(
+        phase1_decoder,
+        ppnet,
+        face_tensor,
+        uv_anchor,
+        A,
+        offset_scale=0.0,
+    )
+
+    assert isinstance(phase1_decoder, Phase1VoronoiDecoder)
+    assert handoff_mask.dtype == torch.bool
+    assert handoff_mask.shape == (8,)
+    assert handoff_seeds.shape == (int(handoff_mask.sum().item()), 2)
+    assert torch.isfinite(out["continuous_voronoi_length"])
+
+    old_phase1_param_ids = {id(p) for p in phase1_decoder.parameters()}
+    if int(handoff_mask.sum().item()) != ppnet.n_seeds:
+        trainer._prune_ppnet_seed_slots(ppnet, handoff_mask)
+    trainer._rebase_ppnet_to_seed_positions(ppnet, handoff_seeds)
+    uv_anchor = handoff_seeds.detach().clone()
+    phase2_decoder = trainer._build_phase2_decoder(
+        device=device,
+        seed_number=int(handoff_seeds.shape[0]),
+        u_periodic=False,
+        v_periodic=False,
+        face_tensor=face_tensor,
+    )
+    opt = trainer._build_optimizer(ppnet, phase2_decoder)
+
+    first_stage2_pred = ppnet(uv_anchor, offset_scale=1.0)
+    assert isinstance(phase2_decoder, ContinuousVoronoiDecoder)
+    assert ppnet.n_seeds == int(handoff_seeds.shape[0])
+    assert phase2_decoder.n_seeds == int(handoff_seeds.shape[0])
+    assert torch.allclose(first_stage2_pred["seeds_raw"], handoff_seeds, atol=1.0e-6)
+
+    optimizer_param_ids = {
+        id(p)
+        for group in opt.param_groups
+        for p in group.get("params", [])
+    }
+    assert old_phase1_param_ids.isdisjoint(optimizer_param_ids)
+    assert id(ppnet.independent_seed_offsets) in optimizer_param_ids
+
+    loss = first_stage2_pred["seeds_raw"].pow(2.0).sum()
+    loss.backward()
+    assert ppnet.independent_seed_offsets.grad is not None
+    assert torch.isfinite(ppnet.independent_seed_offsets.grad).all()
+    assert torch.linalg.vector_norm(ppnet.independent_seed_offsets.grad) > 0
+
+
+def test_phase1_loss_contract_uses_continuous_length_without_graph(monkeypatch):
+    trainer = make_phase_trainer(seed_number=5)
+    face_tensor = make_flat_face_tensor(n=6)
+    phase1_decoder = trainer._build_phase1_decoder(
+        device=face_tensor["uv"].device,
+        seed_number=5,
+    )
+    seeds = torch.tensor(
+        [[0.15, 0.15], [0.35, 0.22], [0.55, 0.52], [0.78, 0.72], [0.25, 0.82]],
+        dtype=face_tensor["uv"].dtype,
+        requires_grad=True,
+    )
+    A = torch.full((face_tensor["uv"].shape[0],), 1.0 / face_tensor["uv"].shape[0])
+
+    def fail_curve_length(*_args, **_kwargs):
+        raise AssertionError("Stage 1 must not call explicit curve_network_length_loss")
+
+    monkeypatch.setattr(trainer, "curve_network_length_loss", fail_curve_length)
+    out = trainer._run_active_decoder(
+        phase1_decoder,
+        ft=face_tensor,
+        seeds_raw=seeds,
+        surface_area_weights=A,
+        stage_id=1,
+        generate_density_fiber=True,
+    )
+    length = out["continuous_voronoi_length"]
+    target = trainer._target_total_length_band_loss(
+        total_length=length,
+        target_total_length=float(length.detach()) + 0.1,
+        lower_tolerance=0.2,
+        upper_buffer=0.05,
+        under_weight=1.0,
+        over_weight=1.0,
+        eps=1.0e-12,
+    )
+
+    assert "edge_curves_xyz" not in out
+    assert torch.isfinite(length)
+    assert torch.isfinite(out["rho"]).all()
+    assert torch.isfinite(out["fiber3d"]).all()
+    assert target["penalty"].item() == pytest.approx(0.0)
 
 
 def test_independent_constraint_controller_decays_satisfied_terms_only():
@@ -377,7 +550,7 @@ def test_feasible_checkpoint_ranking_respects_mode_priorities():
         mechanical_violation=0.0,
         total_loss_is_finite=True,
         fem_is_valid=True,
-        optimization_mode="constrained_displacement",
+        optimization_mode="minimize_length",
     )
     target_ok, target_key = checkpoint_feasibility_key(
         physical_displacement_ratio=0.6,
@@ -389,7 +562,7 @@ def test_feasible_checkpoint_ranking_respects_mode_priorities():
         mechanical_violation=0.0,
         total_loss_is_finite=True,
         fem_is_valid=True,
-        optimization_mode="target_length_constrained_displacement",
+        optimization_mode="minimize_displacement_at_target_length",
         target_length_feasible=True,
     )
     invalid_short, _ = checkpoint_feasibility_key(
@@ -402,7 +575,7 @@ def test_feasible_checkpoint_ranking_respects_mode_priorities():
         mechanical_violation=0.1,
         total_loss_is_finite=True,
         fem_is_valid=True,
-        optimization_mode="constrained_displacement",
+        optimization_mode="minimize_length",
     )
 
     assert min_mode_ok
@@ -420,11 +593,14 @@ def test_target_checkpoint_replacement_uses_final_tuple_element_as_step():
     assert NN_Trainer._best_feasible_step(better_key) == 20
 
 
-def test_stage1_stage2_fem_activation_is_explicit():
-    cfg = TrainingConfig(stage1_enable_fem=False, stage2_enable_fem=True)
+def test_fem_activation_uses_common_config_with_legacy_migration():
+    cfg = TrainingConfig(fem_enabled=False)
     trainer = NN_Trainer.__new__(NN_Trainer)
     trainer.cfg = cfg
 
     assert not trainer._stage_settings_for_stage_id(1)["enable_fem"]
-    assert trainer._stage_settings_for_stage_id(2)["enable_fem"]
+    assert not trainer._stage_settings_for_stage_id(2)["enable_fem"]
     assert trainer._first_physical_stage_id() == 2
+
+    migrated = TrainingConfig(phase1_enable_fem=False)
+    assert migrated.fem_enabled is False
